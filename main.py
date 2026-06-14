@@ -319,6 +319,13 @@ def clean_text(s, maxlen=50):
     return s
 
 
+def _csv_safe(v):
+    """防 CSV 公式注入:首字符为 = + - @ 或制表/回车时前置单引号,Excel 打开不会当公式执行。"""
+    if isinstance(v, str) and v and v[0] in "=+-@\t\r":
+        return "'" + v
+    return v
+
+
 # ==========================================================================
 # 连接池(queue.Queue 阻塞池;每连接 WAL/FK/busy_timeout/autocommit)
 # ==========================================================================
@@ -440,7 +447,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 registration_start_time TEXT,
                 admin_username TEXT DEFAULT 'admin',
-                admin_password TEXT DEFAULT 'admin123');
+                admin_password TEXT DEFAULT NULL);
             """
         )
         # 初始化 settings
@@ -449,7 +456,7 @@ def init_db():
         if row is None:
             # 首启随机生成管理员口令,只打印一次到运行窗口(开源仓库不保留弱默认口令)。
             # 用去歧义字母表(无 0/O/1/l/I),方便部署者从终端抄走后立即登录改密。
-            _pw_alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+            _pw_alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
             init_admin_pw = "".join(secrets.choice(_pw_alphabet) for _ in range(12))
             cur.execute(
                 "INSERT INTO settings (registration_start_time, admin_password) VALUES (?, ?)",
@@ -603,9 +610,9 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _csv(self, rows, header, filename):
         out = io.StringIO()
         w = csv.writer(out)
-        w.writerow(header)
+        w.writerow([_csv_safe(c) for c in header])
         for r in rows:
-            w.writerow(r)
+            w.writerow([_csv_safe(c) for c in r])
         body = out.getvalue().encode("utf-8-sig")  # BOM 便于 Excel 识别中文
         self._send(200, body, ctype="text/csv; charset=utf-8",
                    extra=[("Content-Disposition", 'attachment; filename="{}"'.format(filename))])
