@@ -110,11 +110,12 @@ async function loadOverview(){
       const info = splitRoom(c.name);
       const full = c.current_students >= c.max_students;
       const pct = c.max_students ? Math.round(c.current_students/c.max_students*100) : 0;
-      const urgent = !full && (c.max_students - c.current_students) <= 3;
+      const rem = c.max_students - c.current_students;
+      const blvl = full ? '' : (rem <= 3 ? 'urgent' : rem <= 6 ? 'warm' : '');
       const row = document.createElement('div'); row.className = 'fill-row';
       const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = info.name + (info.room ? ' · '+info.room+'室' : '');
       const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = c.current_students + ' / ' + c.max_students;
-      const bar = document.createElement('div'); bar.className = 'bar' + (urgent ? ' urgent' : '');
+      const bar = document.createElement('div'); bar.className = 'bar' + (blvl ? ' ' + blvl : '');
       const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl);
       row.append(nm, ct, bar);
       box.appendChild(row);
@@ -146,16 +147,17 @@ async function loadClubs(){
     const info = splitRoom(c.name), full = c.current_students >= c.max_students;
     const el = document.createElement('article'); el.className = 'club' + (full ? ' full' : '');
     const top = document.createElement('div'); top.className = 'club-top';
-    const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name; top.appendChild(nm);
-    if (info.room){ const rm = document.createElement('span'); rm.className='room'; rm.textContent = info.room+' 室'; top.appendChild(rm); }
-    el.appendChild(top);
+    const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name;
+    if (info.room){ const rm = document.createElement('span'); rm.className='rm'; rm.textContent = '  ' + info.room + ' 室'; nm.appendChild(rm); }
+    top.appendChild(nm); el.appendChild(top);
     const seats = document.createElement('div'); seats.className = 'seats';
     seats.innerHTML = '<span class="n" style="font-size:22px"></span><span class="u"></span>';
     seats.querySelector('.n').textContent = c.current_students + '/' + c.max_students;
     seats.querySelector('.u').textContent = '已报名';
     el.appendChild(seats);
     const pct = c.max_students ? Math.round(c.current_students/c.max_students*100) : 0;
-    const bar = document.createElement('div'); bar.className = 'bar';
+    const rem = c.max_students - c.current_students;
+    const bar = document.createElement('div'); bar.className = 'bar' + (full ? '' : (rem <= 3 ? ' urgent' : rem <= 6 ? ' warm' : ''));
     const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl); el.appendChild(bar);
     const act = document.createElement('div'); act.className = 'act';
     const exp = document.createElement('a'); exp.className='btn btn-secondary btn-sm'; exp.textContent='导出名单'; exp.href = '/api/export_club_data?club_id='+c.id;

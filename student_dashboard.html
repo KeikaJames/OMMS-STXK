@@ -130,16 +130,17 @@ function card(c, mine){
   el.className = 'club' + (isMine ? ' mine' : '') + (full ? ' full' : '');
 
   const top = document.createElement('div'); top.className = 'club-top';
-  const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name; top.appendChild(nm);
-  if (info.room){ const rm = document.createElement('span'); rm.className = 'room'; rm.textContent = info.room; top.appendChild(rm); }
-  el.appendChild(top);
+  const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name;
+  if (info.room){ const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = '  ' + info.room; nm.appendChild(rm); }
+  top.appendChild(nm); el.appendChild(top);
 
   const seats = document.createElement('div'); seats.className = 'seats';
   const n = document.createElement('span'); n.className = 'n' + (full ? ' gone' : (urgent ? ' urgent' : '')); n.textContent = full ? '0' : left;
   const u = document.createElement('span'); u.className = 'u'; u.textContent = full ? ('已满 · 共 ' + c.max_students) : ('个名额 · 共 ' + c.max_students);
   seats.append(n, u); el.appendChild(seats);
 
-  const bar = document.createElement('div'); bar.className = 'bar' + (urgent ? ' urgent' : '');
+  const blvl = full ? '' : (urgent ? 'urgent' : (left <= 6 ? 'warm' : ''));
+  const bar = document.createElement('div'); bar.className = 'bar' + (blvl ? ' ' + blvl : '');
   const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl); el.appendChild(bar);
 
   const act = document.createElement('div'); act.className = 'act';

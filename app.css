@@ -12,13 +12,13 @@
   /* 中性:单一暖灰阶 */
   --bg: #F1F0EC; --surface: #FFFFFF; --surface-2: #FAF9F6;
   --ink: #1C1B18; --text: #3B3A36; --muted: #767469; --faint: #ABA99F;
-  --line: #E5E3DC; --line-2: #CBC9BE;
+  --line: #E3E1D9; --line-2: #C1BFB3;
   /* 单主色:精炼橙(唯一品牌/动作/紧迫色,改色只动这里) */
   --brand: #DD5326; --brand-press: #C0461E; --brand-tint: #FBEDE6; --brand-ink: #8E3413;
   /* 单语义:成功(仅"已报名"小 badge) */
   --ok: #2E875A; --ok-tint: #E8F1EC;
 
-  --r-sm: 7px; --r: 10px; --r-lg: 13px;
+  --r-sm: 6px; --r: 9px; --r-lg: 12px;
   --sh-1: 0 1px 1px rgba(28,27,24,.04);
   --sh-2: 0 4px 10px -6px rgba(28,27,24,.12);
   --ring: 0 0 0 3px rgba(221,83,38,.16);
@@ -74,7 +74,8 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); line
 .club.full .club-name { color: var(--muted); }
 .club-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .club-name { font-size: 16px; font-weight: 600; color: var(--ink); }
-.room { font-size: 12.5px; color: var(--text); font-weight: 500; white-space: nowrap; background: var(--bg); padding: 3px 9px; border-radius: 7px; }
+.club-name .rm { color: var(--muted); font-weight: 400; font-size: 14px; }
+.room { font-size: 12.5px; color: var(--text); font-weight: 500; white-space: nowrap; background: var(--bg); padding: 3px 9px; border-radius: 6px; }
 .seats { display: flex; align-items: baseline; gap: 6px; margin: 14px 0 9px; }
 .seats .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 700; font-size: 28px; line-height: 1; color: var(--ink); letter-spacing: -.03em; }
 .seats .n.urgent { color: var(--brand); }
@@ -83,7 +84,8 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); line
 /* 一种进度条:细、中性占用、浅轨 */
 .bar { height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; }
 .bar { height: 6px; background: #E0DED6; border-radius: 3px; overflow: hidden; }
-.bar > i { display: block; height: 100%; background: #9F9A8D; border-radius: 3px; transition: width .5s var(--ease); }
+.bar > i { display: block; height: 100%; background: #A8A399; border-radius: 3px; transition: width .5s var(--ease), background .3s var(--ease); }
+.bar.warm > i { background: var(--amber); }
 .bar.urgent > i { background: var(--brand); }
 .act { margin-top: 14px; display: flex; align-items: center; justify-content: flex-end; gap: 9px; }
 .act .grow { margin-right: auto; }
@@ -102,7 +104,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); line
 .btn-quiet { background: none; color: var(--muted); height: auto; padding: 8px 6px; }
 .btn-quiet:hover { color: var(--ink); }
 .btn-block { width: 100%; }
-.btn-sm { height: 38px; padding: 0 16px; font-size: 14px; }
+.btn-sm { height: 38px; padding: 0 20px; font-size: 14px; min-width: 92px; }
 .btn[disabled] { background: var(--bg); color: var(--faint); cursor: not-allowed; transform: none; }
 .btn .spin { width: 15px; height: 15px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
 .confirm { display: flex; gap: 8px; margin-top: 14px; }
@@ -122,7 +124,7 @@ textarea.input { height: auto; padding: 11px 13px; line-height: 1.5; }
 .seg.fit { width: fit-content; }
 .seg button { flex: 1; border: none; background: none; font: inherit; font-size: 14px; font-weight: 500; line-height: 1.2; color: var(--muted); padding: 9px 18px; border-radius: var(--r-sm); cursor: pointer; transition: background .15s var(--ease), color .15s var(--ease); }
 .seg.fit button { flex: none; }
-.seg button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px rgba(28,27,24,.06), inset 0 0 0 1px rgba(28,27,24,.05); }
+.seg button.on { background: var(--surface); color: var(--ink); box-shadow: inset 0 0 0 1px rgba(28,27,24,.09), 0 1px 1px rgba(28,27,24,.05); }
 
 .toast-wrap { position: sticky; bottom: 16px; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; margin-top: 20px; }
 .toast { pointer-events: auto; background: var(--ink); color: #fff; padding: 12px 18px; border-radius: var(--r); font-size: 14px; max-width: 90%; box-shadow: var(--sh-2); }
