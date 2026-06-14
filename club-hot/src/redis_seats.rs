@@ -399,6 +399,31 @@ pub async fn rebuild_stock(seats: &Seats, db: &Db) -> AppResult<()> {
     Ok(())
 }
 
+/// Recover one club's stock key when missing (the `-2` case after init). A missing
+/// key implies no in-flight reservation decremented this club, so `SET NX` from the
+/// committed count is safe (no oversell) and leaves other clubs untouched. Returns
+/// false if the club doesn't exist in the DB.
+pub async fn init_club_stock(seats: &Seats, db: &Db, club_id: i64) -> AppResult<bool> {
+    let Some(c) = db
+        .club_stock_snapshot()
+        .await?
+        .into_iter()
+        .find(|c| c.club_id == club_id)
+    else {
+        return Ok(false);
+    };
+    let left = (c.max_students - c.used).max(0);
+    let mut conn = seats.pool.get().await.map_err(|_| AppError::RedisDown)?;
+    let _: Option<String> = redis::cmd("SET")
+        .arg(k_stock(club_id))
+        .arg(left)
+        .arg("NX")
+        .query_async(&mut conn)
+        .await
+        .map_err(|_| AppError::RedisDown)?;
+    Ok(true)
+}
+
 /// Seed `open_at` from `settings.registration_start_time` at startup. Parses the
 /// `YYYY-MM-DD HH:MM:SS` local-time string to an epoch. Best-effort.
 pub async fn seed_open_at(seats: &Seats, db: &Db) {

@@ -184,10 +184,23 @@ pub async fn register_club(
         Err(_) => return fail(StatusCode::SERVICE_UNAVAILABLE, "系统繁忙，请稍后重试"),
     };
 
-    // -2 (uninitialized): rebuild stock once, then retry — same as Python.
+    // -2 = this club's stock key is missing. Once initialized, recover only THIS club's
+    // key from its committed count (SET NX, can't oversell since a missing key means no
+    // in-flight reservation for it); never full-rebuild here (would re-add seats reserved
+    // on other clubs). Cold start: full rebuild.
     if outcome == AcquireOutcome::Uninitialized {
-        if let Err(e) = crate::redis_seats::rebuild_stock(&seats, &state.db).await {
-            tracing::warn!(error = %e, "rebuild_stock during acquire failed");
+        if seats.initialized().await {
+            let exists = crate::redis_seats::init_club_stock(&seats, &state.db, club_id)
+                .await
+                .unwrap_or(false);
+            if !exists {
+                return json_status(
+                    StatusCode::OK,
+                    json!({ "success": false, "message": "该社团不存在" }),
+                );
+            }
+        } else {
+            let _ = crate::redis_seats::rebuild_stock(&seats, &state.db).await;
         }
         outcome = match seats.acquire(sid, club_id, state.cfg.resv_ttl).await {
             Ok(o) => o,
@@ -412,24 +425,14 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 
 // --- helpers ---------------------------------------------------------------
 
-/// Best-effort client IP for login throttling. Prefers `X-Forwarded-For`'s
-/// first hop (nginx fronts this in prod), else falls back to a constant so the
-/// per-IP bucket still functions when behind a single proxy. Direct-connect
-/// peer IP is not available here without a ConnectInfo extractor; the username
-/// bucket is the primary defense and the IP bucket is intentionally loose.
+/// Client IP for login throttling. Trust only X-Real-IP (our nginx sets it to the
+/// peer address); client-supplied X-Forwarded-For is spoofable and must not be used.
 fn client_ip(headers: &HeaderMap) -> String {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            let ip = first.trim();
-            if !ip.is_empty() {
-                return ip.to_string();
-            }
-        }
-    }
-    if let Some(xr) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if !xr.is_empty() {
-            return xr.to_string();
-        }
-    }
-    "local".to_string()
+    headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "local".to_string())
 }

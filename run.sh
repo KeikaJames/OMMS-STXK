@@ -24,10 +24,12 @@ else
     echo "[rust] 未构建($RUST_BIN 不存在);热路径将由 nginx 回落 Python backup"
 fi
 
-# 4) nginx 边缘 :8080
-if nginx -t -c "$DIR/nginx.conf" 2>/dev/null; then
+# 4) nginx 边缘 :8080(把仓库路径注入临时配置,免去手改 nginx.conf)
+NGINX_CONF=/tmp/club_nginx.conf
+sed "s#__APP_ROOT__#$DIR#g" "$DIR/nginx.conf" > "$NGINX_CONF"
+if nginx -t -c "$NGINX_CONF" 2>/dev/null; then
     nginx -s stop 2>/dev/null || pkill nginx 2>/dev/null
-    nginx -c "$DIR/nginx.conf"
+    nginx -c "$NGINX_CONF"
     echo "[nginx] 边缘 http://127.0.0.1:8080"
 else
     echo "[nginx] 配置校验失败,跳过(直接用 :2001)"

@@ -70,6 +70,12 @@
       <div class="field"><label for="open-at">到点后学生才能抢课</label><input class="input" id="open-at" type="datetime-local"></div>
       <button class="btn btn-primary" id="save-time" type="button" style="width:auto;padding:11px 24px">保存</button>
     </div>
+    <div class="section-h" style="margin-top:26px"><span>修改管理员密码</span></div>
+    <div class="card" style="max-width:420px">
+      <div class="field"><label for="ap-cur">当前密码</label><input class="input" id="ap-cur" type="password" autocomplete="current-password"></div>
+      <div class="field"><label for="ap-new">新密码（至少 8 位）</label><input class="input" id="ap-new" type="password" autocomplete="new-password"></div>
+      <button class="btn btn-primary" id="save-apw" type="button" style="width:auto;padding:11px 24px">修改密码</button>
+    </div>
   </section>
 
   <div class="toast-wrap" id="toasts" aria-live="polite"></div>
@@ -216,6 +222,16 @@ $('#save-time').onclick = async () => {
   const r = await api('/api/update_registration_time', {method:'POST', body:JSON.stringify({start_time:start})});
   const d = await r.json();
   toast(d.success ? '已保存' : (d.message || '保存失败'), d.success?'ok':'err');
+};
+
+$('#save-apw').onclick = async () => {
+  const cur = $('#ap-cur').value, np = $('#ap-new').value;
+  if (!cur || !np){ toast('请填写当前密码和新密码', 'err'); return; }
+  if (np.length < 8){ toast('新密码至少 8 位', 'err'); return; }
+  const r = await api('/api/admin_change_password', {method:'POST', body:JSON.stringify({current:cur, new:np})});
+  const d = await r.json();
+  toast(d.success ? '管理员密码已修改' : (d.message || '修改失败'), d.success?'ok':'err');
+  if (d.success){ $('#ap-cur').value = $('#ap-new').value = ''; }
 };
 
 async function loadSettings(){
