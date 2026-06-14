@@ -68,4 +68,4 @@ nginx.conf     边缘限流 / 静态 / 路由     run.sh  一键编排
 
 ## 作者与许可
 
-在 **Vles0123** 的原始版本基础上,由 **BIRI GA([KeikaJames](https://github.com/KeikaJames))** 经原作者授予后强化改造(并发防超卖、安全加固、界面重做),以 **[Apache License 2.0](LICENSE)** 分发,署名见 [NOTICE](NOTICE)。
+在 **WEILESI(https://github.com/vles0123)** 的原始版本基础上,由 **BIRI GA([KeikaJames](https://github.com/KeikaJames))** 经原作者授予后强化改造(并发防超卖、安全加固、界面重做),以 **[Apache License 2.0](LICENSE)** 分发,署名见 [NOTICE](NOTICE)。
