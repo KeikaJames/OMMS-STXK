@@ -1,0 +1,1142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>市蒙中社团选课系统 - 管理员面板</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Microsoft YaHei', Arial, sans-serif;
+            background-color: #f5f5f5;
+            min-height: 100vh;
+        }
+        
+        .header {
+            background-color: #2c3e50;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 24px;
+        }
+        
+        .admin-container {
+            display: flex;
+            min-height: calc(100vh - 60px);
+        }
+        
+        .sidebar {
+            width: 250px;
+            background-color: #34495e;
+            color: white;
+            padding: 20px;
+        }
+        
+        .sidebar h2 {
+            font-size: 18px;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #4a5f7a;
+        }
+        
+        .sidebar-menu {
+            list-style: none;
+        }
+        
+        .sidebar-menu li {
+            margin-bottom: 10px;
+        }
+        
+        .sidebar-menu a {
+            display: block;
+            padding: 12px 15px;
+            color: #ecf0f1;
+            text-decoration: none;
+            border-radius: 5px;
+            transition: all 0.3s;
+        }
+        
+        .sidebar-menu a:hover {
+            background-color: #3498db;
+            transform: translateX(5px);
+        }
+        
+        .sidebar-menu a.active {
+            background-color: #3498db;
+        }
+        
+        .content {
+            flex: 1;
+            padding: 20px;
+        }
+        
+        .content-header {
+            margin-bottom: 30px;
+        }
+        
+        .content-header h2 {
+            color: #2c3e50;
+            font-size: 24px;
+        }
+        
+        .card {
+            background-color: rgba(255, 255, 255, 0.5);
+            border-radius: 10px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        
+        .card h3 {
+            color: #34495e;
+            font-size: 18px;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: 500;
+        }
+        
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        
+        .form-group textarea {
+            min-height: 150px;
+            resize: vertical;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-right: 10px;
+        }
+        
+        .btn-small {
+            padding: 5px 10px;
+            font-size: 12px;
+            margin-right: 5px;
+        }
+        
+        .btn-primary {
+            background-color: #3498db;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background-color: #2980b9;
+        }
+        
+        .btn-success {
+            background-color: #27ae60;
+            color: white;
+        }
+        
+        .btn-success:hover {
+            background-color: #219a52;
+        }
+        
+        .btn-warning {
+            background-color: #f39c12;
+            color: white;
+        }
+        
+        .btn-warning:hover {
+            background-color: #e67e22;
+        }
+        
+        .btn-danger {
+            background-color: #e74c3c;
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            background-color: #c0392b;
+        }
+        
+        .action-bar {
+            margin-bottom: 15px;
+            text-align: right;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background-color: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            border-top: 4px solid #3498db;
+        }
+        
+        .stat-card h4 {
+            color: #7f8c8d;
+            font-size: 14px;
+            font-weight: normal;
+            margin-bottom: 10px;
+        }
+        
+        .stat-card .stat-value {
+            font-size: 36px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        
+        .stat-card.students {
+            border-top-color: #3498db;
+        }
+        
+        .stat-card.registered {
+            border-top-color: #27ae60;
+        }
+        
+        .stat-card.unregistered {
+            border-top-color: #e74c3c;
+        }
+        
+        .stat-card.clubs {
+            border-top-color: #f39c12;
+        }
+        
+        .table-container {
+            background-color: rgba(255, 255, 255, 0.5);
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        
+        th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+            color: #495057;
+        }
+        
+        tr:hover {
+            background-color: #f8f9fa;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .status-badge.registered {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        
+        .status-badge.unregistered {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        
+        .message {
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .message.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+            display: block;
+        }
+        
+        .message.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+            display: block;
+        }
+        
+        .message.info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+            display: block;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .import-instructions {
+            background-color: rgba(248, 249, 250, 0.9);
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            border-left: 4px solid #3498db;
+        }
+        
+        .import-instructions h4 {
+            color: #34495e;
+            margin-bottom: 10px;
+        }
+        
+        .import-instructions ul {
+            margin-left: 20px;
+            color: #555;
+        }
+        
+        .import-instructions li {
+            margin-bottom: 5px;
+        }
+        
+        @media (max-width: 768px) {
+            .admin-container {
+                flex-direction: column;
+            }
+            
+            .sidebar {
+                width: 100%;
+                padding: 10px;
+            }
+            
+            .sidebar-menu {
+                display: flex;
+                overflow-x: auto;
+                padding-bottom: 10px;
+            }
+            
+            .sidebar-menu li {
+                margin-right: 10px;
+                margin-bottom: 0;
+            }
+            
+            .sidebar-menu a {
+                white-space: nowrap;
+            }
+            
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>市蒙中社团选课系统 - 管理员面板</h1>
+    </div>
+    
+    <div class="admin-container">
+        <div class="sidebar">
+            <h2>管理菜单</h2>
+            <ul class="sidebar-menu">
+                <li><a href="#dashboard" class="active">仪表盘</a></li>
+                <li><a href="#student-management">学生管理</a></li>
+                <li><a href="#club-management">社团管理</a></li>
+                <li><a href="#system-settings">系统设置</a></li>
+                <li><a href="#data-export">数据导出</a></li>
+                <li><a href="/" onclick="return confirm('确定要退出登录吗？')">退出登录</a></li>
+            </ul>
+        </div>
+        
+        <div class="content">
+            <div id="message" class="message"></div>
+            
+            <!-- 仪表盘 -->
+            <div id="dashboard" class="tab-content active">
+                <div class="content-header">
+                    <h2>仪表盘</h2>
+                </div>
+                
+                <div class="stats-grid">
+                    <div class="stat-card students">
+                        <h4>学生总数</h4>
+                        <div class="stat-value" id="total-students">--</div>
+                    </div>
+                    <div class="stat-card registered">
+                        <h4>已报名学生</h4>
+                        <div class="stat-value" id="registered-students">--</div>
+                    </div>
+                    <div class="stat-card unregistered">
+                        <h4>未报名学生</h4>
+                        <div class="stat-value" id="unregistered-students">--</div>
+                    </div>
+                    <div class="stat-card clubs">
+                        <h4>社团总数</h4>
+                        <div class="stat-value" id="total-clubs">--</div>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <h3>报名情况概览</h3>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>学生姓名</th>
+                                    <th>班级</th>
+                                    <th>学号</th>
+                                    <th>报名社团</th>
+                                    <th>状态</th>
+                                </tr>
+                            </thead>
+                            <tbody id="registration-overview">
+                                <tr><td colspan="5" style="text-align: center; padding: 20px;">加载中...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 学生管理 -->
+            <div id="student-management" class="tab-content">
+                <div class="content-header">
+                    <h2>学生管理</h2>
+                </div>
+                
+                <div class="card">
+                    <h3>导入学生信息</h3>
+                    <div class="import-instructions">
+                        <h4>导入说明：</h4>
+                        <ul>
+                            <li>请按照指定格式输入学生信息，每行一个学生</li>
+                            <li>格式：姓名,班级,学号（用逗号分隔）</li>
+                            <li>系统将自动生成用户名（直接使用学生姓名，重复时加数字）和固定密码（123456）</li>
+                        </ul>
+                    </div>
+                    <div class="form-group">
+                        <label for="students-data">学生信息（每行一条）</label>
+                        <textarea id="students-data" placeholder="例如：
+张三,高一(1)班,2024001
+李四,高一(2)班,2024002"></textarea>
+                    </div>
+                    <button id="import-students-btn" class="btn btn-primary">导入学生</button>
+                </div>
+                
+                <div class="card">
+                    <h3>学生列表</h3>
+                    <div class="action-bar">
+                        <button id="export-students-btn" class="btn btn-success">导出学生账号密码</button>
+                        <button id="delete-all-students-btn" class="btn btn-danger">删除所有学生账号</button>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>姓名</th>
+                                    <th>班级</th>
+                                    <th>学号</th>
+                                    <th>用户名</th>
+                                    <th>密码</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="students-list">
+                                <tr><td colspan="6" style="text-align: center; padding: 20px;">加载中...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 社团管理 -->
+            <div id="club-management" class="tab-content">
+                <div class="content-header">
+                    <h2>社团管理</h2>
+                </div>
+                
+                <div class="card">
+                    <h3>导入社团信息</h3>
+                    <div class="import-instructions">
+                        <h4>导入说明：</h4>
+                        <ul>
+                            <li>请按照指定格式输入社团信息，每行一个社团</li>
+                            <li>格式：社团名称,名额数量（用逗号分隔）</li>
+                        </ul>
+                    </div>
+                    <div class="form-group">
+                        <label for="clubs-data">社团信息（每行一条）</label>
+                        <textarea id="clubs-data" placeholder="例如：
+篮球社,20
+音乐社,15
+编程社,25"></textarea>
+                    </div>
+                    <button id="import-clubs-btn" class="btn btn-primary">导入社团</button>
+                </div>
+                
+                <div class="card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h3>社团列表</h3>
+                        <button class="btn btn-danger" onclick="deleteAllClubs()">删除所有社团</button>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>社团名称</th>
+                                    <th>名额数量</th>
+                                    <th>已报名人数</th>
+                                    <th>剩余名额</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="clubs-list">
+                                <tr><td colspan="4" style="text-align: center; padding: 20px;">加载中...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 系统设置 -->
+            <div id="system-settings" class="tab-content">
+                <div class="content-header">
+                    <h2>系统设置</h2>
+                </div>
+                
+                <div class="card">
+                    <h3>系统时间</h3>
+                    <div class="form-group">
+                    <label>当前时间：</label>
+                    <span class="current-time" id="current-time" style="font-size: 16px; font-weight: bold;"></span>
+                </div>
+                </div>
+                
+                <div class="card">
+                    <h3>报名时间设置</h3>
+                    <div class="form-group">
+                        <label for="registration-start-time">设置报名开始时间</label>
+                        <input type="datetime-local" id="registration-start-time">
+                    </div>
+                    <button id="update-time-btn" class="btn btn-primary">更新设置</button>
+                </div>
+                
+                <div class="card">
+                    <h3>管理员设置</h3>
+                    <div class="form-group">
+                        <label for="admin-username">管理员用户名</label>
+                        <input type="text" id="admin-username" value="admin" disabled>
+                    </div>
+                    <div class="form-group">
+                        <label for="admin-password">管理员密码</label>
+                        <input type="text" id="admin-password" value="admin123" disabled>
+                    </div>
+                    <p style="color: #999; font-size: 14px;">注：当前版本暂不支持修改管理员信息</p>
+                </div>
+            </div>
+            
+            <!-- 数据导出 -->
+            <div id="data-export" class="tab-content">
+                <div class="content-header">
+                    <h2>数据导出</h2>
+                </div>
+                
+                <div class="card">
+                    <h3>导出选项</h3>
+                    <button id="export-all-data" class="btn btn-success">导出所有报名数据</button>
+                    <button id="export-unregistered" class="btn btn-warning">导出未报名学生数据</button>
+                    
+                    <div class="form-group" style="margin-top: 20px;">
+                        <label for="export-by-club">按社团导出：</label>
+                        <select id="export-by-club">
+                            <option value="">请选择社团</option>
+                        </select>
+                        <button id="export-club-data" class="btn btn-primary">导出选中社团数据</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // 检查管理员登录状态
+        if (localStorage.getItem('adminLoggedIn') !== 'true') {
+            alert('请先登录管理员账号');
+            window.location.href = '/';
+        }
+        
+        // 实时更新系统时间
+        function updateCurrentTime() {
+            const now = new Date();
+            const options = {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false
+            };
+            const formattedTime = now.toLocaleString('zh-CN', options).replace(/\//g, '-');
+            
+            // 确保所有时间显示元素都被更新
+            const timeElement = document.getElementById('current-time');
+            if (timeElement) {
+                timeElement.textContent = formattedTime;
+            }
+        }
+        
+        // 初始化时间显示并设置每秒更新
+        updateCurrentTime();
+        setInterval(updateCurrentTime, 1000);
+        
+        // 切换标签页
+        document.querySelectorAll('.sidebar-menu a').forEach(link => {
+            link.addEventListener('click', function(e) {
+                e.preventDefault();
+                
+                // 更新菜单激活状态
+                document.querySelectorAll('.sidebar-menu a').forEach(a => a.classList.remove('active'));
+                this.classList.add('active');
+                
+                // 隐藏所有内容
+                document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+                
+                // 显示选中的内容
+                const target = this.getAttribute('href');
+                document.querySelector(target).classList.add('active');
+                
+                // 加载相应数据
+                if (target === '#dashboard') {
+                    loadDashboardStats();
+                } else if (target === '#student-management') {
+                    loadStudentsList();
+                } else if (target === '#club-management') {
+                    loadClubsList();
+                } else if (target === '#data-export') {
+                    loadExportOptions();
+                }
+            });
+        });
+        
+        // 显示消息
+        function showMessage(type, text) {
+            const messageElement = document.getElementById('message');
+            messageElement.className = `message ${type}`;
+            messageElement.textContent = text;
+            
+            // 3秒后自动隐藏
+            setTimeout(() => {
+                messageElement.style.display = 'none';
+            }, 3000);
+        }
+        
+        // 加载仪表盘统计数据
+        function loadDashboardStats() {
+            fetch('/api/get_registrations')
+                .then(response => response.json())
+                .then(data => {
+                    const totalStudents = data.length;
+                    const registeredStudents = data.filter(item => item.club_name !== '未报名').length;
+                    const unregisteredStudents = totalStudents - registeredStudents;
+                    
+                    document.getElementById('total-students').textContent = totalStudents;
+                    document.getElementById('registered-students').textContent = registeredStudents;
+                    document.getElementById('unregistered-students').textContent = unregisteredStudents;
+                    
+                    // 加载社团总数
+                    fetch('/api/get_clubs')
+                        .then(response => response.json())
+                        .then(clubs => {
+                            document.getElementById('total-clubs').textContent = clubs.length;
+                        });
+                    
+                    // 显示报名情况概览
+                    const overviewBody = document.getElementById('registration-overview');
+                    overviewBody.innerHTML = '';
+                    
+                    data.slice(0, 10).forEach(item => {
+                        const row = document.createElement('tr');
+                        const isRegistered = item.club_name !== '未报名';
+                        
+                        row.innerHTML = `
+                            <td>${item.name}</td>
+                            <td>${item.class}</td>
+                            <td>${item.student_id}</td>
+                            <td>${item.club_name}</td>
+                            <td>
+                                <span class="status-badge ${isRegistered ? 'registered' : 'unregistered'}">
+                                    ${isRegistered ? '已报名' : '未报名'}
+                                </span>
+                            </td>
+                        `;
+                        
+                        overviewBody.appendChild(row);
+                    });
+                });
+        }
+        
+        // 导入学生信息
+        document.getElementById('import-students-btn').addEventListener('click', function() {
+            const data = document.getElementById('students-data').value.trim();
+            
+            if (!data) {
+                showMessage('error', '请输入学生信息');
+                return;
+            }
+            
+            const students = [];
+            const lines = data.split('\n');
+            
+            for (let line of lines) {
+                const parts = line.split(',');
+                if (parts.length === 3) {
+                    students.push({
+                        name: parts[0].trim(),
+                        class: parts[1].trim(),
+                        student_id: parts[2].trim()
+                    });
+                }
+            }
+            
+            if (students.length === 0) {
+                showMessage('error', '未找到有效的学生信息，请检查格式');
+                return;
+            }
+            
+            fetch('/api/import_students', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ students })
+            })
+            .then(response => response.json())
+            .then(result => {
+                showMessage('success', `成功导入 ${result.success} 名学生，失败 ${result.failed} 名`);
+                document.getElementById('students-data').value = '';
+                loadStudentsList();
+            })
+            .catch(error => {
+                showMessage('error', '导入失败，请重试');
+            });
+        });
+        
+        // 加载学生列表
+        function loadStudentsList() {
+            fetch('/api/get_all_students')
+                .then(response => response.json())
+                .then(students => {
+                    const studentsList = document.getElementById('students-list');
+                    studentsList.innerHTML = '';
+                    
+                    if (students.length === 0) {
+                        studentsList.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px;">暂无学生信息</td></tr>';
+                        return;
+                    }
+                    
+                    students.forEach(student => {
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${student.name}</td>
+                            <td>${student.class}</td>
+                            <td>${student.student_id}</td>
+                            <td>${student.username}</td>
+                            <td>${student.password}</td>
+                            <td>
+                                <button class="btn btn-small btn-primary" onclick="copyCredentials('${student.username}', '${student.password}')">复制账号</button>
+                                <button class="btn btn-small btn-danger" onclick="deleteStudent(${student.id})">删除</button>
+                            </td>
+                        `;
+                        studentsList.appendChild(row);
+                    });
+                })
+                .catch(error => {
+                    showMessage('error', '加载学生列表失败');
+                    const studentsList = document.getElementById('students-list');
+                    studentsList.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px;">加载失败，请重试</td></tr>';
+                });
+        }
+        
+        // 复制学生账号密码
+        function copyCredentials(username, password) {
+            const textToCopy = `用户名：${username}\n密码：${password}`;
+            navigator.clipboard.writeText(textToCopy).then(() => {
+                showMessage('success', '账号密码已复制到剪贴板');
+            }).catch(() => {
+                showMessage('error', '复制失败，请手动复制');
+            });
+        }
+        
+        // 删除学生
+        function deleteStudent(studentId) {
+            if (!confirm('确定要删除这名学生吗？删除后将无法恢复！')) {
+                return;
+            }
+            
+            fetch('/api/delete_student', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ student_id: studentId })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showMessage('success', '学生删除成功');
+                    loadStudentsList();
+                    loadDashboardStats();
+                } else {
+                    showMessage('error', data.message || '删除失败，请重试');
+                }
+            })
+            .catch(error => {
+                showMessage('error', '删除失败，请重试');
+            });
+        }
+        
+        // 删除所有学生账号 - 添加二级确认菜单
+        function deleteAllStudents() {
+            // 显示确认对话框，警告删除所有学生的严重性
+            if (!confirm('警告：此操作将删除所有学生数据和相关报名信息，此操作不可恢复！您确定要继续吗？')) {
+                return;
+            }
+            
+            // 二次确认
+            if (!confirm('再次确认：此操作将清除所有学生数据，所有学生的报名信息也将被删除！请再次确认是否执行？')) {
+                return;
+            }
+            
+            fetch('/api/delete_all_students', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ confirm: true })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showMessage('success', '所有学生数据已成功删除');
+                    loadStudentsList();
+                    loadDashboardStats();
+                } else {
+                    showMessage('error', '删除失败: ' + (data.message || '未知错误'));
+                }
+            })
+            .catch(error => {
+                console.error('删除所有学生时出错:', error);
+                showMessage('error', '删除过程中发生错误');
+            });
+        }
+        
+        // 删除社团 - 添加二级确认菜单
+        function deleteAllClubs() {
+            // 显示确认对话框，警告删除所有社团的严重性
+            if (!confirm('警告：此操作将删除所有社团数据和相关报名信息，此操作不可恢复！您确定要继续吗？')) {
+                return;
+            }
+            
+            // 二次确认
+            if (!confirm('再次确认：此操作将清除所有社团数据，所有学生的报名信息也将被删除！请再次确认是否执行？')) {
+                return;
+            }
+            
+            fetch('/api/delete_all_clubs', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ confirm: true })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showMessage('success', '所有社团数据已成功删除');
+                    loadClubsList();
+                    loadDashboardStats();
+                    loadExportOptions();
+                } else {
+                    showMessage('error', '删除失败: ' + (data.message || '未知错误'));
+                }
+            })
+            .catch(error => {
+                console.error('删除所有社团时出错:', error);
+                showMessage('error', '删除过程中发生错误');
+            });
+        }
+        
+        function deleteClub(clubId) {
+            // 先显示一级确认
+            if (!confirm('您确定要删除这个社团吗？')) {
+                return;
+            }
+            
+            // 再显示二级确认
+            if (!confirm('此操作不可恢复！删除后相关报名信息也将被清除！请再次确认是否删除？')) {
+                return;
+            }
+            
+            fetch('/api/delete_club', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ club_id: clubId })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showMessage('success', '社团删除成功');
+                    loadClubsList();
+                    loadDashboardStats();
+                    loadExportOptions();
+                } else {
+                    showMessage('error', data.message || '删除失败，请重试');
+                }
+            })
+            .catch(error => {
+                showMessage('error', '删除失败，请重试');
+            });
+        }
+        
+        // 导出学生账号密码到CSV
+        document.getElementById('export-students-btn').addEventListener('click', function() {
+            showMessage('info', '正在生成学生账号密码数据，请稍候...');
+            // 直接访问导出API，浏览器会自动处理下载
+            window.location.href = '/api/export_students_csv';
+        });
+        
+        // 为删除所有学生账号按钮添加事件监听器
+        document.getElementById('delete-all-students-btn')?.addEventListener('click', deleteAllStudents);
+        
+        // 导入社团信息
+        document.getElementById('import-clubs-btn').addEventListener('click', function() {
+            const data = document.getElementById('clubs-data').value.trim();
+            
+            if (!data) {
+                showMessage('error', '请输入社团信息');
+                return;
+            }
+            
+            const clubs = [];
+            const lines = data.split('\n');
+            
+            for (let line of lines) {
+                if (line.trim() === '') continue;
+                
+                // 使用正则表达式分割，处理中文逗号和英文逗号
+                const parts = line.split(/[,，]/);
+                if (parts.length >= 2) {
+                    const maxStudents = parseInt(parts[1].trim());
+                    if (!isNaN(maxStudents) && maxStudents > 0) {
+                        clubs.push({
+                            name: parts[0].trim(),
+                            max_students: maxStudents
+                        });
+                    } else {
+                        console.log('无效的名额数量:', parts[1].trim());
+                    }
+                } else {
+                    console.log('格式不正确的行:', line);
+                }
+            }
+            
+            if (clubs.length === 0) {
+                showMessage('error', '未找到有效的社团信息，请检查格式');
+                return;
+            }
+            
+            console.log('准备导入的社团数据:', clubs);
+            
+            fetch('/api/import_clubs', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ clubs })
+            })
+            .then(response => {
+                console.log('导入响应状态:', response.status);
+                return response.json();
+            })
+            .then(result => {
+                console.log('导入结果:', result);
+                showMessage('success', `成功导入 ${result.success} 个社团，失败 ${result.failed} 个`);
+                document.getElementById('clubs-data').value = '';
+                
+                // 立即重新加载社团列表
+                setTimeout(() => {
+                    loadClubsList();
+                    loadExportOptions();
+                }, 100);
+            })
+            .catch(error => {
+                console.error('导入错误:', error);
+                showMessage('error', '导入失败，请重试');
+            });
+        });
+        
+        // 加载社团列表
+        function loadClubsList() {
+            fetch('/api/get_clubs')
+                .then(response => response.json())
+                .then(clubs => {
+                    const clubsList = document.getElementById('clubs-list');
+                    clubsList.innerHTML = '';
+                    
+                    if (clubs.length === 0) {
+                        clubsList.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 20px;">暂无社团信息</td></tr>';
+                        return;
+                    }
+                    
+                    clubs.forEach(club => {
+                        const row = document.createElement('tr');
+                        const remaining = club.max_students - club.current_students;
+                        
+                        row.innerHTML = `
+                            <td>${club.name}</td>
+                            <td>${club.max_students}</td>
+                            <td>${club.current_students}</td>
+                            <td>${remaining}</td>
+                            <td>
+                                <button class="btn btn-small btn-danger" onclick="deleteClub(${club.id})">删除</button>
+                            </td>
+                        `;
+                        
+                        clubsList.appendChild(row);
+                    });
+                });
+        }
+        
+        // 更新报名时间
+        document.getElementById('update-time-btn').addEventListener('click', function() {
+            const startTime = document.getElementById('registration-start-time').value;
+            
+            if (!startTime) {
+                showMessage('error', '请选择报名开始时间');
+                return;
+            }
+            
+            // 转换为标准时间格式
+            const date = new Date(startTime);
+            const formattedTime = date.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false
+            }).replace(/\//g, '-');
+            
+            fetch('/api/update_registration_time', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ start_time: formattedTime })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showMessage('success', '报名时间设置成功');
+                } else {
+                    showMessage('error', '设置失败，请重试');
+                }
+            })
+            .catch(error => {
+                showMessage('error', '设置失败，请重试');
+            });
+        });
+        
+        // 加载导出选项
+        function loadExportOptions() {
+            fetch('/api/get_clubs')
+                .then(response => response.json())
+                .then(clubs => {
+                    const select = document.getElementById('export-by-club');
+                    select.innerHTML = '<option value="">请选择社团</option>';
+                    
+                    clubs.forEach(club => {
+                        const option = document.createElement('option');
+                        option.value = club.id;
+                        option.textContent = club.name;
+                        select.appendChild(option);
+                    });
+                });
+        }
+        
+        // 导出功能
+        document.getElementById('export-students-btn').addEventListener('click', function() {
+            showMessage('info', '正在生成学生账号密码数据，请稍候...');
+            // 直接访问导出API，浏览器会自动处理下载
+            window.location.href = '/api/export_students_csv';
+        });
+        
+        document.getElementById('export-all-data').addEventListener('click', function() {
+            showMessage('info', '正在导出所有报名数据，请稍候...');
+            // 直接跳转到导出接口
+            window.location.href = '/api/export_all_data';
+        });
+        
+        document.getElementById('export-unregistered').addEventListener('click', function() {
+            showMessage('info', '正在导出未报名学生数据，请稍候...');
+            // 直接跳转到导出接口
+            window.location.href = '/api/export_unregistered';
+        });
+        
+        document.getElementById('export-club-data').addEventListener('click', function() {
+            const clubId = document.getElementById('export-by-club').value;
+            if (!clubId) {
+                showMessage('error', '请选择要导出的社团');
+                return;
+            }
+            
+            showMessage('info', '正在导出社团数据，请稍候...');
+            // 直接跳转到导出接口
+            window.location.href = `/api/export_club_data?club_id=${clubId}`;
+        });
+        
+        // 初始化页面时加载仪表盘数据
+        loadDashboardStats();
+    </script>
+</body>
+</html>

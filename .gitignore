@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# SQLite 运行时产物与数据(数据不入库;schema 在 main.py)
+club_system.db
+club_system.db-wal
+club_system.db-shm
+club_system.db.bak
+
+# Rust
+target/
+**/target/
+
+# 设计 skill 下载缓存
+.skills_cache/
+
+# 杂项
+.DS_Store
+*.log
