@@ -188,6 +188,16 @@ function parseLines(txt, n){
   return txt.split(/\n+/).map(l => l.trim()).filter(Boolean).map(l => l.split(/[,，\t]+/).map(x => x.trim())).filter(p => p.length >= n);
 }
 
+function csvCell(v){ v = String(v == null ? '' : v); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; }
+function downloadCreds(creds){
+  const lines = [['姓名','班级','账号','初始密码']].concat(creds.map(c => [c.name, c.class || '', c.username, c.password]));
+  const csv = '﻿' + lines.map(r => r.map(csvCell).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv;charset=utf-8'}));
+  a.download = '账号密码表_' + new Date().toISOString().slice(0,10) + '.csv';
+  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href);
+}
+
 $('#imp-stu-go').onclick = async () => {
   const rows = parseLines($('#imp-stu').value, 3);
   if (!rows.length){ toast('没有可导入的行', 'err'); return; }
@@ -197,9 +207,10 @@ $('#imp-stu-go').onclick = async () => {
   toast('成功 '+d.success+',失败 '+d.failed, d.success?'ok':'err');
   const out = $('#imp-stu-out');
   if (d.credentials && d.credentials.length){
-    out.innerHTML = '<p style="font-size:13px;color:var(--muted);margin:6px 0">初始账号(仅此一次,请导出留存):</p><div class="card" style="padding:0;overflow:auto"><table class="tbl"><thead><tr><th>姓名</th><th>账号</th><th>初始密码</th></tr></thead><tbody></tbody></table></div>';
+    out.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 0 6px"><span style="font-size:13px;color:var(--muted)">初始账号(仅此一次,请下载留存后分发):</span><button class="btn btn-primary btn-sm" id="dl-creds" type="button">下载账号密码表</button></div><div class="card" style="padding:0;overflow:auto"><table class="tbl"><thead><tr><th>姓名</th><th>班级</th><th>账号</th><th>初始密码</th></tr></thead><tbody></tbody></table></div>';
     const tb = out.querySelector('tbody');
-    d.credentials.forEach(c => { const tr = document.createElement('tr'); ['name','username','password'].forEach(k => { const td = document.createElement('td'); if (k==='password') td.className='mono'; td.textContent = c[k]; tr.appendChild(td); }); tb.appendChild(tr); });
+    d.credentials.forEach(c => { const tr = document.createElement('tr'); ['name','class','username','password'].forEach(k => { const td = document.createElement('td'); if (k==='password') td.className='mono'; td.textContent = c[k] || ''; tr.appendChild(td); }); tb.appendChild(tr); });
+    $('#dl-creds').onclick = () => downloadCreds(d.credentials);
   }
   $('#imp-stu').value = ''; loadStudents(); loadOverview();
 };
