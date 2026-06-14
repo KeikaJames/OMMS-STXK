@@ -11,12 +11,12 @@
 <body>
 <a class="skip" href="#main">跳到主内容</a>
 <header class="topbar">
-  <div class="brand"><b>管理控制台</b><small>市蒙古族中学</small></div>
+  <div class="brand"><img class="mark" src="/favicon.svg" alt=""><span class="t"><b>管理控制台</b><small>市蒙古族中学</small></span></div>
   <nav class="topnav"><button id="logout" type="button">退出</button></nav>
 </header>
 
 <main class="wrap wrap-wide" id="main">
-  <div class="seg" id="seg" style="max-width:520px">
+  <div class="seg fit" id="seg">
     <button class="on" data-v="overview" type="button">概览</button>
     <button data-v="students" type="button">学生</button>
     <button data-v="clubs" type="button">社团</button>
@@ -29,14 +29,14 @@
       <div class="metric"><div class="k">学生</div><div class="v" id="m-students">—</div></div>
       <div class="metric"><div class="k">已报名</div><div class="v" id="m-reg">—</div></div>
       <div class="metric"><div class="k">未报名</div><div class="v" id="m-unreg">—</div></div>
-      <div class="metric"><div class="k">报名率</div><div class="v" id="m-rate">—</div></div>
+      <div class="metric hero"><div class="k">报名率</div><div class="v" id="m-rate">—</div></div>
     </div>
     <div class="section-h"><span>各社团填报</span><span class="num" id="ov-time"></span></div>
     <div class="card" id="ov-fill"><div class="sk" style="height:60px"></div></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">
-      <a class="btn btn-ghost" style="width:auto" href="/api/export_all_data">导出报名总表</a>
-      <a class="btn btn-ghost" style="width:auto" href="/api/export_unregistered">导出未报名名单</a>
-      <a class="btn btn-ghost" style="width:auto" href="/api/export_students_csv">导出学生账号</a>
+      <a class="btn btn-soft" style="width:auto" href="/api/export_all_data">导出报名总表</a>
+      <a class="btn btn-soft" style="width:auto" href="/api/export_unregistered">导出未报名名单</a>
+      <a class="btn btn-soft" style="width:auto" href="/api/export_students_csv">导出学生账号</a>
     </div>
   </section>
 
@@ -101,18 +101,22 @@ async function loadOverview(){
     $('#m-students').textContent = total;
     $('#m-reg').textContent = reg;
     $('#m-unreg').textContent = total - reg;
-    $('#m-rate').textContent = total ? Math.round(reg/total*100) + '%' : '—';
+    $('#m-rate').innerHTML = total ? Math.round(reg/total*100) + '<small>%</small>' : '—';
     $('#ov-time').textContent = t.start_time ? (t.can_register ? '开抢中' : '开放 ' + t.start_time) : '未设时间';
     const box = $('#ov-fill'); box.innerHTML = '';
     if (!clubs.length){ box.innerHTML = '<p class="empty">还没有社团</p>'; return; }
     clubs.forEach(c => {
-      const info = splitRoom(c.name), pct = Math.round(c.current_students/c.max_students*100);
-      const row = document.createElement('div'); row.style.cssText = 'padding:11px 2px;border-bottom:1px solid var(--line)';
-      row.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px">'
-        + '<span style="font-weight:500"></span><span class="num" style="color:var(--muted);font-size:13px"></span></div>'
-        + '<div class="bar"><i style="width:'+pct+'%"></i></div>';
-      row.querySelector('span').textContent = info.name + (info.room ? ' · '+info.room+'室' : '');
-      row.querySelectorAll('span')[1].textContent = c.current_students + ' / ' + c.max_students;
+      const info = splitRoom(c.name);
+      const full = c.current_students >= c.max_students;
+      const ratio = c.max_students ? (c.max_students - c.current_students)/c.max_students : 0;
+      const lvl = full ? '' : (ratio > 0.5 ? 'ok' : ratio > 0.2 ? 'mid' : 'low');
+      const row = document.createElement('div'); row.className = 'fill-row';
+      const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = info.name + (info.room ? ' · '+info.room+'室' : '');
+      const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = c.current_students + ' / ' + c.max_students;
+      const gc = full ? 'full' : (lvl === 'ok' ? '' : 'lvl-'+lvl);
+      const g = document.createElement('div'); g.className = 'gauge' + (gc ? ' '+gc : '');
+      for (let i=0;i<c.max_students;i++){ const cell=document.createElement('i'); if(i<c.current_students) cell.className='on'; g.appendChild(cell); }
+      row.append(nm, ct, g);
       box.appendChild(row);
     });
   }catch(e){ if (e.message !== 'unauth') console.error(e); }
@@ -154,8 +158,8 @@ async function loadClubs(){
     for (let i=0;i<c.max_students;i++){ const cell = document.createElement('i'); if (i<c.current_students) cell.className='on'; g.appendChild(cell); }
     el.appendChild(g);
     const act = document.createElement('div'); act.className = 'act'; act.style.display='flex'; act.style.gap='8px';
-    const exp = document.createElement('a'); exp.className='btn btn-ghost'; exp.textContent='导出名单'; exp.href = '/api/export_club_data?club_id='+c.id;
-    const del = document.createElement('button'); del.className='btn btn-ghost'; del.style.color='var(--danger)'; del.type='button'; del.textContent='删除';
+    const exp = document.createElement('a'); exp.className='btn btn-soft'; exp.textContent='导出名单'; exp.href = '/api/export_club_data?club_id='+c.id;
+    const del = document.createElement('button'); del.className='btn btn-soft'; del.style.color='var(--danger)'; del.type='button'; del.textContent='删除';
     del.onclick = () => confirmInline(del, async () => { const r = await api('/api/delete_club', {method:'POST', body:JSON.stringify({club_id:c.id})}); const d = await r.json(); toast(d.message || (d.success?'已删除':'删除失败'), d.success?'ok':'err'); loadClubs(); loadOverview(); });
     act.append(exp, del); el.appendChild(act);
     box.appendChild(el);

@@ -12,7 +12,7 @@
 <a class="skip" href="#main">跳到主内容</a>
 
 <header class="topbar">
-  <div class="brand"><b>社团选课</b><small>市蒙古族中学</small></div>
+  <div class="brand"><img class="mark" src="/favicon.svg" alt=""><span class="t"><b>社团选课</b><small>市蒙古族中学</small></span></div>
   <nav class="topnav" aria-label="主导航">
     <a href="/student/dashboard" class="active" aria-current="page">选课</a>
     <a href="/student/profile">个人信息</a>
@@ -126,41 +126,41 @@ function card(c, mine){
   const isMine = mine && me.registered_club === c.name;
   const full = c.current_students >= c.max_students;
   const left = Math.max(0, c.max_students - c.current_students);
+  const ratio = c.max_students ? left / c.max_students : 0;
+  const lvl = full ? '' : (ratio > 0.5 ? 'ok' : ratio > 0.2 ? 'mid' : 'low');
   const info = splitRoom(c.name);
+  const blocked = !isMine && (full || mine || !canRegister);
 
   const el = document.createElement('article');
-  el.className = 'club' + (isMine ? ' mine' : '');
+  el.className = 'club' + (isMine ? ' mine' : (blocked ? ' dim' : ''));
 
   const top = document.createElement('div'); top.className = 'club-top';
   const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name; top.appendChild(nm);
   if (info.room){ const rm = document.createElement('span'); rm.className = 'room'; rm.textContent = info.room; top.appendChild(rm); }
   el.appendChild(top);
 
+  const grp = document.createElement('div'); grp.className = 'grp';
   const lt = document.createElement('div'); lt.className = 'left';
-  const n = document.createElement('span'); n.className = 'n' + (full ? ' zero' : ''); n.textContent = left;
+  const n = document.createElement('span'); n.className = 'n ' + (full ? 'zero' : 'u-'+lvl); n.textContent = full ? 0 : left;
   const tt = document.createElement('span'); tt.className = 't'; tt.textContent = full ? '已满 · 共 '+c.max_students : '个名额剩余 · 共 '+c.max_students;
-  lt.append(n, tt); el.appendChild(lt);
-
-  const g = document.createElement('div'); g.className = 'gauge' + (full ? ' full' : '');
+  lt.append(n, tt);
+  const gc = full ? 'full' : (lvl === 'ok' ? '' : 'lvl-'+lvl);
+  const g = document.createElement('div'); g.className = 'gauge' + (gc ? ' '+gc : '');
   for (let i=0;i<c.max_students;i++){ const cell = document.createElement('i'); if (i < c.current_students) cell.className='on'; g.appendChild(cell); }
-  el.appendChild(g);
+  grp.append(lt, g); el.appendChild(grp);
 
   const act = document.createElement('div'); act.className = 'act';
   if (isMine){
-    const tag = document.createElement('div'); tag.className = 'mine-tag';
-    tag.textContent = '你已选这个社团';
-    el.appendChild(tag);
+    const tag = document.createElement('span'); tag.className = 'mine-tag'; tag.style.marginRight = 'auto'; tag.textContent = '你已选这个社团';
     const btn = document.createElement('button'); btn.className = 'btn btn-ghost'; btn.type='button'; btn.textContent = '退选';
     btn.onclick = () => askCancel(act, c);
-    act.appendChild(btn);
-  } else if (mine){
-    act.appendChild(disabled('已选其他社团'));
-  } else if (full){
-    act.appendChild(disabled('已满员'));
-  } else if (!canRegister){
-    act.appendChild(disabled('未开始'));
+    act.append(tag, btn);
+  } else if (mine){ act.appendChild(note('已选其他社团'));
+  } else if (full){ act.appendChild(note('已满员'));
+  } else if (!canRegister){ act.appendChild(note('未开始'));
   } else {
-    const btn = document.createElement('button'); btn.className = 'btn btn-go'; btn.type='button'; btn.textContent = '报名';
+    const btn = document.createElement('button'); btn.className = 'btn btn-go'; btn.type='button';
+    btn.innerHTML = '报名<span class="arr" aria-hidden="true">→</span>';
     btn.onclick = () => doRegister(btn, c.id);
     act.appendChild(btn);
   }
@@ -168,8 +168,8 @@ function card(c, mine){
   return el;
 }
 
-function disabled(label){
-  const b = document.createElement('button'); b.className='btn'; b.type='button'; b.disabled=true; b.textContent=label; return b;
+function note(label){
+  const s = document.createElement('span'); s.style.cssText = 'color:var(--faint);font-size:13px'; s.textContent = label; return s;
 }
 
 function askCancel(act, c){

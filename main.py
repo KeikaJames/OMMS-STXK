@@ -659,6 +659,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._serve_page(PAGES[path])
         if path in STATIC:
             return self._serve_static(STATIC[path])
+        if path.startswith("/fonts/") and path.endswith(".woff2") and "/" not in path[7:] and ".." not in path:
+            return self._serve_static((path[1:], "font/woff2"))
         route = GET_ROUTES.get(path)
         if route is None and path.startswith("/api/export_club_data"):
             route = ("_h_export_club_data", ROLE_ADMIN)
