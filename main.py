@@ -554,6 +554,10 @@ PAGES = {
     "/student/profile": "student_profile.html",
     "/admin/dashboard": "admin_dashboard.html",
 }
+STATIC = {
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+}
 
 
 # ==========================================================================
@@ -652,6 +656,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path in PAGES:
             return self._serve_page(PAGES[path])
+        if path in STATIC:
+            return self._serve_static(STATIC[path])
         route = GET_ROUTES.get(path)
         if route is None and path.startswith("/api/export_club_data"):
             route = ("_h_export_club_data", ROLE_ADMIN)
@@ -696,6 +702,15 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         except OSError:
             return self._json(404, {"success": False, "message": "页面不存在"})
         self._send(200, body, ctype="text/html; charset=utf-8")
+
+    def _serve_static(self, spec):
+        fname, ctype = spec
+        try:
+            with open(fname, "rb") as f:
+                body = f.read()
+        except OSError:
+            return self._json(404, {"success": False, "message": "资源不存在"})
+        self._send(200, body, ctype=ctype, extra=[("Cache-Control", "public, max-age=300")])
 
     # ======================================================================
     # 公共端点
