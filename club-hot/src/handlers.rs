@@ -184,17 +184,24 @@ pub async fn register_club(
         Err(_) => return fail(StatusCode::SERVICE_UNAVAILABLE, "系统繁忙，请稍后重试"),
     };
 
-    // -2 = stock key missing. Once initialized, a full rebuild would re-add seats
-    // held by in-flight reservations on other clubs (oversell), so only rebuild on
-    // genuine cold start; otherwise treat the club as unavailable.
+    // -2 = this club's stock key is missing. Once initialized, recover only THIS club's
+    // key from its committed count (SET NX, can't oversell since a missing key means no
+    // in-flight reservation for it); never full-rebuild here (would re-add seats reserved
+    // on other clubs). Cold start: full rebuild.
     if outcome == AcquireOutcome::Uninitialized {
         if seats.initialized().await {
-            return json_status(
-                StatusCode::OK,
-                json!({ "success": false, "message": "该社团暂不可报名，请刷新重试" }),
-            );
+            let exists = crate::redis_seats::init_club_stock(&seats, &state.db, club_id)
+                .await
+                .unwrap_or(false);
+            if !exists {
+                return json_status(
+                    StatusCode::OK,
+                    json!({ "success": false, "message": "该社团不存在" }),
+                );
+            }
+        } else {
+            let _ = crate::redis_seats::rebuild_stock(&seats, &state.db).await;
         }
-        let _ = crate::redis_seats::rebuild_stock(&seats, &state.db).await;
         outcome = match seats.acquire(sid, club_id, state.cfg.resv_ttl).await {
             Ok(o) => o,
             Err(_) => return fail(StatusCode::SERVICE_UNAVAILABLE, "系统繁忙，请稍后重试"),

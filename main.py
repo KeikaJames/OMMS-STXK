@@ -524,6 +524,23 @@ def rebuild_stock():
         log.error("rebuild_stock 失败: %s", e)
 
 
+def init_club_stock(club_id):
+    """缺键恢复:仅初始化该社团名额(SET NX,缺键意味无在途预留,不会超卖);返回社团是否在库。"""
+    with DB_POOL.connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT max_students, "
+                    "(SELECT COUNT(*) FROM registrations r WHERE r.club_id=c.id) "
+                    "FROM clubs c WHERE c.id=?", (club_id,))
+        row = cur.fetchone()
+    if not row:
+        return False
+    try:
+        RG.r.set(K_STOCK.format(club_id), max(0, int(row[0]) - int(row[1])), nx=True)
+    except Exception as e:  # noqa: BLE001
+        log.error("init_club_stock cid=%s: %s", club_id, e)
+    return True
+
+
 def seed_open_at():
     try:
         with DB_POOL.connection() as conn:
@@ -905,7 +922,16 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         except RuntimeError:
             return self._json(503, {"success": False, "message": "系统繁忙,请稍后重试"})
         if code == -2:
-            rebuild_stock()
+            # 缺键:已初始化则只补该社团(避免全量 rebuild 还原他社在途预留→超卖),冷启动才全量
+            try:
+                inited = bool(RG.r) and bool(RG.r.exists(K_INIT))
+            except Exception:  # noqa: BLE001
+                inited = True
+            if inited:
+                if not init_club_stock(club_id):
+                    return self._json(200, {"success": False, "message": "社团不存在"})
+            else:
+                rebuild_stock()
             try:
                 code = RG.acquire_seat(sid, club_id)
             except RuntimeError:
