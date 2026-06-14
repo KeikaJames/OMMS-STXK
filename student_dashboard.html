@@ -140,8 +140,7 @@ function card(c, mine){
   seats.append(n, u); el.appendChild(seats);
 
   const bar = document.createElement('div'); bar.className = 'bar' + (urgent ? ' urgent' : '');
-  const remPct = c.max_students ? Math.round(left / c.max_students * 100) : 0;
-  const fl = document.createElement('i'); fl.style.width = remPct + '%'; bar.appendChild(fl); el.appendChild(bar);
+  const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl); el.appendChild(bar);
 
   const act = document.createElement('div'); act.className = 'act';
   if (isMine){

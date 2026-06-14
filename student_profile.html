@@ -61,7 +61,7 @@ async function load(){
   $('#f-sid').textContent = d.student_id; $('#f-user').textContent = d.username;
   const card = $('#reg-card');
   if (d.registered_club){
-    const t = d.registration_time ? d.registration_time : '';
+    const t = d.registration_time ? d.registration_time.slice(0, 16) : '';
     card.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px">'
       + '<span style="font-size:16px;font-weight:600;color:var(--ink)" id="rc-name"></span><span class="badge-ok">已报名</span></div>'
       + '<p style="margin:11px 0 0;font-size:13px;color:var(--muted)" id="rc-time"></p>';
