@@ -7,5 +7,5 @@
   <!-- 门 -->
   <rect x="14.2" y="19.4" width="3.6" height="5" rx="0.7" fill="#161B24"/>
   <!-- 炊烟 -->
-  <path d="M16 6.4 q-1.8 -1.5 0 -3 q1.8 -1.5 0 -3" fill="none" stroke="#E2552E" stroke-width="1.2" stroke-linecap="round"/>
+  <path d="M16 6.4 q-1.9 -1.6 0 -3.2 q1.9 -1.6 0 -3.2" fill="none" stroke="#E2552E" stroke-width="1.6" stroke-linecap="round"/>
 </svg>
