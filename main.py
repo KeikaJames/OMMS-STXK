@@ -665,6 +665,12 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._serve_static(STATIC[path])
         if path.startswith("/fonts/") and path.endswith(".woff2") and "/" not in path[7:] and ".." not in path:
             return self._serve_static((path[1:], "font/woff2"))
+        if path.startswith("/img/") and "/" not in path[5:] and ".." not in path:
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            mt = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                  "webp": "image/webp", "svg": "image/svg+xml"}.get(ext)
+            if mt:
+                return self._serve_static((path[1:], mt))
         route = GET_ROUTES.get(path)
         if route is None and path.startswith("/api/export_club_data"):
             route = ("_h_export_club_data", ROLE_ADMIN)

@@ -69,6 +69,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); line
 /* ---- 社团卡(一种卡) ---- */
 .clubs { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 14px; }
 @media (min-width: 600px) { .clubs { grid-template-columns: 1fr 1fr; } }
+@media (min-width: 1024px) { .wrap-clubs { max-width: 960px; } .clubs { grid-template-columns: repeat(3, 1fr); } }
 .club { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 16px 18px; box-shadow: var(--sh-1); display: flex; flex-direction: column; transition: box-shadow .25s var(--ease), border-color .2s var(--ease); }
 .club:hover { box-shadow: var(--sh-2); }
 .club.mine { border-color: var(--brand); }
@@ -125,6 +126,14 @@ textarea.input { height: auto; padding: 11px 13px; line-height: 1.5; }
 .seg.fit { width: fit-content; }
 .seg button { flex: 1; border: none; background: none; font: inherit; font-size: 14px; font-weight: 500; line-height: 1.2; color: var(--ink); padding: 9px 18px; border-radius: var(--r-sm); cursor: pointer; transition: background .15s var(--ease), color .15s var(--ease); }
 .seg button:not(.on):hover { background: rgba(28,27,24,.035); }
+
+/* ---- 主页(登录):铅笔速写背景 + 毛玻璃卡(纸张米色与 --bg 同源,天然融合) ---- */
+body.home { min-height: 100dvh; background: linear-gradient(180deg, rgba(241,240,236,.18), rgba(241,240,236,.40) 52%, rgba(241,240,236,.66)), url("/img/home-bg.jpg") center 30% / cover no-repeat; background-color: var(--bg); }
+body.home .card { background: rgba(255,255,255,.80); -webkit-backdrop-filter: blur(14px) saturate(1.07); backdrop-filter: blur(14px) saturate(1.07); border: 1px solid rgba(255,255,255,.78); box-shadow: 0 14px 40px -16px rgba(28,27,24,.32), inset 0 1px 0 rgba(255,255,255,.6); }
+body.home .home-head { position: relative; }
+body.home .home-head::before { content: ""; position: absolute; inset: -14px -36px -8px; background: radial-gradient(58% 74% at 50% 44%, rgba(241,240,236,.85), rgba(241,240,236,0) 72%); z-index: -1; pointer-events: none; }
+body.home .foot { color: rgba(28,27,24,.5); }
+@media (min-width: 768px) { body.home .home-head img { width: 52px; height: 52px; } body.home .home-head h1 { font-size: 23px; } }
 .seg.fit button { flex: none; }
 .seg button.on { background: var(--surface); color: var(--ink); box-shadow: inset 0 0 0 1px rgba(28,27,24,.09), 0 1px 1px rgba(28,27,24,.05); }
 
