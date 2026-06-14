@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="社团选课">
+  <rect width="32" height="32" rx="7" fill="#161B24"/>
+  <!-- 蒙古包(ger):圆顶 + 略鼓的毡墙 -->
+  <path d="M6.6 17 Q16 6.4 25.4 17 L24 24.4 Q16 23.3 8 24.4 Z" fill="#E2552E"/>
+  <!-- 屋顶与毡墙接缝 -->
+  <path d="M6.6 17 Q16 14.4 25.4 17" fill="none" stroke="#161B24" stroke-width="1.1" stroke-linecap="round" opacity=".55"/>
+  <!-- 门 -->
+  <rect x="14.2" y="19.4" width="3.6" height="5" rx="0.7" fill="#161B24"/>
+  <!-- 炊烟 -->
+  <path d="M16 6.4 q-1.9 -1.6 0 -3.2 q1.9 -1.6 0 -3.2" fill="none" stroke="#E2552E" stroke-width="1.6" stroke-linecap="round"/>
+</svg>

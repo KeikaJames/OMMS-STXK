@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161B24">
+<title>登录 · 鄂尔多斯市实验中学社团选课</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="home">
+<main class="home-main">
+  <div style="width:100%;max-width:380px">
+    <div class="card">
+      <div class="home-head" style="text-align:center;margin-bottom:20px">
+        <img src="/favicon.svg" width="46" height="46" alt="" style="border-radius:11px">
+        <h1 style="font-size:21px;color:var(--ink);margin-top:10px;font-weight:600">社团选课</h1>
+        <p class="mono" style="color:var(--muted);font-size:12px;margin-top:3px;letter-spacing:1.4px">鄂尔多斯市实验中学</p>
+      </div>
+      <div class="seg" id="seg">
+        <button class="on" data-type="student" type="button">学生登录</button>
+        <button data-type="admin" type="button">管理员</button>
+      </div>
+      <div class="field">
+        <label for="u">用户名</label>
+        <input class="input" id="u" autocomplete="username" placeholder="请输入用户名">
+      </div>
+      <div class="field">
+        <label for="p">密码</label>
+        <input class="input" id="p" type="password" autocomplete="current-password" placeholder="请输入密码">
+      </div>
+      <div style="margin:2px 2px 18px">
+        <span style="font-size:12px;color:var(--muted)">密码遗失,请联系班主任或管理员重置</span>
+      </div>
+      <p id="err" style="color:var(--danger);font-size:13px;min-height:0;margin:0 2px 12px"></p>
+      <button class="btn btn-primary btn-block" id="go" type="button">登录</button>
+    </div>
+  </div>
+  <p class="foot" style="position:absolute;left:0;right:0;bottom:18px;margin:0">Designed by Gabiri &middot; &copy; Weilesi</p>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+let kind = 'student';
+$('#seg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  [...$('#seg').children].forEach(x => x.classList.toggle('on', x === b));
+  kind = b.dataset.type;
+});
+function fail(m){ const e = $('#err'); e.textContent = m; }
+async function go(){
+  const u = $('#u').value.trim(), p = $('#p').value;
+  if (!u || !p){ fail('请输入用户名和密码'); return; }
+  fail('');
+  const btn = $('#go'); btn.disabled = true; const txt = btn.textContent;
+  btn.innerHTML = '<span class="spin" aria-hidden="true"></span>';
+  try{
+    const r = await fetch(kind === 'student' ? '/api/login' : '/api/admin_login', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username:u, password:p})
+    });
+    const d = await r.json();
+    if (d.success){ location.href = kind === 'student' ? '/student/dashboard' : '/admin/dashboard'; return; }
+    fail(d.message || '登录失败,请重试');
+  }catch(e){ fail('网络错误,请重试'); }
+  btn.disabled = false; btn.textContent = txt;
+}
+$('#go').addEventListener('click', go);
+$('#p').addEventListener('keyup', e => { if (e.key === 'Enter') go(); });
+$('#u').addEventListener('keyup', e => { if (e.key === 'Enter') $('#p').focus(); });
+</script>
+</body>
+</html>

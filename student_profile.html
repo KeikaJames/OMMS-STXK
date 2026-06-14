@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161B24">
+<title>个人信息 · 鄂尔多斯市实验中学社团选课</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<a class="skip" href="#main">跳到主内容</a>
+<header class="topbar">
+  <div class="brand"><img class="mark" src="/favicon.svg" alt=""><span class="t"><b>社团选课</b><small>鄂尔多斯市实验中学</small></span></div>
+  <nav class="topnav" aria-label="主导航">
+    <a href="/student/dashboard">选课</a>
+    <a href="/student/profile" class="active" aria-current="page">个人信息</a>
+    <button id="logout" type="button">退出</button>
+  </nav>
+</header>
+
+<main class="wrap" id="main">
+  <div class="section-h"><span>基本信息</span></div>
+  <div class="card" style="margin-bottom:16px">
+    <dl style="display:grid;grid-template-columns:auto 1fr;gap:14px 18px;margin:0">
+      <dt style="color:var(--muted);font-size:14px">姓名</dt><dd id="f-name" style="margin:0;text-align:right">—</dd>
+      <dt style="color:var(--muted);font-size:14px">班级</dt><dd id="f-class" style="margin:0;text-align:right">—</dd>
+      <dt style="color:var(--muted);font-size:14px">学号</dt><dd id="f-sid" class="mono" style="margin:0;text-align:right">—</dd>
+      <dt style="color:var(--muted);font-size:14px">账号</dt><dd id="f-user" style="margin:0;text-align:right">—</dd>
+    </dl>
+  </div>
+
+  <div class="section-h"><span>我的社团</span></div>
+  <div class="card" id="reg-card" style="margin-bottom:16px">
+    <p id="reg-empty" class="empty" style="padding:18px 0">还未报名任何社团</p>
+  </div>
+
+  <div class="section-h"><span>修改密码</span></div>
+  <div class="card">
+    <div class="field"><label for="cp">当前密码</label><input class="input" id="cp" type="password" autocomplete="current-password"></div>
+    <div class="field"><label for="np">新密码（至少 6 位）</label><input class="input" id="np" type="password" autocomplete="new-password"></div>
+    <div class="field"><label for="np2">确认新密码</label><input class="input" id="np2" type="password" autocomplete="new-password"></div>
+    <button class="btn btn-primary" id="save" type="button" style="min-width:128px">保存</button>
+  </div>
+
+  <div class="toast-wrap" id="toasts" aria-live="polite"></div>
+  <p class="foot">Designed by Gabiri &middot; &copy; Weilesi</p>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+function splitRoom(n){ const m = n.match(/^(.*?)（\s*([0-9A-Za-z]+)\s*）\s*$/); return m ? {name:m[1].trim(), room:m[2]} : {name:n, room:null}; }
+function toast(msg, kind){
+  const t = document.createElement('div'); t.className = 'toast' + (kind ? ' '+kind : ''); t.textContent = msg;
+  $('#toasts').appendChild(t); setTimeout(() => t.remove(), 2600);
+}
+async function load(){
+  const r = await fetch('/api/get_student_info', {headers:{'Content-Type':'application/json'}});
+  if (r.status === 401){ location.href = '/'; return; }
+  const d = await r.json();
+  $('#f-name').textContent = d.name; $('#f-class').textContent = d.class;
+  $('#f-sid').textContent = d.student_id; $('#f-user').textContent = d.username;
+  const card = $('#reg-card');
+  if (d.registered_club){
+    const t = d.registration_time ? d.registration_time.slice(0, 16) : '';
+    card.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px">'
+      + '<span style="font-size:16px;font-weight:600;color:var(--ink)" id="rc-name"></span><span class="badge-ok">已报名</span></div>'
+      + '<p style="margin:11px 0 0;font-size:13px;color:var(--muted)" id="rc-time"></p>';
+    const ri = splitRoom(d.registered_club);
+    const rcn = card.querySelector('#rc-name'); rcn.textContent = ri.name;
+    if (ri.room){ const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = ri.room + ' 室'; rcn.appendChild(rm); }
+    card.querySelector('#rc-time').textContent = '报名时间 ' + t;
+  }
+}
+$('#save').addEventListener('click', async () => {
+  const cp = $('#cp').value, np = $('#np').value, np2 = $('#np2').value;
+  if (!cp || !np || !np2){ toast('请填写所有密码字段', 'err'); return; }
+  if (np !== np2){ toast('两次新密码不一致', 'err'); return; }
+  if (np.length < 6){ toast('新密码至少 6 位', 'err'); return; }
+  const btn = $('#save'); btn.disabled = true; const txt = btn.textContent;
+  btn.innerHTML = '<span class="spin" aria-hidden="true"></span>';
+  try{
+    const r = await fetch('/api/change_password', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({current:cp, new:np})});
+    if (r.status === 401){ location.href = '/'; return; }
+    const d = await r.json();
+    toast(d.message || (d.success ? '密码已修改' : '修改失败'), d.success ? 'ok' : 'err');
+    if (d.success){ $('#cp').value = $('#np').value = $('#np2').value = ''; }
+  }catch(e){ toast('网络错误', 'err'); }
+  btn.disabled = false; btn.textContent = txt;
+});
+$('#logout').onclick = async () => {
+  try{ await fetch('/api/logout', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); }catch(e){}
+  location.href = '/';
+};
+load();
+</script>
+</body>
+</html>

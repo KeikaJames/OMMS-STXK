@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161B24">
+<title>管理控制台 · 鄂尔多斯市实验中学社团选课</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<a class="skip" href="#main">跳到主内容</a>
+<header class="topbar">
+  <div class="brand"><img class="mark" src="/favicon.svg" alt=""><span class="t"><b>管理控制台</b><small>鄂尔多斯市实验中学</small></span></div>
+  <nav class="topnav"><button id="logout" type="button">退出</button></nav>
+</header>
+
+<main class="wrap wrap-wide" id="main">
+  <div class="seg fit" id="seg">
+    <button class="on" data-v="overview" type="button">概览</button>
+    <button data-v="students" type="button">学生</button>
+    <button data-v="clubs" type="button">社团</button>
+    <button data-v="settings" type="button">设置</button>
+  </div>
+
+  <section data-view="overview">
+    <div class="grid-metrics" style="margin-bottom:18px">
+      <div class="metric"><div class="k">社团</div><div class="v" id="m-clubs">—</div></div>
+      <div class="metric"><div class="k">学生</div><div class="v" id="m-students">—</div></div>
+      <div class="metric"><div class="k">已报名</div><div class="v" id="m-reg">—</div></div>
+      <div class="metric"><div class="k">未报名</div><div class="v" id="m-unreg">—</div></div>
+      <div class="metric hero"><div class="k">报名率</div><div class="v" id="m-rate">—</div></div>
+    </div>
+    <div class="section-h"><span>各社团填报</span><span class="num" id="ov-time"></span></div>
+    <div class="card" id="ov-fill"><div class="sk" style="height:60px"></div></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">
+      <a class="btn btn-secondary" style="width:auto" href="/api/export_all_data">导出报名总表</a>
+      <a class="btn btn-secondary" style="width:auto" href="/api/export_unregistered">导出未报名名单</a>
+      <a class="btn btn-secondary" style="width:auto" href="/api/export_students_csv">导出学生账号</a>
+    </div>
+  </section>
+
+  <section data-view="students" hidden>
+    <div class="section-h"><span>导入学生</span></div>
+    <div class="card" style="margin-bottom:18px">
+      <p style="font-size:13px;color:var(--muted);margin-bottom:8px">每行一个,用逗号分隔:<span class="mono">姓名,班级,学号</span></p>
+      <textarea class="input" id="imp-stu" rows="4" style="font-family:var(--mono);resize:vertical" placeholder="李四,高一(2)班,2024012&#10;王五,高一(3)班,2024013"></textarea>
+      <button class="btn btn-primary" id="imp-stu-go" type="button" style="width:auto;margin-top:10px;padding:11px 24px">导入</button>
+      <div id="imp-stu-out" style="margin-top:12px"></div>
+    </div>
+    <div class="section-h"><span>学生名单</span><button class="btn btn-quiet" id="del-all-stu" type="button" style="color:var(--danger)">清空全部</button></div>
+    <div class="card" style="padding:0;overflow:auto"><table class="tbl" id="stu-tbl"><tbody><tr><td style="padding:16px">加载中…</td></tr></tbody></table></div>
+  </section>
+
+  <section data-view="clubs" hidden>
+    <div class="section-h"><span>导入社团</span></div>
+    <div class="card" style="margin-bottom:18px">
+      <p style="font-size:13px;color:var(--muted);margin-bottom:8px">每行一个,用逗号分隔:<span class="mono">社团名,人数上限</span></p>
+      <textarea class="input" id="imp-club" rows="3" style="font-family:var(--mono);resize:vertical" placeholder="机器人（316）,12&#10;书法社（201）,20"></textarea>
+      <button class="btn btn-primary" id="imp-club-go" type="button" style="width:auto;margin-top:10px;padding:11px 24px">导入</button>
+      <div id="imp-club-out" style="margin-top:10px"></div>
+    </div>
+    <div class="section-h"><span>社团列表</span></div>
+    <div id="club-list" class="clubs"><div class="sk sk-club"></div></div>
+  </section>
+
+  <section data-view="settings" hidden>
+    <div class="section-h"><span>报名开放时间</span></div>
+    <div class="card" style="max-width:420px">
+      <div class="field"><label for="open-at">到点后学生才能抢课</label><input class="input" id="open-at" type="datetime-local"></div>
+      <button class="btn btn-primary" id="save-time" type="button" style="width:auto;padding:11px 24px">保存</button>
+    </div>
+  </section>
+
+  <div class="toast-wrap" id="toasts" aria-live="polite"></div>
+  <p class="foot">Designed by Gabiri &middot; &copy; Weilesi</p>
+</main>
+
+<script>
+const $ = s => document.querySelector(s), $$ = s => document.querySelectorAll(s);
+function toast(m, k){ const t = document.createElement('div'); t.className = 'toast'+(k?' '+k:''); t.textContent = m; $('#toasts').appendChild(t); setTimeout(()=>t.remove(), 2800); }
+async function api(path, opts){
+  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+  if (r.status === 401){ location.href = '/'; throw new Error('unauth'); }
+  return r;
+}
+function splitRoom(n){ const m = n.match(/^(.*?)（\s*([0-9A-Za-z]+)\s*）\s*$/); return m ? {name:m[1].trim(), room:m[2]} : {name:n, room:null}; }
+
+$('#seg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  [...$('#seg').children].forEach(x => x.classList.toggle('on', x === b));
+  $$('section[data-view]').forEach(s => s.hidden = s.dataset.view !== b.dataset.v);
+});
+
+async function loadOverview(){
+  try{
+    const [clubs, regs, t] = await Promise.all([
+      (await api('/api/get_clubs')).json(), (await api('/api/get_registrations')).json(), (await api('/api/check_registration_time')).json()
+    ]);
+    const total = regs.length, reg = regs.filter(r => r.club_name && r.club_name !== '未报名').length;
+    $('#m-clubs').textContent = clubs.length;
+    $('#m-students').textContent = total;
+    $('#m-reg').textContent = reg;
+    $('#m-unreg').textContent = total - reg;
+    $('#m-rate').innerHTML = total ? Math.round(reg/total*100) + '<small>%</small>' : '—';
+    $('#ov-time').innerHTML = t.start_time ? (t.can_register ? '<span class="pill"><span class="dot"></span>开抢中</span>' : '<span style="color:var(--muted);font-size:13px">开放 ' + t.start_time + '</span>') : '<span style="color:var(--faint);font-size:13px">未设时间</span>';
+    const box = $('#ov-fill'); box.innerHTML = '';
+    if (!clubs.length){ box.innerHTML = '<p class="empty">还没有社团</p>'; return; }
+    clubs.forEach(c => {
+      const info = splitRoom(c.name);
+      const full = c.current_students >= c.max_students;
+      const pct = c.max_students ? Math.round(c.current_students/c.max_students*100) : 0;
+      const rem = c.max_students - c.current_students;
+      const blvl = full ? '' : (rem <= 3 ? 'urgent' : rem <= 6 ? 'warm' : '');
+      const row = document.createElement('div'); row.className = 'fill-row';
+      const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = info.name;
+      if (info.room){ const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = info.room + ' 室'; nm.appendChild(rm); }
+      const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = c.current_students + ' / ' + c.max_students;
+      const bar = document.createElement('div'); bar.className = 'bar' + (blvl ? ' ' + blvl : '');
+      const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl);
+      row.append(nm, ct, bar);
+      box.appendChild(row);
+    });
+  }catch(e){ if (e.message !== 'unauth') console.error(e); }
+}
+
+async function loadStudents(){
+  const rows = await (await api('/api/get_all_students')).json();
+  const tb = $('#stu-tbl');
+  if (!rows.length){ tb.innerHTML = '<tbody><tr><td class="empty" style="padding:30px">还没有学生</td></tr></tbody>'; return; }
+  tb.innerHTML = '<thead><tr><th>姓名</th><th>班级</th><th>学号</th><th>账号</th><th></th></tr></thead><tbody></tbody>';
+  const body = tb.querySelector('tbody');
+  rows.forEach(s => {
+    const tr = document.createElement('tr');
+    ['name','class','student_id','username'].forEach(k => { const td = document.createElement('td'); if (k==='student_id') td.className='mono'; td.textContent = s[k]; tr.appendChild(td); });
+    const td = document.createElement('td'); td.style.textAlign = 'right';
+    const del = document.createElement('button'); del.className = 'btn btn-quiet'; del.style.color = 'var(--danger)'; del.type='button'; del.textContent = '删除';
+    del.onclick = () => confirmInline(del, async () => { await api('/api/delete_student', {method:'POST', body:JSON.stringify({student_id:s.id})}); toast('已删除', 'ok'); loadStudents(); loadOverview(); });
+    td.appendChild(del); tr.appendChild(td); body.appendChild(tr);
+  });
+}
+
+async function loadClubs(){
+  const clubs = await (await api('/api/get_clubs')).json();
+  const box = $('#club-list'); box.innerHTML = '';
+  if (!clubs.length){ box.innerHTML = '<p class="empty" style="grid-column:1/-1">还没有社团</p>'; return; }
+  clubs.forEach(c => {
+    const info = splitRoom(c.name), full = c.current_students >= c.max_students;
+    const el = document.createElement('article'); el.className = 'club' + (full ? ' full' : '');
+    const top = document.createElement('div'); top.className = 'club-top';
+    const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name;
+    if (info.room){ const rm = document.createElement('span'); rm.className='rm'; rm.textContent = info.room + ' 室'; nm.appendChild(rm); }
+    top.appendChild(nm); el.appendChild(top);
+    const seats = document.createElement('div'); seats.className = 'seats';
+    seats.innerHTML = '<span class="n" style="font-size:22px"></span><span class="u"></span>';
+    seats.querySelector('.n').textContent = c.current_students + '/' + c.max_students;
+    seats.querySelector('.u').textContent = '已报名';
+    el.appendChild(seats);
+    const pct = c.max_students ? Math.round(c.current_students/c.max_students*100) : 0;
+    const rem = c.max_students - c.current_students;
+    const bar = document.createElement('div'); bar.className = 'bar' + (full ? '' : (rem <= 3 ? ' urgent' : rem <= 6 ? ' warm' : ''));
+    const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl); el.appendChild(bar);
+    const act = document.createElement('div'); act.className = 'act';
+    const exp = document.createElement('a'); exp.className='btn btn-secondary btn-sm'; exp.textContent='导出名单'; exp.href = '/api/export_club_data?club_id='+c.id;
+    const del = document.createElement('button'); del.className='btn btn-secondary btn-sm'; del.style.color='var(--brand)'; del.type='button'; del.textContent='删除';
+    del.onclick = () => confirmInline(del, async () => { const r = await api('/api/delete_club', {method:'POST', body:JSON.stringify({club_id:c.id})}); const d = await r.json(); toast(d.message || (d.success?'已删除':'删除失败'), d.success?'ok':'err'); loadClubs(); loadOverview(); });
+    act.append(exp, del); el.appendChild(act);
+    box.appendChild(el);
+  });
+}
+
+function confirmInline(btn, fn){
+  if (btn.dataset.armed){ return; }
+  const txt = btn.textContent, orig = btn.onclick;
+  btn.dataset.armed = '1'; btn.textContent = '确认?'; btn.style.fontWeight = '600';
+  const reset = () => { btn.textContent = txt; btn.style.fontWeight = ''; btn.onclick = orig; delete btn.dataset.armed; };
+  btn.onclick = async () => { reset(); try{ await fn(); }catch(e){} };
+  setTimeout(() => { if (btn.dataset.armed) reset(); }, 3000);
+}
+
+function parseLines(txt, n){
+  return txt.split(/\n+/).map(l => l.trim()).filter(Boolean).map(l => l.split(/[,，\t]+/).map(x => x.trim())).filter(p => p.length >= n);
+}
+
+$('#imp-stu-go').onclick = async () => {
+  const rows = parseLines($('#imp-stu').value, 3);
+  if (!rows.length){ toast('没有可导入的行', 'err'); return; }
+  const students = rows.map(p => ({name:p[0], class:p[1], student_id:p[2]}));
+  const r = await api('/api/import_students', {method:'POST', body:JSON.stringify({students})});
+  const d = await r.json();
+  toast('成功 '+d.success+',失败 '+d.failed, d.success?'ok':'err');
+  const out = $('#imp-stu-out');
+  if (d.credentials && d.credentials.length){
+    out.innerHTML = '<p style="font-size:13px;color:var(--muted);margin:6px 0">初始账号(仅此一次,请导出留存):</p><div class="card" style="padding:0;overflow:auto"><table class="tbl"><thead><tr><th>姓名</th><th>账号</th><th>初始密码</th></tr></thead><tbody></tbody></table></div>';
+    const tb = out.querySelector('tbody');
+    d.credentials.forEach(c => { const tr = document.createElement('tr'); ['name','username','password'].forEach(k => { const td = document.createElement('td'); if (k==='password') td.className='mono'; td.textContent = c[k]; tr.appendChild(td); }); tb.appendChild(tr); });
+  }
+  $('#imp-stu').value = ''; loadStudents(); loadOverview();
+};
+
+$('#imp-club-go').onclick = async () => {
+  const rows = parseLines($('#imp-club').value, 2);
+  if (!rows.length){ toast('没有可导入的行', 'err'); return; }
+  const clubs = rows.map(p => ({name:p[0], max_students:parseInt(p[1],10)})).filter(c => c.max_students > 0);
+  const r = await api('/api/import_clubs', {method:'POST', body:JSON.stringify({clubs})});
+  const d = await r.json();
+  toast('成功 '+d.success+',失败 '+d.failed, d.success?'ok':'err');
+  $('#imp-club').value = ''; loadClubs(); loadOverview();
+};
+
+$('#del-all-stu').onclick = () => confirmInline($('#del-all-stu'), async () => { await api('/api/delete_all_students', {method:'POST', body:JSON.stringify({confirm:true})}); toast('已清空学生', 'ok'); loadStudents(); loadOverview(); });
+
+$('#save-time').onclick = async () => {
+  const v = $('#open-at').value; if (!v){ toast('请选择时间', 'err'); return; }
+  const start = v.replace('T', ' ') + ':00';
+  const r = await api('/api/update_registration_time', {method:'POST', body:JSON.stringify({start_time:start})});
+  const d = await r.json();
+  toast(d.success ? '已保存' : (d.message || '保存失败'), d.success?'ok':'err');
+};
+
+async function loadSettings(){
+  const t = await (await api('/api/check_registration_time')).json();
+  if (t.start_time){ $('#open-at').value = t.start_time.slice(0,16).replace(' ', 'T'); }
+}
+
+$('#logout').onclick = async () => { try{ await fetch('/api/logout', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); }catch(e){} location.href = '/'; };
+
+loadOverview(); loadStudents(); loadClubs(); loadSettings();
+setInterval(loadOverview, 6000);
+</script>
+</body>
+</html>

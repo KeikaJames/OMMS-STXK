@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161B24">
+<title>选课主页 · 鄂尔多斯市实验中学社团选课</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<a class="skip" href="#main">跳到主内容</a>
+
+<header class="topbar">
+  <div class="brand"><img class="mark" src="/favicon.svg" alt=""><span class="t"><b>社团选课</b><small>鄂尔多斯市实验中学</small></span></div>
+  <nav class="topnav" aria-label="主导航">
+    <a href="/student/dashboard" class="active" aria-current="page">选课</a>
+    <a href="/student/profile">个人信息</a>
+    <button id="logout" type="button">退出</button>
+  </nav>
+</header>
+
+<main class="wrap wrap-clubs" id="main">
+  <section aria-labelledby="status-h">
+    <h2 id="status-h" class="sr-only" style="position:absolute;left:-999px">选课状态</h2>
+    <div class="status" id="statusbar">
+      <div class="status-top">
+        <span class="lab"><span class="dot"></span><span id="status-text">正在载入</span></span>
+        <span class="clock num" id="clock"></span>
+      </div>
+      <p class="rule">每人 <b>限选 1 个</b> 社团 · 抢到后可退选改选</p>
+    </div>
+  </section>
+
+  <section aria-labelledby="clubs-h">
+    <div class="section-h"><span id="clubs-h">社团列表</span><span id="hint" class="num"></span></div>
+    <div class="clubs" id="clubs">
+      <div class="sk sk-club"></div><div class="sk sk-club"></div>
+    </div>
+  </section>
+
+  <div class="toast-wrap" id="toasts" aria-live="polite"></div>
+  <p class="foot">Designed by Gabiri &middot; &copy; Weilesi</p>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+let me = null;            // 学生信息(含 registered_club)
+let canRegister = false;
+let openAt = null;        // 开放时刻(毫秒)
+let inflight = false;     // 单飞:同一时刻只允许一个写操作
+let backoffUntil = 0;     // 503 退避截止
+
+function toast(msg, kind){
+  const t = document.createElement('div');
+  t.className = 'toast' + (kind ? ' ' + kind : '');
+  t.textContent = msg;
+  $('#toasts').appendChild(t);
+  setTimeout(() => t.remove(), 2600);
+}
+
+async function api(path, opts){
+  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+  if (r.status === 401){ location.href = '/'; throw new Error('unauth'); }
+  return r;
+}
+
+function splitRoom(name){
+  const m = name.match(/^(.*?)（\s*([0-9A-Za-z]+)\s*）\s*$/);
+  return m ? {name: m[1].trim(), room: m[2] + ' 室'} : {name, room: null};
+}
+
+function fmtClock(d){
+  const p = n => String(n).padStart(2,'0');
+  return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+
+function tickClock(){
+  const now = new Date();
+  if (canRegister || openAt === null){
+    $('#clock').textContent = fmtClock(now);
+  } else {
+    let s = Math.max(0, Math.round((openAt - now.getTime())/1000));
+    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60); s = s%60;
+    const p = n => String(n).padStart(2,'0');
+    $('#clock').textContent = (h>0 ? p(h)+':' : '') + p(m)+':'+p(s);
+  }
+}
+
+async function refresh(){
+  try{
+    const [tRes, cRes, sRes] = await Promise.all([
+      api('/api/check_registration_time'), api('/api/get_clubs'), api('/api/get_student_info')
+    ]);
+    const t = await tRes.json(), clubs = await cRes.json(); me = await sRes.json();
+    canRegister = !!t.can_register;
+    openAt = t.start_time ? new Date(t.start_time.replace(/-/g,'/')).getTime() : null;
+    renderStatus(); renderClubs(clubs);
+  }catch(e){ if (e.message !== 'unauth') console.error(e); }
+}
+
+function renderStatus(){
+  const bar = $('#statusbar');
+  if (canRegister){ bar.className = 'status open'; $('#status-text').textContent = '开抢进行中'; }
+  else if (openAt){ bar.className = 'status'; $('#status-text').textContent = '距开抢'; }
+  else { bar.className = 'status'; $('#status-text').textContent = '尚未设置开放时间'; }
+  tickClock();
+}
+
+function renderClubs(clubs){
+  const box = $('#clubs'); box.innerHTML = '';
+  if (!clubs.length){
+    box.innerHTML = '<div class="empty" style="grid-column:1/-1">暂无社团</div>';
+    $('#hint').textContent = ''; return;
+  }
+  const mine = me && me.registered_club;
+  $('#hint').textContent = mine ? '已选 1 / 1' : (canRegister ? '可选 1 个' : '');
+  clubs.forEach(c => box.appendChild(card(c, mine)));
+}
+
+function card(c, mine){
+  const isMine = mine && me.registered_club === c.name;
+  const full = c.current_students >= c.max_students;
+  const left = Math.max(0, c.max_students - c.current_students);
+  const urgent = !full && left <= 3;
+  const pct = c.max_students ? Math.round(c.current_students / c.max_students * 100) : 0;
+  const info = splitRoom(c.name);
+
+  const el = document.createElement('article');
+  el.className = 'club' + (isMine ? ' mine' : '') + (full ? ' full' : '');
+
+  const top = document.createElement('div'); top.className = 'club-top';
+  const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name;
+  if (info.room){ const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = info.room; nm.appendChild(rm); }
+  top.appendChild(nm); el.appendChild(top);
+
+  const seats = document.createElement('div'); seats.className = 'seats';
+  const n = document.createElement('span'); n.className = 'n' + (full ? ' gone' : (urgent ? ' urgent' : '')); n.textContent = full ? '0' : left;
+  const u = document.createElement('span'); u.className = 'u'; u.textContent = full ? ('已满 · 共 ' + c.max_students) : ('个名额 · 共 ' + c.max_students);
+  seats.append(n, u); el.appendChild(seats);
+
+  const blvl = full ? '' : (urgent ? 'urgent' : (left <= 6 ? 'warm' : ''));
+  const bar = document.createElement('div'); bar.className = 'bar' + (blvl ? ' ' + blvl : '');
+  const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl); el.appendChild(bar);
+
+  const act = document.createElement('div'); act.className = 'act';
+  if (isMine){
+    const badge = document.createElement('span'); badge.className = 'badge-ok grow'; badge.textContent = '你已选这个社团';
+    const btn = document.createElement('button'); btn.className = 'btn btn-secondary btn-sm'; btn.type='button'; btn.textContent = '退选';
+    btn.onclick = () => askCancel(act, c);
+    act.append(badge, btn);
+  } else if (mine){ act.appendChild(state('已选其他社团'));
+  } else if (full){ act.appendChild(state('已满员'));
+  } else if (!canRegister){ act.appendChild(state('未开始'));
+  } else {
+    const btn = document.createElement('button'); btn.className = 'btn btn-primary btn-sm'; btn.type='button'; btn.textContent = '报名';
+    btn.onclick = () => doRegister(btn, c.id);
+    act.appendChild(btn);
+  }
+  el.appendChild(act);
+  return el;
+}
+
+function state(label){ const s = document.createElement('span'); s.className = 'state'; s.textContent = label; return s; }
+
+function askCancel(act, c){
+  act.innerHTML = '';
+  act.className = 'confirm';
+  const yes = document.createElement('button'); yes.className='btn btn-secondary btn-sm'; yes.style.color='var(--brand)'; yes.type='button'; yes.textContent='确认退选';
+  const no = document.createElement('button'); no.className='btn btn-primary btn-sm'; no.type='button'; no.textContent='再想想';
+  yes.onclick = () => doCancel(yes);
+  no.onclick = () => refresh();
+  act.append(yes, no);
+}
+
+function busy(btn, on){
+  if (on){ btn.dataset.txt = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spin" aria-hidden="true"></span>'; }
+  else { btn.disabled = false; btn.textContent = btn.dataset.txt || btn.textContent; }
+}
+
+async function guardedWrite(btn, fn){
+  if (inflight) return;
+  if (Date.now() < backoffUntil){ toast('系统繁忙,请稍候重试', 'err'); return; }
+  inflight = true; busy(btn, true);
+  try { await fn(); }
+  finally { inflight = false; busy(btn, false); }
+}
+
+function doRegister(btn, clubId){
+  guardedWrite(btn, async () => {
+    const r = await fetch('/api/register_club', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({club_id: clubId})});
+    if (r.status === 401){ location.href='/'; return; }
+    if (r.status === 503 || r.status === 429){
+      const ra = parseInt(r.headers.get('Retry-After') || '2', 10);
+      backoffUntil = Date.now() + (isNaN(ra)?2:ra)*1000;
+      toast('系统繁忙,'+ (isNaN(ra)?2:ra) +' 秒后可重试', 'err'); return;
+    }
+    const d = await r.json();
+    toast(d.message || (d.success ? '报名成功' : '报名失败'), d.success ? 'ok' : 'err');
+    await refresh();
+  });
+}
+
+function doCancel(btn){
+  guardedWrite(btn, async () => {
+    const r = await api('/api/cancel_registration', {method:'POST', body:'{}'});
+    const d = await r.json();
+    toast(d.message || (d.success ? '已退选' : '退选失败'), d.success ? 'ok' : 'err');
+    await refresh();
+  });
+}
+
+$('#logout').onclick = async () => {
+  try { await fetch('/api/logout', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); } catch(e){}
+  location.href = '/';
+};
+
+setInterval(tickClock, 1000);
+(function loop(){ refresh().finally(() => setTimeout(loop, 4000 + Math.floor(Math.random()*2500))); })();
+</script>
+</body>
+</html>
