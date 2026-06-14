@@ -4,13 +4,13 @@
 
 :root {
   /* 中性底:Apple systemGroupedBackground */
-  --bg: #F5F5F7; --card: #FFFFFF;
+  --bg: #F2F2F7; --card: #FFFFFF;
   --ink: #1D1D1F; --text: #1D1D1F; --muted: #6E6E73; --faint: #AEAEB2;
-  --line: rgba(0,0,0,.08); --line-2: rgba(0,0,0,.14);
-  /* 单主色:蓝(取 Apple 系统蓝一族,加深以保证白底对比) */
-  --brand: #0A6CD8; --brand-2: #2E8AF0; --brand-press: #0857AC; --brand-tint: rgba(10,108,216,.10);
-  /* 语义 */
-  --ok: #1E8E4E; --ok-tint: rgba(30,142,78,.12); --amber: #C98A12; --hot: #D33B30; --danger: #D33B30;
+  --line: rgba(60,60,67,.13); --line-2: rgba(60,60,67,.22);
+  /* 单主色:Apple Web 蓝(apple.com 同款,统一所有强调) */
+  --brand: #0071E3; --brand-press: #0062C4; --brand-tint: rgba(0,113,227,.10);
+  /* 语义:全部取 Apple 系统色,与主色同属一套体系 */
+  --ok: #248A3D; --ok-tint: rgba(36,138,61,.12); --amber: #FF9500; --hot: #FF3B30; --danger: #E5342A;
   /* 玻璃(仅浮层用) */
   --glass: rgba(248,248,250,.72); --glass-line: rgba(255,255,255,.6); --glass-hi: inset 0 1px 0 0 rgba(255,255,255,.7);
   --blur: saturate(1.8) blur(20px);
@@ -18,7 +18,7 @@
   --sh-1: 0 1px 2px rgba(0,0,0,.05), 0 0 0 .5px rgba(0,0,0,.04);
   --sh-2: 0 6px 20px -8px rgba(20,28,48,.16);
   --sh-card: 0 0 0 .5px rgba(20,28,48,.05), 0 1px 2px rgba(20,28,48,.07), 0 4px 10px -3px rgba(20,28,48,.07);
-  --ring: 0 0 0 4px rgba(10,108,216,.28);
+  --ring: 0 0 0 4px rgba(0,113,227,.28);
   --r-sm: 9px; --r: 12px; --r-lg: 18px;
   --ease: cubic-bezier(.4,0,.2,1);
   --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
@@ -55,7 +55,7 @@ body { font-family: var(--sans); color: var(--text); background: var(--bg); line
 
 /* ---- 开抢状态条:倒计时 hero ---- */
 .status { background: var(--card); border-radius: var(--r-lg); padding: 20px 22px; box-shadow: var(--sh-card); }
-.status.open { box-shadow: var(--sh-card), inset 0 0 0 1.5px rgba(10,108,216,.5); }
+.status.open { box-shadow: var(--sh-card), inset 0 0 0 1.5px rgba(0,113,227,.5); }
 .status-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .status .lab { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 500; color: var(--muted); }
 .status.open .lab { color: var(--brand); font-weight: 600; }
@@ -72,7 +72,7 @@ body { font-family: var(--sans); color: var(--text); background: var(--bg); line
 @media (min-width: 1024px) { .wrap-clubs { max-width: 1000px; } .clubs { grid-template-columns: repeat(3, 1fr); } }
 .club { padding: 20px 22px; display: flex; flex-direction: column; transition: transform .25s var(--ease), box-shadow .25s var(--ease); }
 .club:hover { transform: translateY(-2px); box-shadow: 0 0 0 .5px rgba(20,28,48,.05), 0 2px 5px rgba(20,28,48,.08), 0 12px 28px -10px rgba(20,28,48,.18); }
-.club.mine { box-shadow: var(--sh-card), inset 0 0 0 1.5px rgba(10,108,216,.5); }
+.club.mine { box-shadow: var(--sh-card), inset 0 0 0 1.5px rgba(0,113,227,.5); }
 .club.full { background: #FAFAFC; box-shadow: var(--sh-1); }
 .club.full .club-name { color: var(--muted); }
 .club-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
@@ -101,8 +101,8 @@ body { font-family: var(--sans); color: var(--text); background: var(--bg); line
 .btn:focus-visible { outline: none; box-shadow: var(--ring); }
 .btn-primary { background: var(--brand); color: #fff; }
 .btn-primary:hover { background: var(--brand-press); }
-.btn-secondary { background: rgba(10,108,216,.12); color: var(--brand-press); box-shadow: inset 0 0 0 .5px rgba(10,108,216,.24); }
-.btn-secondary:hover { background: rgba(10,108,216,.18); }
+.btn-secondary { background: rgba(118,118,128,.12); color: var(--ink); }
+.btn-secondary:hover { background: rgba(118,118,128,.2); }
 .btn-quiet { background: none; color: var(--muted); height: auto; padding: 8px 6px; font-weight: 500; }
 .btn-quiet:hover { color: var(--ink); }
 .btn-block { width: 100%; }
@@ -139,7 +139,7 @@ body.home .foot { color: rgba(40,42,52,.6); text-shadow: 0 1px 2px rgba(247,246,
 
 .toast-wrap { position: sticky; bottom: 18px; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; margin-top: 22px; z-index: 40; }
 .toast { pointer-events: auto; background: rgba(28,28,30,.86); -webkit-backdrop-filter: saturate(1.8) blur(20px); backdrop-filter: saturate(1.8) blur(20px); color: #fff; padding: 13px 19px; border-radius: var(--r); font-size: 14.5px; max-width: 90%; box-shadow: var(--glass-hi), 0 10px 30px -10px rgba(0,0,0,.4); }
-.toast.ok { background: rgba(26,128,70,.92); } .toast.err { background: rgba(190,52,44,.92); }
+.toast.ok { background: rgba(36,138,61,.94); } .toast.err { background: rgba(229,52,42,.95); }
 
 .sk { background: linear-gradient(100deg, #EDEDF0 30%, #F6F6F8 50%, #EDEDF0 70%); background-size: 300% 100%; animation: sk 1.3s ease infinite; border-radius: var(--r-lg); }
 .sk-club { height: 142px; }
@@ -150,7 +150,7 @@ body.home .foot { color: rgba(40,42,52,.6); text-shadow: 0 1px 2px rgba(247,246,
 .tbl th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12.5px; padding: 12px 14px; border-bottom: .5px solid var(--line); position: sticky; top: 0; background: rgba(255,255,255,.85); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur); }
 .tbl td { padding: 13px 14px; border-bottom: .5px solid var(--line); }
 .tbl tr:last-child td { border-bottom: none; }
-.tbl tr:hover td { background: rgba(10,108,216,.04); }
+.tbl tr:hover td { background: rgba(0,113,227,.04); }
 .fill-row { display: grid; grid-template-columns: 1fr auto; gap: 9px 14px; align-items: center; padding: 15px 2px; border-bottom: .5px solid var(--line); }
 .fill-row:last-child { border-bottom: none; }
 .fill-row .nm { font-weight: 500; color: var(--text); }
@@ -170,5 +170,5 @@ body.home .foot { color: rgba(40,42,52,.6); text-shadow: 0 1px 2px rgba(247,246,
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes sk { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
-@keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(10,108,216,.4); } 70% { box-shadow: 0 0 0 6px rgba(10,108,216,0); } }
+@keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(0,113,227,.4); } 70% { box-shadow: 0 0 0 6px rgba(0,113,227,0); } }
 @media (prefers-reduced-motion: reduce) { * { animation-duration: .001ms !important; transition-duration: .001ms !important; scroll-behavior: auto !important; } }
