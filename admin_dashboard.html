@@ -73,6 +73,7 @@
   </section>
 
   <div class="toast-wrap" id="toasts" aria-live="polite"></div>
+  <p class="footer">Designed By Gabiri, Copyright By Weilesi</p>
 </main>
 
 <script>
@@ -108,8 +109,8 @@ async function loadOverview(){
     clubs.forEach(c => {
       const info = splitRoom(c.name);
       const full = c.current_students >= c.max_students;
-      const ratio = c.max_students ? (c.max_students - c.current_students)/c.max_students : 0;
-      const lvl = full ? '' : (ratio > 0.5 ? 'ok' : ratio > 0.2 ? 'mid' : 'low');
+      const fill = c.max_students ? c.current_students/c.max_students : 0;
+      const lvl = full ? '' : (fill >= 0.8 ? 'low' : fill >= 0.5 ? 'mid' : 'ok');
       const row = document.createElement('div'); row.className = 'fill-row';
       const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = info.name + (info.room ? ' · '+info.room+'室' : '');
       const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = c.current_students + ' / ' + c.max_students;

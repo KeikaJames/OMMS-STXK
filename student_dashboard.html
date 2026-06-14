@@ -37,7 +37,7 @@
   </section>
 
   <div class="toast-wrap" id="toasts" aria-live="polite"></div>
-  <p class="footer">一人一社 · 抢到后可退选改选</p>
+  <p class="footer">一人一社 · 抢到后可退选改选<br>Designed By Gabiri, Copyright By Weilesi</p>
 </main>
 
 <script>
@@ -126,8 +126,8 @@ function card(c, mine){
   const isMine = mine && me.registered_club === c.name;
   const full = c.current_students >= c.max_students;
   const left = Math.max(0, c.max_students - c.current_students);
-  const ratio = c.max_students ? left / c.max_students : 0;
-  const lvl = full ? '' : (ratio > 0.5 ? 'ok' : ratio > 0.2 ? 'mid' : 'low');
+  const fill = c.max_students ? c.current_students / c.max_students : 0;
+  const lvl = full ? '' : (fill >= 0.8 ? 'low' : fill >= 0.5 ? 'mid' : 'ok');
   const info = splitRoom(c.name);
   const blocked = !isMine && (full || mine || !canRegister);
 
