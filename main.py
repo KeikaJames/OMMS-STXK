@@ -1120,7 +1120,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                             "VALUES (?,?,?,?,?)",
                             (name, klass, student_no, username, hash_password(plain)))
                         results["success"] += 1
-                        credentials.append({"name": name, "username": username, "password": plain})
+                        credentials.append({"name": name, "class": klass, "username": username, "password": plain})
                     except sqlite3.IntegrityError:
                         results["failed"] += 1  # 学号/用户名重复
                         seen.discard(username)
