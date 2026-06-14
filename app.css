@@ -7,12 +7,12 @@
 @font-face { font-family:"JetBrains Mono"; src:url("/fonts/JetBrainsMono-700.woff2") format("woff2"); font-weight:700; font-display:swap; }
 
 :root {
-  --bg: #ECEBE6; --bg-2: #E4E3DD; --surface: #FFFFFF;
+  --bg: #ECEBE6; --bg-2: #E4E3DD; --surface: #FEFEFC;
   --ink: #1A1A1E; --text: #2C2C31; --muted: #6E6E76; --label: #3C3C42; --faint: #A6A6AE;
   --hair: rgba(26,26,30,.06); --hair-2: rgba(26,26,30,.12); --track: #E4E4DF;
 
   --accent: #E5512A;        /* 稀缺 / 已满 */
-  --amber: #D98A1F;         /* 中等紧迫 */
+  --amber: #E0A02C;         /* 中等紧迫(往黄推,与朱砂拉开色相)*/
   --accent-soft: #FBEDE6; --accent-line: #F2C8B7; --accent-ink: #97350F;
   --ok: #2F9266; --ok-soft: #E6F2EC; --danger: #D6452C;
 
@@ -76,10 +76,11 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); line
 .club:hover { box-shadow: var(--sh-3), var(--hi); transform: translateY(-3px); }
 .club:nth-child(2){animation-delay:.05s} .club:nth-child(3){animation-delay:.1s} .club:nth-child(4){animation-delay:.15s} .club:nth-child(5){animation-delay:.2s} .club:nth-child(6){animation-delay:.25s}
 .club.mine { background: var(--accent-soft); border-color: transparent; box-shadow: 0 0 0 1.5px var(--accent), var(--sh-2); }
-.club.dim { opacity: .5; }
+.club.dim .grp { opacity: .42; }
+.club.dim .act { opacity: .7; }
 .club-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .club-name { font-size: 17px; font-weight: 600; color: var(--ink); letter-spacing: .2px; }
-.room { font-family: var(--mono); font-size: 12px; font-weight: 500; color: var(--label); background: var(--bg); padding: 3px 9px; border-radius: 7px; white-space: nowrap; }
+.room { font-family: var(--mono); font-size: 13px; font-weight: 500; color: var(--label); background: var(--bg-2); padding: 4px 10px; border-radius: 8px; white-space: nowrap; }
 .club.mine .room { background: rgba(255,255,255,.7); }
 .grp { margin: 14px 0 0; }
 .left { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
@@ -146,7 +147,8 @@ textarea.input { height: auto; padding: 12px 14px; }
 .fill-row:last-child { border-bottom: none; }
 .fill-row .nm { font-weight: 500; color: var(--text); }
 .fill-row .ct { font-family: var(--mono); color: var(--muted); font-size: 13px; }
-.fill-row .gauge { grid-column: 1 / -1; }
+.fill-row .gauge { grid-column: 1 / -1; max-width: 440px; }
+.fill-row .gauge i { height: 9px; }
 .metric { background: var(--surface); border: 1px solid var(--hair); border-radius: var(--r); padding: 16px 18px; box-shadow: var(--sh-1), var(--hi); animation: rise .5s var(--ease) backwards; }
 .metric.hero { background: #FCF3EE; border-color: var(--accent-line); }
 .metric .k { font-size: 12px; color: var(--muted); letter-spacing: .3px; }
@@ -156,7 +158,7 @@ textarea.input { height: auto; padding: 12px 14px; }
 .grid-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
 .metric:nth-child(2){animation-delay:.04s} .metric:nth-child(3){animation-delay:.08s} .metric:nth-child(4){animation-delay:.12s} .metric:nth-child(5){animation-delay:.16s}
 
-.footer { text-align: center; color: var(--faint); font-size: 12px; padding: 30px 0 10px; font-family: var(--mono); letter-spacing: .3px; }
+.footer { text-align: center; color: var(--faint); font-size: 12px; padding: 30px 0 10px; font-family: var(--mono); letter-spacing: -.2px; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes sk { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
