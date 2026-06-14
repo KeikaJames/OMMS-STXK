@@ -387,7 +387,11 @@ DB_POOL = None  # init_db() 后赋值
 # 用户名生成(复用调用者连接 + 同事务/本批去重,原子)
 # ==========================================================================
 def gen_username(name, cursor, seen):
-    base = "".join(c for c in str(name) if c.strip()) or "user"
+    raw = str(name).strip()
+    if HAS_PYPINYIN:
+        base = "".join(c for c in "".join(lazy_pinyin(raw)).lower() if c.isalnum()) or "stu"
+    else:
+        base = "".join(c for c in raw if c.strip()) or "user"
     candidate = base
     i = 0
     while True:

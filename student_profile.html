@@ -49,6 +49,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
+function splitRoom(n){ const m = n.match(/^(.*?)（\s*([0-9A-Za-z]+)\s*）\s*$/); return m ? {name:m[1].trim(), room:m[2]} : {name:n, room:null}; }
 function toast(msg, kind){
   const t = document.createElement('div'); t.className = 'toast' + (kind ? ' '+kind : ''); t.textContent = msg;
   $('#toasts').appendChild(t); setTimeout(() => t.remove(), 2600);
@@ -65,7 +66,9 @@ async function load(){
     card.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px">'
       + '<span style="font-size:16px;font-weight:600;color:var(--ink)" id="rc-name"></span><span class="badge-ok">已报名</span></div>'
       + '<p style="margin:11px 0 0;font-size:13px;color:var(--muted)" id="rc-time"></p>';
-    card.querySelector('#rc-name').textContent = d.registered_club;
+    const ri = splitRoom(d.registered_club);
+    const rcn = card.querySelector('#rc-name'); rcn.textContent = ri.name;
+    if (ri.room){ const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = ri.room + ' 室'; rcn.appendChild(rm); }
     card.querySelector('#rc-time').textContent = '报名时间 ' + t;
   }
 }

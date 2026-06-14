@@ -131,7 +131,7 @@ function card(c, mine){
 
   const top = document.createElement('div'); top.className = 'club-top';
   const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name;
-  if (info.room){ const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = '  ' + info.room; nm.appendChild(rm); }
+  if (info.room){ const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = info.room; nm.appendChild(rm); }
   top.appendChild(nm); el.appendChild(top);
 
   const seats = document.createElement('div'); seats.className = 'seats';

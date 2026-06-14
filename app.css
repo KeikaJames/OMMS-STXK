@@ -17,6 +17,8 @@
   --brand: #DD5326; --brand-press: #C0461E; --brand-tint: #FBEDE6; --brand-ink: #8E3413;
   /* 单语义:成功(仅"已报名"小 badge) */
   --ok: #2E875A; --ok-tint: #E8F1EC;
+  /* 进度条中段紧迫色(琥珀,仅用于 .bar.warm) */
+  --amber: #E0A02C;
 
   --r-sm: 6px; --r: 9px; --r-lg: 12px;
   --sh-1: 0 1px 1px rgba(28,27,24,.04);
@@ -74,17 +76,16 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); line
 .club.full .club-name { color: var(--muted); }
 .club-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .club-name { font-size: 16px; font-weight: 600; color: var(--ink); }
-.club-name .rm { color: var(--muted); font-weight: 400; font-size: 14px; }
+.rm { color: var(--text); font-weight: 500; font-size: .9em; margin-left: .5em; letter-spacing: .1px; }
 .room { font-size: 12.5px; color: var(--text); font-weight: 500; white-space: nowrap; background: var(--bg); padding: 3px 9px; border-radius: 6px; }
 .seats { display: flex; align-items: baseline; gap: 6px; margin: 14px 0 9px; }
 .seats .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 700; font-size: 28px; line-height: 1; color: var(--ink); letter-spacing: -.03em; }
 .seats .n.urgent { color: var(--brand); }
-.seats .n.gone { color: var(--faint); }
+.seats .n.gone { color: var(--muted); }
 .seats .u { font-size: 13px; color: var(--muted); }
 /* 一种进度条:细、中性占用、浅轨 */
-.bar { height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; }
-.bar { height: 6px; background: #E0DED6; border-radius: 3px; overflow: hidden; }
-.bar > i { display: block; height: 100%; background: #A8A399; border-radius: 3px; transition: width .5s var(--ease), background .3s var(--ease); }
+.bar { height: 8px; background: #EAE8E1; border: 1px solid #C2C0B4; border-radius: 4px; overflow: hidden; box-sizing: border-box; }
+.bar > i { display: block; height: 100%; background: #8A8478; transition: width .5s var(--ease), background .3s var(--ease); }
 .bar.warm > i { background: var(--amber); }
 .bar.urgent > i { background: var(--brand); }
 .act { margin-top: 14px; display: flex; align-items: center; justify-content: flex-end; gap: 9px; }
@@ -122,7 +123,8 @@ textarea.input { height: auto; padding: 11px 13px; line-height: 1.5; }
 
 .seg { display: flex; align-items: stretch; background: var(--bg); border: 1px solid var(--line); border-radius: var(--r); padding: 3px; margin-bottom: 18px; }
 .seg.fit { width: fit-content; }
-.seg button { flex: 1; border: none; background: none; font: inherit; font-size: 14px; font-weight: 500; line-height: 1.2; color: var(--muted); padding: 9px 18px; border-radius: var(--r-sm); cursor: pointer; transition: background .15s var(--ease), color .15s var(--ease); }
+.seg button { flex: 1; border: none; background: none; font: inherit; font-size: 14px; font-weight: 500; line-height: 1.2; color: var(--ink); padding: 9px 18px; border-radius: var(--r-sm); cursor: pointer; transition: background .15s var(--ease), color .15s var(--ease); }
+.seg button:not(.on):hover { background: rgba(28,27,24,.035); }
 .seg.fit button { flex: none; }
 .seg button.on { background: var(--surface); color: var(--ink); box-shadow: inset 0 0 0 1px rgba(28,27,24,.09), 0 1px 1px rgba(28,27,24,.05); }
 
@@ -149,7 +151,7 @@ textarea.input { height: auto; padding: 11px 13px; line-height: 1.5; }
 .metric .k { font-size: 12px; color: var(--muted); }
 .metric .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 26px; font-weight: 700; color: var(--ink); margin-top: 3px; letter-spacing: -.03em; }
 .metric.hero .v { color: var(--ink); }
-.metric .v small { font-size: .5em; font-weight: 600; color: var(--faint); margin-left: 2px; vertical-align: baseline; }
+.metric .v small { font-size: .58em; font-weight: 600; color: var(--muted); margin-left: 2px; vertical-align: baseline; }
 .grid-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 10px; }
 .pill { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; color: var(--brand); background: var(--brand-tint); padding: 5px 11px; border-radius: 99px; }
 .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--brand); animation: pulse 2s var(--ease) infinite; }

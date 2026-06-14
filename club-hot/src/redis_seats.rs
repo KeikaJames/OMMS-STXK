@@ -313,7 +313,7 @@ fn redis_pool_err(op: &str, e: deadpool_redis::PoolError) -> redis::RedisError {
 /// 32 random bytes, URL-safe base64 without padding — same alphabet/entropy as
 /// Python's `secrets.token_urlsafe(32)`.
 fn gen_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes[..]);
     url_safe_b64(&bytes)

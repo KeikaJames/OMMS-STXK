@@ -83,7 +83,7 @@ pub fn hash_password(plain: &str) -> Result<String, argon2::password_hash::Error
     // version coupling that `SaltString::generate` would impose).
     let mut salt_bytes = [0u8; 16];
     {
-        use rand::Rng;
+        use rand::RngExt;
         rand::rng().fill(&mut salt_bytes[..]);
     }
     let salt = SaltString::encode_b64(&salt_bytes)?;

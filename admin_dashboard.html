@@ -113,7 +113,8 @@ async function loadOverview(){
       const rem = c.max_students - c.current_students;
       const blvl = full ? '' : (rem <= 3 ? 'urgent' : rem <= 6 ? 'warm' : '');
       const row = document.createElement('div'); row.className = 'fill-row';
-      const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = info.name + (info.room ? ' · '+info.room+'室' : '');
+      const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = info.name;
+      if (info.room){ const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = info.room + ' 室'; nm.appendChild(rm); }
       const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = c.current_students + ' / ' + c.max_students;
       const bar = document.createElement('div'); bar.className = 'bar' + (blvl ? ' ' + blvl : '');
       const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl);
@@ -148,7 +149,7 @@ async function loadClubs(){
     const el = document.createElement('article'); el.className = 'club' + (full ? ' full' : '');
     const top = document.createElement('div'); top.className = 'club-top';
     const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name;
-    if (info.room){ const rm = document.createElement('span'); rm.className='rm'; rm.textContent = '  ' + info.room + ' 室'; nm.appendChild(rm); }
+    if (info.room){ const rm = document.createElement('span'); rm.className='rm'; rm.textContent = info.room + ' 室'; nm.appendChild(rm); }
     top.appendChild(nm); el.appendChild(top);
     const seats = document.createElement('div'); seats.className = 'seats';
     seats.innerHTML = '<span class="n" style="font-size:22px"></span><span class="u"></span>';
