@@ -34,9 +34,9 @@
     <div class="section-h"><span>各社团填报</span><span class="num" id="ov-time"></span></div>
     <div class="card" id="ov-fill"><div class="sk" style="height:60px"></div></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">
-      <a class="btn btn-soft" style="width:auto" href="/api/export_all_data">导出报名总表</a>
-      <a class="btn btn-soft" style="width:auto" href="/api/export_unregistered">导出未报名名单</a>
-      <a class="btn btn-soft" style="width:auto" href="/api/export_students_csv">导出学生账号</a>
+      <a class="btn btn-secondary" style="width:auto" href="/api/export_all_data">导出报名总表</a>
+      <a class="btn btn-secondary" style="width:auto" href="/api/export_unregistered">导出未报名名单</a>
+      <a class="btn btn-secondary" style="width:auto" href="/api/export_students_csv">导出学生账号</a>
     </div>
   </section>
 
@@ -45,7 +45,7 @@
     <div class="card" style="margin-bottom:18px">
       <p style="font-size:13px;color:var(--muted);margin-bottom:8px">每行一个,用逗号分隔:<span class="mono">姓名,班级,学号</span></p>
       <textarea class="input" id="imp-stu" rows="4" style="font-family:var(--mono);resize:vertical" placeholder="李四,高一(2)班,2024012&#10;王五,高一(3)班,2024013"></textarea>
-      <button class="btn btn-go" id="imp-stu-go" type="button" style="width:auto;margin-top:10px;padding:11px 24px">导入</button>
+      <button class="btn btn-primary" id="imp-stu-go" type="button" style="width:auto;margin-top:10px;padding:11px 24px">导入</button>
       <div id="imp-stu-out" style="margin-top:12px"></div>
     </div>
     <div class="section-h"><span>学生名单</span><button class="btn btn-quiet" id="del-all-stu" type="button" style="color:var(--danger)">清空全部</button></div>
@@ -57,7 +57,7 @@
     <div class="card" style="margin-bottom:18px">
       <p style="font-size:13px;color:var(--muted);margin-bottom:8px">每行一个,用逗号分隔:<span class="mono">社团名,人数上限</span></p>
       <textarea class="input" id="imp-club" rows="3" style="font-family:var(--mono);resize:vertical" placeholder="机器人（316）,12&#10;书法社（201）,20"></textarea>
-      <button class="btn btn-go" id="imp-club-go" type="button" style="width:auto;margin-top:10px;padding:11px 24px">导入</button>
+      <button class="btn btn-primary" id="imp-club-go" type="button" style="width:auto;margin-top:10px;padding:11px 24px">导入</button>
       <div id="imp-club-out" style="margin-top:10px"></div>
     </div>
     <div class="section-h"><span>社团列表</span></div>
@@ -68,12 +68,12 @@
     <div class="section-h"><span>报名开放时间</span></div>
     <div class="card" style="max-width:420px">
       <div class="field"><label for="open-at">到点后学生才能抢课</label><input class="input" id="open-at" type="datetime-local"></div>
-      <button class="btn btn-go" id="save-time" type="button" style="width:auto;padding:11px 24px">保存</button>
+      <button class="btn btn-primary" id="save-time" type="button" style="width:auto;padding:11px 24px">保存</button>
     </div>
   </section>
 
   <div class="toast-wrap" id="toasts" aria-live="polite"></div>
-  <p class="footer">Designed By Gabiri, Copyright By Weilesi</p>
+  <p class="foot">Designed By Gabiri, Copyright By Weilesi</p>
 </main>
 
 <script>
@@ -103,21 +103,20 @@ async function loadOverview(){
     $('#m-reg').textContent = reg;
     $('#m-unreg').textContent = total - reg;
     $('#m-rate').innerHTML = total ? Math.round(reg/total*100) + '<small>%</small>' : '—';
-    $('#ov-time').textContent = t.start_time ? (t.can_register ? '开抢中' : '开放 ' + t.start_time) : '未设时间';
+    $('#ov-time').innerHTML = t.start_time ? (t.can_register ? '<span class="pill"><span class="dot"></span>开抢中</span>' : '<span style="color:var(--muted);font-size:13px">开放 ' + t.start_time + '</span>') : '<span style="color:var(--faint);font-size:13px">未设时间</span>';
     const box = $('#ov-fill'); box.innerHTML = '';
     if (!clubs.length){ box.innerHTML = '<p class="empty">还没有社团</p>'; return; }
     clubs.forEach(c => {
       const info = splitRoom(c.name);
       const full = c.current_students >= c.max_students;
-      const fill = c.max_students ? c.current_students/c.max_students : 0;
-      const lvl = full ? '' : (fill >= 0.8 ? 'low' : fill >= 0.5 ? 'mid' : 'ok');
+      const pct = c.max_students ? Math.round(c.current_students/c.max_students*100) : 0;
+      const urgent = !full && (c.max_students - c.current_students) <= 3;
       const row = document.createElement('div'); row.className = 'fill-row';
       const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = info.name + (info.room ? ' · '+info.room+'室' : '');
       const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = c.current_students + ' / ' + c.max_students;
-      const gc = full ? 'full' : (lvl === 'ok' ? '' : 'lvl-'+lvl);
-      const g = document.createElement('div'); g.className = 'gauge' + (gc ? ' '+gc : '');
-      for (let i=0;i<c.max_students;i++){ const cell=document.createElement('i'); if(i<c.current_students) cell.className='on'; g.appendChild(cell); }
-      row.append(nm, ct, g);
+      const bar = document.createElement('div'); bar.className = 'bar' + (urgent ? ' urgent' : '');
+      const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl);
+      row.append(nm, ct, bar);
       box.appendChild(row);
     });
   }catch(e){ if (e.message !== 'unauth') console.error(e); }
@@ -145,22 +144,22 @@ async function loadClubs(){
   if (!clubs.length){ box.innerHTML = '<p class="empty" style="grid-column:1/-1">还没有社团</p>'; return; }
   clubs.forEach(c => {
     const info = splitRoom(c.name), full = c.current_students >= c.max_students;
-    const el = document.createElement('article'); el.className = 'club';
+    const el = document.createElement('article'); el.className = 'club' + (full ? ' full' : '');
     const top = document.createElement('div'); top.className = 'club-top';
     const nm = document.createElement('span'); nm.className = 'club-name'; nm.textContent = info.name; top.appendChild(nm);
     if (info.room){ const rm = document.createElement('span'); rm.className='room'; rm.textContent = info.room+' 室'; top.appendChild(rm); }
     el.appendChild(top);
-    const lt = document.createElement('div'); lt.className = 'left';
-    lt.innerHTML = '<span class="n" style="font-size:20px"></span><span class="t"></span>';
-    lt.querySelector('.n').textContent = c.current_students + '/' + c.max_students;
-    lt.querySelector('.t').textContent = '已报名';
-    el.appendChild(lt);
-    const g = document.createElement('div'); g.className = 'gauge' + (full?' full':'');
-    for (let i=0;i<c.max_students;i++){ const cell = document.createElement('i'); if (i<c.current_students) cell.className='on'; g.appendChild(cell); }
-    el.appendChild(g);
-    const act = document.createElement('div'); act.className = 'act'; act.style.display='flex'; act.style.gap='8px';
-    const exp = document.createElement('a'); exp.className='btn btn-soft'; exp.textContent='导出名单'; exp.href = '/api/export_club_data?club_id='+c.id;
-    const del = document.createElement('button'); del.className='btn btn-soft'; del.style.color='var(--danger)'; del.type='button'; del.textContent='删除';
+    const seats = document.createElement('div'); seats.className = 'seats';
+    seats.innerHTML = '<span class="n" style="font-size:22px"></span><span class="u"></span>';
+    seats.querySelector('.n').textContent = c.current_students + '/' + c.max_students;
+    seats.querySelector('.u').textContent = '已报名';
+    el.appendChild(seats);
+    const pct = c.max_students ? Math.round(c.current_students/c.max_students*100) : 0;
+    const bar = document.createElement('div'); bar.className = 'bar';
+    const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl); el.appendChild(bar);
+    const act = document.createElement('div'); act.className = 'act';
+    const exp = document.createElement('a'); exp.className='btn btn-secondary btn-sm'; exp.textContent='导出名单'; exp.href = '/api/export_club_data?club_id='+c.id;
+    const del = document.createElement('button'); del.className='btn btn-secondary btn-sm'; del.style.color='var(--brand)'; del.type='button'; del.textContent='删除';
     del.onclick = () => confirmInline(del, async () => { const r = await api('/api/delete_club', {method:'POST', body:JSON.stringify({club_id:c.id})}); const d = await r.json(); toast(d.message || (d.success?'已删除':'删除失败'), d.success?'ok':'err'); loadClubs(); loadOverview(); });
     act.append(exp, del); el.appendChild(act);
     box.appendChild(el);
