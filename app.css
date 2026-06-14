@@ -63,6 +63,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); line
 .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
 .status.open .dot { background: var(--brand); animation: pulse 2s var(--ease) infinite; }
 .status .clock { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 700; font-size: 30px; line-height: 1; color: var(--ink); letter-spacing: -.04em; }
+.status .clock .clk-now { font-family: var(--sans); font-size: 13px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-right: 6px; vertical-align: middle; }
 .status .rule { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
 .status .rule b { color: var(--ink); font-weight: 600; }
 

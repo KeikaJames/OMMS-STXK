@@ -5,7 +5,8 @@
 
 设计要点(见 ~/.claude/plans/debug-bug-virtual-emerson.md):
   * 连接池:queue.Queue 阻塞池(修掉手搓池的死锁/泄漏),每连接 WAL/FK/busy_timeout/autocommit。
-  * 名额:Redis 原子 Lua 抢占(根治超卖),SQLite 仅落库;current_students 为派生镜像。
+  * 名额:Redis 原子 Lua 抢占(并发不超卖;进程被强杀的窗口可能少卖,靠重启 rebuild 对账修正),
+    SQLite 仅落库;current_students 为派生镜像。
   * 安全:argon2 口令哈希、随机每人口令、服务端 session(Redis)+ HttpOnly/SameSite Cookie、
           全接口角色鉴权、IDOR 修复(身份只取自 session)、静态白名单(消灭整库/源码下载)、
           import 入库消毒(防存储型 XSS)、登录限流。
@@ -300,7 +301,9 @@ def gen_password():
 # ==========================================================================
 # 输入消毒(服务端防存储型 XSS:拒绝危险字符,不改数据语义)
 # ==========================================================================
-_BAD_CHARS = set('<>"\'&')
+# 仅拒尖括号与控制字符:前端一律用 textContent 输出、SQL 全参数化、CSV 走 csv 模块,
+# 故 & ' " 等在合法姓名里(如 王&李、O'Brien)是安全的,放行以免静默丢学生。
+_BAD_CHARS = set('<>')
 
 
 def clean_text(s, maxlen=50):
@@ -444,11 +447,18 @@ def init_db():
         cur.execute("SELECT id, admin_password FROM settings LIMIT 1")
         row = cur.fetchone()
         if row is None:
+            # 首启随机生成管理员口令,只打印一次到运行窗口(开源仓库不保留弱默认口令)。
+            # 用去歧义字母表(无 0/O/1/l/I),方便部署者从终端抄走后立即登录改密。
+            _pw_alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+            init_admin_pw = "".join(secrets.choice(_pw_alphabet) for _ in range(12))
             cur.execute(
                 "INSERT INTO settings (registration_start_time, admin_password) VALUES (?, ?)",
-                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), hash_password("admin123")),
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), hash_password(init_admin_pw)),
             )
-            log.info("初始化 settings,默认管理员 admin/admin123(已哈希,请尽快改密)")
+            log.warning("=" * 60)
+            log.warning("首次初始化:管理员账号 admin   初始密码  %s", init_admin_pw)
+            log.warning("此密码仅显示这一次,请立即登录后修改;切勿用于生产明文环境。")
+            log.warning("=" * 60)
         else:
             # 管理员口令一次性迁移成 argon2
             sid, apw = row
@@ -760,7 +770,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             log.error("get_clubs 失败: %s", e)
             return self._json(500, {"success": False, "message": "服务器错误"})
         ids = [r[0] for r in rows]
-        live = RG.stock_left(ids)  # 实时名额(零滞后);None 则回落 current_students
+        live = RG.stock_left(ids)  # 实时名额(Redis 实时);None 则回落 current_students
         data = []
         for cid, name, maxs, cur_s in rows:
             if live is not None and live.get(cid) is not None:
@@ -880,7 +890,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         if open_at is None or RG.now_epoch() < open_at:
             return self._json(200, {"success": False, "message": "报名尚未开始"})
 
-        # Redis 原子抢占(根治超卖)
+        # Redis 原子抢占(并发不超卖;进程崩溃窗口可能少卖,靠重启 rebuild 对账)
         try:
             code = RG.acquire_seat(sid, club_id)
         except RuntimeError:
