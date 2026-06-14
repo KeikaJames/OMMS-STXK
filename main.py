@@ -562,6 +562,7 @@ POST_ROUTES = {
     "/api/register_club": ("_h_register_club", ROLE_STUDENT),
     "/api/cancel_registration": ("_h_cancel_registration", ROLE_STUDENT),
     "/api/change_password": ("_h_change_password", ROLE_STUDENT),
+    "/api/admin_change_password": ("_h_admin_change_password", ROLE_ADMIN),
     "/api/import_students": ("_h_import_students", ROLE_ADMIN),
     "/api/import_clubs": ("_h_import_clubs", ROLE_ADMIN),
     "/api/update_registration_time": ("_h_update_time", ROLE_ADMIN),
@@ -570,6 +571,7 @@ POST_ROUTES = {
     "/api/delete_club": ("_h_delete_club", ROLE_ADMIN),
     "/api/delete_all_clubs": ("_h_delete_all_clubs", ROLE_ADMIN),
 }
+WEB_DIR = os.environ.get("WEB_DIR", "web")  # 前端资源目录
 PAGES = {
     "/": "login.html",
     "/student/dashboard": "student_dashboard.html",
@@ -727,7 +729,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     # ---- 静态页(白名单;无通用文件嗅探,消灭整库/源码下载与遍历) ----
     def _serve_page(self, fname):
         try:
-            with open(fname, "rb") as f:
+            with open(os.path.join(WEB_DIR, fname), "rb") as f:
                 body = f.read()
         except OSError:
             return self._json(404, {"success": False, "message": "页面不存在"})
@@ -736,7 +738,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _serve_static(self, spec):
         fname, ctype = spec
         try:
-            with open(fname, "rb") as f:
+            with open(os.path.join(WEB_DIR, fname), "rb") as f:
                 body = f.read()
         except OSError:
             return self._json(404, {"success": False, "message": "资源不存在"})
@@ -978,6 +980,23 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     # ======================================================================
     # 管理端点(均 admin 鉴权)
     # ======================================================================
+    def _h_admin_change_password(self, sess, data):
+        cur_pw = data.get("current") or ""
+        new_pw = data.get("new") or ""
+        if len(new_pw) < 8:
+            return self._json(400, {"success": False, "message": "新密码至少 8 位"})
+        uname = sess.get("username", "admin")
+        with DB_POOL.connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, admin_password FROM settings WHERE admin_username = ?", (uname,))
+            row = c.fetchone()
+            ok, _ = verify_password(row[1], cur_pw) if row else (False, False)
+            if not ok:
+                return self._json(400, {"success": False, "message": "当前密码不正确"})
+            conn.execute("UPDATE settings SET admin_password = ? WHERE id = ?",
+                         (hash_password(new_pw), row[0]))
+        self._json(200, {"success": True, "message": "管理员密码已修改"})
+
     def _h_get_registrations(self, sess):
         with DB_POOL.connection() as conn:
             cur = conn.cursor()
