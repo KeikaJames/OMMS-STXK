@@ -77,12 +77,15 @@ function fmtClock(d){
 
 function tickClock(){
   const now = new Date();
-  if (canRegister || openAt === null){
+  const p = n => String(n).padStart(2,'0');
+  if (canRegister){
+    // 开抢中:显示当前时间并加“现在”前缀,避免被误读成倒计时(开抢不自动截止)
+    $('#clock').innerHTML = '<span class="clk-now">现在</span>' + p(now.getHours())+':'+p(now.getMinutes())+':'+p(now.getSeconds());
+  } else if (openAt === null){
     $('#clock').textContent = fmtClock(now);
   } else {
     let s = Math.max(0, Math.round((openAt - now.getTime())/1000));
     const h = Math.floor(s/3600), m = Math.floor((s%3600)/60); s = s%60;
-    const p = n => String(n).padStart(2,'0');
     $('#clock').textContent = (h>0 ? p(h)+':' : '') + p(m)+':'+p(s);
   }
 }
@@ -123,7 +126,7 @@ function card(c, mine){
   const full = c.current_students >= c.max_students;
   const left = Math.max(0, c.max_students - c.current_students);
   const urgent = !full && left <= 3;
-  const pct = c.max_students ? Math.round(c.current_students / c.max_students * 100) : 0;
+  const leftPct = c.max_students ? Math.round(left / c.max_students * 100) : 0;  // 剩余占比:名额越少,条越短(与大数字同向)
   const info = splitRoom(c.name);
 
   const el = document.createElement('article');
@@ -141,7 +144,7 @@ function card(c, mine){
 
   const blvl = full ? '' : (urgent ? 'urgent' : (left <= 6 ? 'warm' : ''));
   const bar = document.createElement('div'); bar.className = 'bar' + (blvl ? ' ' + blvl : '');
-  const fl = document.createElement('i'); fl.style.width = pct + '%'; bar.appendChild(fl); el.appendChild(bar);
+  const fl = document.createElement('i'); fl.style.width = (full ? 0 : leftPct) + '%'; bar.appendChild(fl); el.appendChild(bar);
 
   const act = document.createElement('div'); act.className = 'act';
   if (isMine){
