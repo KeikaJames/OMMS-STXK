@@ -125,9 +125,9 @@ textarea.input { height: auto; padding: 12px 14px; }
 
 .seg { display: flex; align-items: center; background: var(--bg-2); border-radius: var(--r); padding: 4px; margin-bottom: 20px; }
 .seg.fit { width: fit-content; }
-.seg button { flex: 1; border: none; background: none; font: inherit; font-weight: 500; color: var(--muted); padding: 10px 18px; border-radius: var(--r-sm); cursor: pointer; transition: background .25s var(--ease), color .2s var(--ease), box-shadow .25s var(--ease); }
+.seg button { flex: 1; border: none; background: none; font: inherit; font-weight: 500; line-height: 1.25; color: var(--muted); padding: 10px 18px; border-radius: var(--r-sm); cursor: pointer; transition: background .25s var(--ease), color .2s var(--ease), box-shadow .25s var(--ease); }
 .seg.fit button { flex: none; }
-.seg button.on { background: var(--surface); color: var(--ink); box-shadow: var(--sh-1); }
+.seg button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(24,24,42,.10), 0 0 0 .5px rgba(24,24,42,.03); }
 
 .toast-wrap { position: sticky; bottom: 18px; display: flex; flex-direction: column; gap: 9px; align-items: center; pointer-events: none; margin-top: 22px; }
 .toast { pointer-events: auto; background: var(--ink); color: #fff; padding: 13px 20px; border-radius: var(--r); font-size: 14px; max-width: 92%; box-shadow: var(--sh-3); animation: rise .35s var(--ease); }
