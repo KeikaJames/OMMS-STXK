@@ -1,292 +1,67 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>市蒙中社团选课系统 - 登录</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Microsoft YaHei', Arial, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            position: relative;
-            overflow: hidden;
-            background-color: #4CAF50; /* 使用简单的纯色背景作为备选 */
-        }
-        
-        /* 背景容器 */
-        .background-container {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: -1;
-        }
-        
-        /* 视频背景 - 简化版本 */
-        #video-background {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-        
-        /* 视频覆盖层 */
-        .video-overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0, 0, 0, 0.6);
-        }
-        
-        .container {
-            background-color: rgba(255, 255, 255, 0.5);
-            border-radius: 10px;
-            box-shadow: 0 0 20px rgba(0, 0, 0, 0.2);
-            padding: 40px;
-            width: 400px;
-            max-width: 90%;
-            backdrop-filter: blur(10px);
-            position: relative;
-            z-index: 1;
-        }
-        
-        .header {
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        
-        .header h1 {
-            color: #333;
-            font-size: 24px;
-            margin-bottom: 10px;
-            text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.1);
-        }
-        
-        .header p {
-            color: #555;
-            font-size: 14px;
-            text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.1);
-        }
-        
-        .form-group {
-            margin-bottom: 20px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            color: #333;
-            font-weight: 500;
-        }
-        
-        .form-group input {
-            width: 100%;
-            padding: 12px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            font-size: 16px;
-            transition: border-color 0.3s;
-        }
-        
-        .form-group input:focus {
-            outline: none;
-            border-color: #4CAF50;
-        }
-        
-        .btn {
-            width: 100%;
-            padding: 12px;
-            background-color: #4CAF50;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            font-size: 16px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: background-color 0.3s;
-        }
-        
-        .btn:hover {
-            background-color: #45a049;
-        }
-        
-        .btn:active {
-            transform: translateY(1px);
-        }
-        
-        .error-message {
-            color: #f44336;
-            margin-bottom: 15px;
-            padding: 10px;
-            background-color: #ffebee;
-            border-radius: 5px;
-            display: none;
-        }
-        
-        .login-type {
-            margin-bottom: 20px;
-            text-align: center;
-        }
-        
-        .login-type label {
-            margin: 0 15px;
-            cursor: pointer;
-            color: #666;
-            transition: color 0.3s;
-        }
-        
-        .login-type label:hover {
-            color: #4CAF50;
-        }
-        
-        .login-type input[type="radio"] {
-            margin-right: 5px;
-        }
-        
-        @media (max-width: 480px) {
-            .container {
-                padding: 30px 20px;
-            }
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161B24">
+<title>登录 · 市蒙古族中学社团选课</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
 </head>
 <body>
-    <!-- 简化的背景实现，同时保留视频支持 -->
-    <div class="background-container">
-        <video id="video-background" autoplay muted loop playsinline>
-            <source src="DJI_20250604113724_0011_D.MP4" type="video/mp4">
-        </video>
-        <div class="video-overlay"></div>
+<main style="min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:24px">
+  <div style="width:100%;max-width:380px">
+    <div style="text-align:center;margin-bottom:22px">
+      <img src="/favicon.svg" width="46" height="46" alt="" style="border-radius:11px">
+      <h1 style="font-size:21px;color:var(--ink);margin-top:12px;font-weight:600">社团选课</h1>
+      <p class="mono" style="color:var(--muted);font-size:12px;margin-top:3px;letter-spacing:1.5px">市蒙古族中学</p>
     </div>
-    
-    <script>
-        // 视频加载失败时的处理，回退到简单背景
-        const video = document.getElementById('video-background');
-        video.addEventListener('error', function() {
-            console.log('视频加载失败，使用备用背景');
-            this.style.display = 'none';
-            // 使用绿色半透明背景作为备选
-            document.querySelector('.video-overlay').style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
-        });
-    </script>
-    
-    <div class="container">
-        <div class="header">
-            <h1>市蒙中社团选课系统</h1>
-            <p>请输入您的账号和密码</p>
-        </div>
-        
-        <div class="login-type">
-            <label>
-                <input type="radio" name="loginType" value="student" checked> 学生登录
-            </label>
-            <label>
-                <input type="radio" name="loginType" value="admin"> 管理员登录
-            </label>
-        </div>
-        
-        <div id="error-message" class="error-message"></div>
-        
-        <div class="form-group">
-            <label for="username">用户名</label>
-            <input type="text" id="username" placeholder="请输入用户名" required>
-        </div>
-        
-        <div class="form-group">
-            <label for="password">密码</label>
-            <input type="password" id="password" placeholder="请输入密码" required>
-        </div>
-        
-        <button id="login-btn" class="btn">登录</button>
+    <div class="card">
+      <div class="seg" id="seg">
+        <button class="on" data-type="student" type="button">学生登录</button>
+        <button data-type="admin" type="button">管理员</button>
+      </div>
+      <div class="field">
+        <label for="u">用户名</label>
+        <input class="input" id="u" autocomplete="username" placeholder="请输入用户名">
+      </div>
+      <div class="field">
+        <label for="p">密码</label>
+        <input class="input" id="p" type="password" autocomplete="current-password" placeholder="请输入密码">
+      </div>
+      <p id="err" style="color:var(--danger);font-size:13px;min-height:18px;margin:2px 2px 12px"></p>
+      <button class="btn btn-go" id="go" type="button">登录</button>
     </div>
-    
-    <script>
-        document.getElementById('login-btn').addEventListener('click', function() {
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
-            const loginType = document.querySelector('input[name="loginType"]:checked').value;
-            const errorMessage = document.getElementById('error-message');
-            
-            if (!username || !password) {
-                errorMessage.textContent = '请输入用户名和密码';
-                errorMessage.style.display = 'block';
-                return;
-            }
-            
-            // 清除错误信息
-            errorMessage.style.display = 'none';
-            
-            // 显示加载状态
-            this.textContent = '登录中...';
-            this.disabled = true;
-            
-            // 发送登录请求
-            const url = loginType === 'student' ? '/api/login' : '/api/admin_login';
-            
-            fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ username, password })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    // 登录成功，保存信息并跳转
-                    if (loginType === 'student') {
-                        // 保存学生信息到localStorage
-                        localStorage.setItem('studentInfo', JSON.stringify({
-                            id: data.student_id,
-                            name: data.name,
-                            class: data.class,
-                            student_no: data.student_no
-                        }));
-                        // 跳转到学生面板
-                        window.location.href = '/student/dashboard';
-                    } else {
-                        // 管理员登录成功
-                        localStorage.setItem('adminLoggedIn', 'true');
-                        window.location.href = '/admin/dashboard';
-                    }
-                } else {
-                    // 登录失败
-                    errorMessage.textContent = data.message || '登录失败，请重试';
-                    errorMessage.style.display = 'block';
-                }
-            })
-            .catch(error => {
-                console.error('登录错误:', error);
-                errorMessage.textContent = '网络错误，请重试';
-                errorMessage.style.display = 'block';
-            })
-            .finally(() => {
-                // 恢复按钮状态
-                this.textContent = '登录';
-                this.disabled = false;
-            });
-        });
-        
-        // 回车登录
-        document.getElementById('password').addEventListener('keyup', function(event) {
-            if (event.key === 'Enter') {
-                document.getElementById('login-btn').click();
-            }
-        });
-    </script>
+  </div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+let kind = 'student';
+$('#seg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  [...$('#seg').children].forEach(x => x.classList.toggle('on', x === b));
+  kind = b.dataset.type;
+});
+function fail(m){ const e = $('#err'); e.textContent = m; }
+async function go(){
+  const u = $('#u').value.trim(), p = $('#p').value;
+  if (!u || !p){ fail('请输入用户名和密码'); return; }
+  fail('');
+  const btn = $('#go'); btn.disabled = true; const txt = btn.textContent;
+  btn.innerHTML = '<span class="spin" aria-hidden="true"></span>';
+  try{
+    const r = await fetch(kind === 'student' ? '/api/login' : '/api/admin_login', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username:u, password:p})
+    });
+    const d = await r.json();
+    if (d.success){ location.href = kind === 'student' ? '/student/dashboard' : '/admin/dashboard'; return; }
+    fail(d.message || '登录失败,请重试');
+  }catch(e){ fail('网络错误,请重试'); }
+  btn.disabled = false; btn.textContent = txt;
+}
+$('#go').addEventListener('click', go);
+$('#p').addEventListener('keyup', e => { if (e.key === 'Enter') go(); });
+$('#u').addEventListener('keyup', e => { if (e.key === 'Enter') $('#p').focus(); });
+</script>
 </body>
 </html>

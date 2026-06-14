@@ -1,403 +1,93 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>市蒙中社团选课系统 - 个人信息</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Microsoft YaHei', Arial, sans-serif;
-            background-color: #f5f5f5;
-            min-height: 100vh;
-        }
-        
-        .header {
-            background-color: #4CAF50;
-            color: white;
-            padding: 20px;
-            text-align: center;
-        }
-        
-        .header h1 {
-            font-size: 24px;
-            margin-bottom: 10px;
-        }
-        
-        .header p {
-            font-size: 14px;
-            opacity: 0.9;
-        }
-        
-        .nav {
-            background-color: white;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-            padding: 0 20px;
-        }
-        
-        .nav ul {
-            display: flex;
-            list-style: none;
-        }
-        
-        .nav li {
-            margin-right: 20px;
-        }
-        
-        .nav a {
-            display: block;
-            padding: 15px 10px;
-            color: #333;
-            text-decoration: none;
-            transition: all 0.3s;
-            border-bottom: 3px solid transparent;
-        }
-        
-        .nav a:hover {
-            color: #4CAF50;
-        }
-        
-        .nav a.active {
-            color: #4CAF50;
-            border-bottom-color: #4CAF50;
-        }
-        
-        .container {
-            max-width: 800px;
-            margin: 20px auto;
-            padding: 0 20px;
-        }
-        
-        .profile-card {
-            background-color: white;
-            border-radius: 10px;
-            padding: 30px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-        }
-        
-        .profile-card h2 {
-            color: #333;
-            font-size: 20px;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 2px solid #f0f0f0;
-        }
-        
-        .info-item {
-            display: flex;
-            margin-bottom: 15px;
-            padding-bottom: 15px;
-            border-bottom: 1px solid #f5f5f5;
-        }
-        
-        .info-item:last-child {
-            margin-bottom: 0;
-            padding-bottom: 0;
-            border-bottom: none;
-        }
-        
-        .info-label {
-            flex: 0 0 100px;
-            color: #666;
-            font-weight: 500;
-        }
-        
-        .info-value {
-            flex: 1;
-            color: #333;
-            font-size: 16px;
-        }
-        
-        .club-info {
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            border-left: 4px solid #4CAF50;
-        }
-        
-        .no-club {
-            color: #999;
-            font-style: italic;
-        }
-        
-        .password-section {
-            background-color: white;
-            border-radius: 10px;
-            padding: 30px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-        }
-        
-        .password-section h2 {
-            color: #333;
-            font-size: 20px;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 2px solid #f0f0f0;
-        }
-        
-        .form-group {
-            margin-bottom: 20px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            color: #666;
-            font-weight: 500;
-        }
-        
-        .form-group input {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            font-size: 14px;
-        }
-        
-        .btn {
-            padding: 10px 30px;
-            border: none;
-            border-radius: 5px;
-            font-size: 16px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.3s;
-            background-color: #4CAF50;
-            color: white;
-        }
-        
-        .btn:hover {
-            background-color: #45a049;
-        }
-        
-        .btn:active {
-            transform: translateY(1px);
-        }
-        
-        .message {
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 20px;
-            display: none;
-        }
-        
-        .message.success {
-            background-color: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-            display: block;
-        }
-        
-        .message.error {
-            background-color: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-            display: block;
-        }
-        
-        .footer {
-            margin-top: 40px;
-            padding: 20px;
-            text-align: center;
-            color: #666;
-            font-size: 14px;
-        }
-        
-        @media (max-width: 768px) {
-            .nav ul {
-                justify-content: center;
-            }
-            
-            .info-item {
-                flex-direction: column;
-            }
-            
-            .info-label {
-                flex: none;
-                margin-bottom: 5px;
-            }
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161B24">
+<title>个人信息 · 市蒙古族中学社团选课</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
 </head>
 <body>
-    <div class="header">
-        <h1>市蒙中社团选课系统</h1>
-        <p>欢迎，<span id="student-name"></span> 同学！</p>
-    </div>
-    
-    <div class="nav">
-        <ul>
-            <li><a href="/student/dashboard">选课主页</a></li>
-            <li><a href="/student/profile" class="active">个人信息</a></li>
-            <li><a href="/" id="logout-link">退出登录</a></li>
-        </ul>
-    </div>
-    
-    <div class="container">
-        <div id="message" class="message"></div>
-        
-        <div class="profile-card">
-            <h2>基本信息</h2>
-            <div class="info-item">
-                <div class="info-label">姓名</div>
-                <div class="info-value" id="info-name"></div>
-            </div>
-            <div class="info-item">
-                <div class="info-label">班级</div>
-                <div class="info-value" id="info-class"></div>
-            </div>
-            <div class="info-item">
-                <div class="info-label">学号</div>
-                <div class="info-value" id="info-student-id"></div>
-            </div>
-            <div class="info-item">
-                <div class="info-label">账号</div>
-                <div class="info-value" id="info-username"></div>
-            </div>
-        </div>
-        
-        <div class="profile-card">
-            <h2>报名信息</h2>
-            <div class="info-item">
-                <div class="info-label">已报社团</div>
-                <div class="info-value">
-                    <div id="club-info" class="club-info no-club">
-                        您还未报名任何社团
-                    </div>
-                </div>
-            </div>
-            <div class="info-item">
-                <div class="info-label">报名时间</div>
-                <div class="info-value" id="registration-time">--</div>
-            </div>
-        </div>
-        
-        <div class="password-section">
-            <h2>修改密码</h2>
-            <div class="form-group">
-                <label for="current-password">当前密码</label>
-                <input type="password" id="current-password" placeholder="请输入当前密码">
-            </div>
-            <div class="form-group">
-                <label for="new-password">新密码</label>
-                <input type="password" id="new-password" placeholder="请输入新密码">
-            </div>
-            <div class="form-group">
-                <label for="confirm-password">确认新密码</label>
-                <input type="password" id="confirm-password" placeholder="请再次输入新密码">
-            </div>
-            <button id="change-password-btn" class="btn">修改密码</button>
-        </div>
-    </div>
-    
-    <div class="footer">
-        <p>© 2025 市蒙中高中社团选课系统</p>
-    </div>
-    
-    <script>
-        // 获取学生信息
-        const studentInfo = JSON.parse(localStorage.getItem('studentInfo'));
-        
-        if (!studentInfo) {
-            alert('请先登录');
-            window.location.href = '/';
-        }
-        
-        // 修复退出登录功能
-        document.getElementById('logout-link').addEventListener('click', function(e) {
-            e.preventDefault();
-            if (confirm('确定要退出登录吗？')) {
-                window.location.href = '/';
-            }
-        });
-        
-        // 显示学生姓名
-        document.getElementById('student-name').textContent = studentInfo.name;
-        
-        // 加载学生详细信息
-        function loadStudentInfo() {
-            fetch('/api/get_student_info', {
-                headers: {
-                    'X-Student-ID': studentInfo.id
-                }
-            })
-            .then(response => response.json())
-            .then(data => {
-                // 显示基本信息
-                document.getElementById('info-name').textContent = data.name;
-                document.getElementById('info-class').textContent = data.class;
-                document.getElementById('info-student-id').textContent = data.student_id;
-                document.getElementById('info-username').textContent = data.username;
-                
-                // 显示报名信息
-                const clubInfoElement = document.getElementById('club-info');
-                const registrationTimeElement = document.getElementById('registration-time');
-                
-                if (data.registered_club) {
-                    clubInfoElement.className = 'club-info';
-                    clubInfoElement.textContent = data.registered_club;
-                    registrationTimeElement.textContent = data.registration_time ? 
-                        new Date(data.registration_time).toLocaleString('zh-CN') : '--';
-                } else {
-                    clubInfoElement.className = 'club-info no-club';
-                    clubInfoElement.textContent = '您还未报名任何社团';
-                    registrationTimeElement.textContent = '--';
-                }
-            });
-        }
-        
-        // 显示消息
-        function showMessage(type, text) {
-            const messageElement = document.getElementById('message');
-            messageElement.className = `message ${type}`;
-            messageElement.textContent = text;
-            
-            // 3秒后自动隐藏
-            setTimeout(() => {
-                messageElement.style.display = 'none';
-            }, 3000);
-        }
-        
-        // 修改密码
-        document.getElementById('change-password-btn').addEventListener('click', function() {
-            const currentPassword = document.getElementById('current-password').value;
-            const newPassword = document.getElementById('new-password').value;
-            const confirmPassword = document.getElementById('confirm-password').value;
-            
-            // 验证输入
-            if (!currentPassword || !newPassword || !confirmPassword) {
-                showMessage('error', '请填写所有密码字段');
-                return;
-            }
-            
-            if (newPassword !== confirmPassword) {
-                showMessage('error', '两次输入的新密码不一致');
-                return;
-            }
-            
-            if (newPassword.length < 6) {
-                showMessage('error', '新密码长度至少为6位');
-                return;
-            }
-            
-            // 这里应该调用API修改密码
-            // 由于当前系统未实现密码修改API，这里仅作模拟
-            showMessage('success', '密码修改功能暂未实现');
-            
-            // 清空输入框
-            document.getElementById('current-password').value = '';
-            document.getElementById('new-password').value = '';
-            document.getElementById('confirm-password').value = '';
-        });
-        
-        // 页面加载时加载学生信息
-        loadStudentInfo();
-    </script>
+<a class="skip" href="#main">跳到主内容</a>
+<header class="topbar">
+  <div class="brand"><b>社团选课</b><small>市蒙古族中学</small></div>
+  <nav class="topnav" aria-label="主导航">
+    <a href="/student/dashboard">选课</a>
+    <a href="/student/profile" class="active" aria-current="page">个人信息</a>
+    <button id="logout" type="button">退出</button>
+  </nav>
+</header>
+
+<main class="wrap" id="main">
+  <div class="section-h"><span>基本信息</span></div>
+  <div class="card" style="margin-bottom:16px">
+    <dl style="display:grid;grid-template-columns:auto 1fr;gap:14px 18px;margin:0">
+      <dt style="color:var(--muted);font-size:14px">姓名</dt><dd id="f-name" style="margin:0;text-align:right">—</dd>
+      <dt style="color:var(--muted);font-size:14px">班级</dt><dd id="f-class" style="margin:0;text-align:right">—</dd>
+      <dt style="color:var(--muted);font-size:14px">学号</dt><dd id="f-sid" class="mono" style="margin:0;text-align:right">—</dd>
+      <dt style="color:var(--muted);font-size:14px">账号</dt><dd id="f-user" style="margin:0;text-align:right">—</dd>
+    </dl>
+  </div>
+
+  <div class="section-h"><span>我的社团</span></div>
+  <div class="card" id="reg-card" style="margin-bottom:16px">
+    <p id="reg-empty" class="empty" style="padding:18px 0">还未报名任何社团</p>
+  </div>
+
+  <div class="section-h"><span>修改密码</span></div>
+  <div class="card">
+    <div class="field"><label for="cp">当前密码</label><input class="input" id="cp" type="password" autocomplete="current-password"></div>
+    <div class="field"><label for="np">新密码（至少 6 位）</label><input class="input" id="np" type="password" autocomplete="new-password"></div>
+    <div class="field"><label for="np2">确认新密码</label><input class="input" id="np2" type="password" autocomplete="new-password"></div>
+    <button class="btn btn-go" id="save" type="button" style="width:auto;padding:12px 28px">保存</button>
+  </div>
+
+  <div class="toast-wrap" id="toasts" aria-live="polite"></div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+function toast(msg, kind){
+  const t = document.createElement('div'); t.className = 'toast' + (kind ? ' '+kind : ''); t.textContent = msg;
+  $('#toasts').appendChild(t); setTimeout(() => t.remove(), 2600);
+}
+async function load(){
+  const r = await fetch('/api/get_student_info', {headers:{'Content-Type':'application/json'}});
+  if (r.status === 401){ location.href = '/'; return; }
+  const d = await r.json();
+  $('#f-name').textContent = d.name; $('#f-class').textContent = d.class;
+  $('#f-sid').textContent = d.student_id; $('#f-user').textContent = d.username;
+  const card = $('#reg-card');
+  if (d.registered_club){
+    const t = d.registration_time ? d.registration_time : '';
+    card.innerHTML = '<div class="club mine" style="margin:0"><div class="club-top"><span class="club-name"></span></div>'
+      + '<p class="mine-tag" style="margin:10px 0 0"><span></span></p></div>';
+    card.querySelector('.club-name').textContent = d.registered_club;
+    card.querySelector('.mine-tag span').textContent = '报名时间 ' + t;
+  }
+}
+$('#save').addEventListener('click', async () => {
+  const cp = $('#cp').value, np = $('#np').value, np2 = $('#np2').value;
+  if (!cp || !np || !np2){ toast('请填写所有密码字段', 'err'); return; }
+  if (np !== np2){ toast('两次新密码不一致', 'err'); return; }
+  if (np.length < 6){ toast('新密码至少 6 位', 'err'); return; }
+  const btn = $('#save'); btn.disabled = true; const txt = btn.textContent;
+  btn.innerHTML = '<span class="spin" aria-hidden="true"></span>';
+  try{
+    const r = await fetch('/api/change_password', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({current:cp, new:np})});
+    if (r.status === 401){ location.href = '/'; return; }
+    const d = await r.json();
+    toast(d.message || (d.success ? '密码已修改' : '修改失败'), d.success ? 'ok' : 'err');
+    if (d.success){ $('#cp').value = $('#np').value = $('#np2').value = ''; }
+  }catch(e){ toast('网络错误', 'err'); }
+  btn.disabled = false; btn.textContent = txt;
+});
+$('#logout').onclick = async () => {
+  try{ await fetch('/api/logout', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); }catch(e){}
+  location.href = '/';
+};
+load();
+</script>
 </body>
 </html>

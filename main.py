@@ -540,6 +540,7 @@ POST_ROUTES = {
     "/api/logout": ("_h_logout", ROLE_PUBLIC),
     "/api/register_club": ("_h_register_club", ROLE_STUDENT),
     "/api/cancel_registration": ("_h_cancel_registration", ROLE_STUDENT),
+    "/api/change_password": ("_h_change_password", ROLE_STUDENT),
     "/api/import_students": ("_h_import_students", ROLE_ADMIN),
     "/api/import_clubs": ("_h_import_clubs", ROLE_ADMIN),
     "/api/update_registration_time": ("_h_update_time", ROLE_ADMIN),
@@ -925,6 +926,25 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, {"success": False, "message": "取消报名失败,请重试"})
         RG.release_seat(sid, club_id)  # 名额还回
         self._json(200, {"success": True, "message": "取消报名成功"})
+
+    def _h_change_password(self, sess, data):
+        sid = sess["student_id"]
+        cur_pw = data.get("current") or ""
+        new_pw = data.get("new") or ""
+        if len(new_pw) < 6:
+            return self._json(400, {"success": False, "message": "新密码至少 6 位"})
+        with DB_POOL.connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT password FROM students WHERE id = ?", (sid,))
+            row = c.fetchone()
+            if not row:
+                return self._json(404, {"success": False, "message": "用户不存在"})
+            ok, _ = verify_password(row[0], cur_pw)
+            if not ok:
+                return self._json(400, {"success": False, "message": "当前密码不正确"})
+            conn.execute("UPDATE students SET password = ? WHERE id = ?",
+                         (hash_password(new_pw), sid))
+        self._json(200, {"success": True, "message": "密码已修改"})
 
     # ======================================================================
     # 管理端点(均 admin 鉴权)
