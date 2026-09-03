@@ -20,7 +20,7 @@
   <div class="admin-workbench-head">
     <div class="admin-intro">
       <h1><button id="home-trigger" type="button" aria-label="返回工作台">工作台</button></h1>
-      <p>从一个任务开始管理；当前页面只展示你正在处理的内容。</p>
+      <p>本学期社团选课管理</p>
     </div>
 
     <nav class="admin-primary-nav" id="seg" aria-label="一级菜单">
@@ -94,10 +94,11 @@
           <li><b>3</b><span>安全交付</span></li>
         </ol>
         <div class="field admin-import-field">
-          <label for="imp-stu">每行一位学生</label>
-          <p class="admin-field-hint">使用逗号或 Tab 分隔：<code>姓名，班级，学号</code></p>
-          <textarea class="input" id="imp-stu" rows="7" spellcheck="false" placeholder="李四,高一(2)班,2024012&#10;王五,高一(3)班,2024013"></textarea>
-          <p class="admin-validation-note" id="imp-stu-check" aria-live="polite">粘贴名单后会在这里检查格式。</p>
+          <label for="imp-stu">粘贴学生名单</label>
+          <p class="admin-field-hint">可直接从 Excel 粘贴表格，也支持逗号或 Tab 分隔。系统会识别姓名、班级和学号；有歧义时请确认列对应关系。</p>
+          <textarea class="input" id="imp-stu" rows="7" spellcheck="false" placeholder="姓名&#9;班级&#9;学号&#10;任五&#9;300&#9;201"></textarea>
+          <div class="admin-import-preview" id="imp-stu-preview" hidden></div>
+          <p class="admin-validation-note" id="imp-stu-check" aria-live="polite">粘贴名单后会在这里识别列和异常行。</p>
         </div>
         <div class="admin-task-actions">
           <button class="btn btn-primary" id="imp-stu-go" type="button">创建账号并进入交付</button>
@@ -141,7 +142,7 @@
     <article class="admin-pane" data-pane="clubs-cards">
       <div class="admin-pane-heading">
         <h2>项目卡片</h2>
-        <p>在单张卡片内编辑项目名称、人数上限和卡片图片。</p>
+        <p>在单张卡片内编辑项目名称、人数上限和卡片背景。</p>
       </div>
       <div id="club-list" class="clubs admin-project-grid"><div class="sk sk-club"></div></div>
     </article>
@@ -262,6 +263,8 @@ let settingsLoadVersion = 0;
 let studentImportInFlight = false;
 let clubImportInFlight = false;
 let overviewTimer = null;
+let studentImportDraft = null;
+const knownStudentIds = new Set();
 
 const adminMenu = {
   home: [],
@@ -560,6 +563,11 @@ async function loadStudents(){
     const rows = await readAdminJson(await api('/api/get_all_students'), '暂时无法读取学生名单');
     if (version !== studentsLoadVersion) return;
     if (!Array.isArray(rows)) throw new Error('学生数据格式异常');
+    knownStudentIds.clear();
+    rows.forEach(student => {
+      if (student && student.student_id) knownStudentIds.add(String(student.student_id));
+    });
+    if (studentImportDraft) updateStudentImportCheck({preserveDraft: true});
     if (!rows.length){ tb.innerHTML = '<tbody><tr><td class="empty" style="padding:30px">还没有学生</td></tr></tbody>'; return; }
     tb.innerHTML = '<thead><tr><th>姓名</th><th>班级</th><th>学号</th><th>账号</th><th></th></tr></thead><tbody></tbody>';
     const body = tb.querySelector('tbody');
@@ -716,9 +724,9 @@ async function loadClubs(){
     const capacityId = 'club-capacity-' + club.id;
     const imageId = 'club-image-' + club.id;
     form.innerHTML =
-      '<div class="field"><label for="' + nameId + '">项目名称</label><input class="input admin-name" id="' + nameId + '" maxlength="80"></div>' +
-      '<div class="field"><label for="' + capacityId + '">人数上限</label><input class="input admin-capacity" id="' + capacityId + '" type="number" min="' + Math.max(1, club.current_students) + '" max="10000" step="1"><small>当前已有 ' + club.current_students + ' 人，人数上限不能更低。</small></div>' +
-      '<div class="field admin-media-field"><label for="' + imageId + '">卡片图片或 GIF</label><input class="input admin-image-input" id="' + imageId + '" type="file" accept="image/jpeg,image/png,image/webp,image/gif"><small>支持 JPEG、PNG、WebP、GIF，最大 2MB；推荐 16:9 或 2:1。</small></div>' +
+      '<div class="field"><label for="' + nameId + '">项目名称</label><input class="input admin-name" id="' + nameId + '" maxlength="80" placeholder="例如：天文观测（305）"></div>' +
+      '<div class="field"><label for="' + capacityId + '">人数上限</label><input class="input admin-capacity" id="' + capacityId + '" type="number" min="' + Math.max(1, club.current_students) + '" max="10000" step="1"><small>不能低于当前已报名的 ' + club.current_students + ' 人。</small></div>' +
+      '<div class="field admin-media-field"><label for="' + imageId + '">卡片背景</label><input class="input admin-image-input" id="' + imageId + '" type="file" accept="image/jpeg,image/png,image/webp,image/gif"><small>选择一张用于项目展示的背景，建议横向比例。</small></div>' +
       '<div class="admin-media-actions"></div>' +
       '<p class="admin-project-error" role="alert" hidden></p>' +
       '<div class="admin-editor-actions"><button class="btn btn-secondary btn-sm admin-cancel" type="button">取消</button><button class="btn btn-primary btn-sm admin-save" type="submit">保存</button></div>';
@@ -748,12 +756,12 @@ async function loadClubs(){
       if (!file) return;
       if (!allowedProjectMedia.has(file.type)){
         fileInput.value = '';
-        showEditorError(card, '仅支持 JPEG、PNG、WebP 和 GIF');
+        showEditorError(card, '请选择常见图片格式');
         return;
       }
       if (file.size > 2 * 1024 * 1024){
         fileInput.value = '';
-        showEditorError(card, '图片或 GIF 不能超过 2MB');
+        showEditorError(card, '卡片背景不能超过 2MB');
         return;
       }
       releasePreview(club.id);
@@ -907,6 +915,185 @@ function parseDelimitedRows(text, fieldCount){
   return {valid, invalid};
 }
 
+const studentFields = ['name', 'class', 'student_id'];
+const studentFieldLabels = {name: '姓名', class: '班级', student_id: '学号'};
+const studentHeaderAliases = {
+  name: ['姓名', '学生姓名', '学生', 'name'],
+  class: ['班级', '班号', '行政班', '班级号', 'class'],
+  student_id: ['学号', '学生学号', '学籍号', 'studentid', 'id']
+};
+
+function normalizeHeader(value){
+  return String(value || '').trim().toLowerCase().replace(/[\s_\-（）()]/g, '');
+}
+
+function headerField(value){
+  const normalized = normalizeHeader(value);
+  return studentFields.find(field => studentHeaderAliases[field].includes(normalized)) || null;
+}
+
+function isNumericLike(value){
+  return /^[A-Za-z0-9_-]+$/.test(String(value || '').trim());
+}
+
+function buildStudentImportDraft(text){
+  const rows = [];
+  let columns = 0;
+  text.split(/\n/).forEach((raw, index) => {
+    const line = raw.trim();
+    if (!line) return;
+    const cells = line.split(/[,，\t]+/).map(value => value.trim());
+    columns = Math.max(columns, cells.length);
+    rows.push({sourceRow: index + 1, cells});
+  });
+  if (!rows.length) return null;
+
+  const headerMapping = {};
+  rows[0].cells.forEach((cell, index) => {
+    const field = headerField(cell);
+    if (field && headerMapping[field] === undefined) headerMapping[field] = index;
+  });
+  const hasHeader = studentFields.every(field => headerMapping[field] !== undefined);
+  const dataRows = hasHeader ? rows.slice(1) : rows;
+  const columnStats = Array.from({length: columns}, (_, index) => {
+    const values = dataRows.map(row => row.cells[index] || '').filter(Boolean);
+    const distinct = new Set(values);
+    const chineseRatio = values.length ? values.filter(value => /[\u3400-\u9fff]/.test(value)).length / values.length : 0;
+    const numericRatio = values.length ? values.filter(isNumericLike).length / values.length : 0;
+    const classRatio = values.length ? values.filter(value => /班|年|级/.test(value)).length / values.length : 0;
+    return {index, values, chineseRatio, numericRatio, classRatio, uniqueRatio: values.length ? distinct.size / values.length : 0};
+  });
+
+  const mapping = hasHeader ? {...headerMapping} : {};
+  let confident = hasHeader;
+  if (!hasHeader && dataRows.length) {
+    const name = [...columnStats].sort((a, b) => b.chineseRatio - a.chineseRatio)[0];
+    if (name && name.chineseRatio >= .5) mapping.name = name.index;
+
+    const available = columnStats.filter(stat => stat.index !== mapping.name && stat.values.length);
+    const explicitClass = [...available].sort((a, b) => b.classRatio - a.classRatio)[0];
+    const repeatedNumeric = [...available]
+      .filter(stat => stat.numericRatio >= .8 && stat.uniqueRatio < .85)
+      .sort((a, b) => a.uniqueRatio - b.uniqueRatio)[0];
+    const classColumn = explicitClass && explicitClass.classRatio >= .5 ? explicitClass : repeatedNumeric;
+    if (classColumn) mapping.class = classColumn.index;
+
+    const idColumn = [...available]
+      .filter(stat => stat.index !== mapping.class && stat.numericRatio >= .7)
+      .sort((a, b) => b.uniqueRatio - a.uniqueRatio)[0];
+    if (idColumn) mapping.student_id = idColumn.index;
+
+    const mapped = studentFields.every(field => mapping[field] !== undefined);
+    confident = Boolean(mapped && mapping.name !== mapping.class && mapping.class !== mapping.student_id && mapping.name !== mapping.student_id && classColumn && idColumn && (classColumn.classRatio >= .5 || dataRows.length > 1));
+
+    if (!mapping.class && available[0]) mapping.class = available[0].index;
+    if (!mapping.student_id && available.find(stat => stat.index !== mapping.class)) {
+      mapping.student_id = available.find(stat => stat.index !== mapping.class).index;
+    }
+  }
+
+  return {rows, dataRows, columns, columnStats, mapping, confident, confirmed: hasHeader};
+}
+
+function validateStudentImportDraft(draft){
+  if (!draft) return {students: [], issues: [], mappingReady: false};
+  const mappingReady = studentFields.every(field => Number.isInteger(draft.mapping[field])) && new Set(studentFields.map(field => draft.mapping[field])).size === studentFields.length;
+  if (!mappingReady) return {students: [], issues: ['请为姓名、班级和学号分别选择不同的列'], mappingReady: false};
+
+  const students = [];
+  const issues = [];
+  const batchIds = new Set();
+  draft.dataRows.forEach(row => {
+    const student = {
+      name: (row.cells[draft.mapping.name] || '').trim(),
+      class: (row.cells[draft.mapping.class] || '').trim(),
+      student_id: (row.cells[draft.mapping.student_id] || '').trim()
+    };
+    const invalidText = value => !value || value.length > 50 || /[<>\u0000-\u001F]/.test(value);
+    if (invalidText(student.name) || invalidText(student.class) || !student.student_id || student.student_id.length > 40 || /[<>\u0000-\u001F]/.test(student.student_id)) {
+      issues.push('第 ' + row.sourceRow + ' 行内容不完整或包含不支持的字符');
+      return;
+    }
+    if (batchIds.has(student.student_id)) {
+      issues.push('第 ' + row.sourceRow + ' 行学号与本次名单重复');
+      return;
+    }
+    if (knownStudentIds.has(student.student_id)) {
+      issues.push('第 ' + row.sourceRow + ' 行学号已存在');
+      return;
+    }
+    batchIds.add(student.student_id);
+    students.push({...student, sourceRow: row.sourceRow});
+  });
+  return {students, issues, mappingReady};
+}
+
+function columnLabel(draft, index){
+  const samples = draft.columnStats[index]?.values.slice(0, 2).join('、') || '空列';
+  return '第 ' + (index + 1) + ' 列 · ' + samples;
+}
+
+function renderStudentImportPreview(){
+  const box = $('#imp-stu-preview');
+  const draft = studentImportDraft;
+  box.replaceChildren();
+  if (!draft) { box.hidden = true; return; }
+  box.hidden = false;
+  const validation = validateStudentImportDraft(draft);
+
+  const summary = document.createElement('p');
+  summary.className = 'admin-import-confidence' + (draft.confident || draft.confirmed ? ' is-ready' : '');
+  summary.textContent = draft.confident || draft.confirmed
+    ? '已读取 ' + draft.dataRows.length + ' 行 · 已识别列对应关系'
+    : '已读取 ' + draft.dataRows.length + ' 行 · 请确认班级与学号的列对应关系';
+  box.appendChild(summary);
+
+  const map = document.createElement('div');
+  map.className = 'admin-column-map';
+  studentFields.forEach(field => {
+    const label = document.createElement('label');
+    label.textContent = studentFieldLabels[field];
+    const select = document.createElement('select');
+    select.setAttribute('aria-label', studentFieldLabels[field] + '所在列');
+    const empty = document.createElement('option');
+    empty.value = '';
+    empty.textContent = '选择列';
+    select.appendChild(empty);
+    for (let index = 0; index < draft.columns; index += 1) {
+      const option = document.createElement('option');
+      option.value = String(index);
+      option.textContent = columnLabel(draft, index);
+      option.selected = draft.mapping[field] === index;
+      select.appendChild(option);
+    }
+    select.addEventListener('change', () => {
+      draft.mapping[field] = select.value === '' ? undefined : Number(select.value);
+      draft.confirmed = true;
+      renderStudentImportPreview();
+      updateStudentImportCheck({preserveDraft: true});
+    });
+    label.appendChild(select);
+    map.appendChild(label);
+  });
+  box.appendChild(map);
+
+  const samples = document.createElement('div');
+  samples.className = 'admin-import-sample';
+  validation.students.slice(0, 3).forEach(student => {
+    const row = document.createElement('span');
+    row.textContent = student.name + ' · ' + student.class + ' · ' + student.student_id;
+    samples.appendChild(row);
+  });
+  if (samples.childElementCount) box.appendChild(samples);
+
+  if (validation.issues.length) {
+    const issues = document.createElement('p');
+    issues.className = 'admin-import-issues';
+    issues.textContent = validation.issues.slice(0, 3).join('；') + (validation.issues.length > 3 ? '；还有 ' + (validation.issues.length - 3) + ' 项' : '');
+    box.appendChild(issues);
+  }
+}
+
 function setButtonPending(button, pending, label){
   if (pending) {
     button.dataset.label = button.textContent;
@@ -984,14 +1171,15 @@ function renderCredentialDelivery(){
   output.append(head, tableWrap);
 }
 
-function updateStudentImportCheck(){
-  const input = $('#imp-stu');
-  const parsed = parseDelimitedRows(input.value, 3);
+function updateStudentImportCheck({preserveDraft = false} = {}){
+  if (!preserveDraft) studentImportDraft = buildStudentImportDraft($('#imp-stu').value);
+  renderStudentImportPreview();
   const note = $('#imp-stu-check');
   const button = $('#imp-stu-go');
-  if (!parsed.valid.length && !parsed.invalid.length){
-    note.textContent = '粘贴名单后会在这里检查格式。';
+  if (!studentImportDraft){
+    note.textContent = '粘贴名单后会在这里识别列和异常行。';
     button.disabled = true;
+    button.textContent = '确认名单并创建账号';
     return;
   }
   if (pendingCredentials.length){
@@ -999,10 +1187,20 @@ function updateStudentImportCheck(){
     button.disabled = true;
     return;
   }
-  note.textContent = parsed.invalid.length
-    ? '第 ' + parsed.invalid.join('、') + ' 行缺少姓名、班级或学号；修正后才能导入。'
-    : '已识别 ' + parsed.valid.length + ' 行，格式正确；下一步将创建账号。';
-  button.disabled = studentImportInFlight || !parsed.valid.length || Boolean(parsed.invalid.length);
+  const validation = validateStudentImportDraft(studentImportDraft);
+  if (!studentImportDraft.confident && !studentImportDraft.confirmed) {
+    note.textContent = '系统无法可靠判断所有列，请确认姓名、班级和学号的对应列。';
+    button.disabled = true;
+    button.textContent = '请确认列对应关系';
+    return;
+  }
+  note.textContent = validation.issues.length
+    ? validation.issues[0] + '；修正后才能导入。'
+    : '已准备 ' + validation.students.length + ' 名学生，确认后将创建账号。';
+  button.disabled = studentImportInFlight || !validation.students.length || Boolean(validation.issues.length);
+  button.textContent = validation.students.length
+    ? '确认 ' + validation.students.length + ' 名学生并创建账号'
+    : '确认名单并创建账号';
 }
 
 $('#imp-stu-go').onclick = async () => {
@@ -1012,13 +1210,17 @@ $('#imp-stu-go').onclick = async () => {
     activateRoute('students', 'students-accounts', {focus: true});
     return;
   }
-  const parsed = parseDelimitedRows($('#imp-stu').value, 3);
-  if (!parsed.valid.length){ toast('没有可导入的行', 'err'); return; }
-  if (parsed.invalid.length){
-    toast('请先修正第 ' + parsed.invalid.join('、') + ' 行', 'err');
+  const validation = validateStudentImportDraft(studentImportDraft);
+  if (!studentImportDraft || !validation.students.length){ toast('没有可导入的学生', 'err'); return; }
+  if (!studentImportDraft.confident && !studentImportDraft.confirmed){
+    toast('请先确认列对应关系', 'err');
     return;
   }
-  const students = parsed.valid.map(row => ({name: row.cells[0], class: row.cells[1], student_id: row.cells[2]}));
+  if (validation.issues.length){
+    toast(validation.issues[0], 'err');
+    return;
+  }
+  const students = validation.students.map(({name, class: klass, student_id}) => ({name, class: klass, student_id}));
   const result = $('#imp-stu-result');
   const button = $('#imp-stu-go');
   result.textContent = '';

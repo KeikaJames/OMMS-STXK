@@ -41,6 +41,7 @@ let reconcileTarget = null;
 let lastClubs = [];
 let confirmingCancelFor = null;
 let activeMediaState = 'loading';
+let activeMediaSource = null;
 let mediaSwapGeneration = 0;
 let refreshInFlight = null;
 let queuedProfileRefresh = false;
@@ -129,10 +130,12 @@ function deriveViewState() {
 }
 
 function setStateMedia(state) {
-  if (state === activeMediaState) return;
   const media = $('#state-media');
   const image = $('#state-image');
-  const source = UI.stateArt[state] || UI.stateArt.idle;
+  const source = state === 'selected'
+    ? selectedClubArt() || UI.stateArt.selected
+    : UI.stateArt[state] || UI.stateArt.idle;
+  if (state === activeMediaState && source === activeMediaSource) return;
   const generation = ++mediaSwapGeneration;
   const preload = new Image();
 
@@ -142,6 +145,7 @@ function setStateMedia(state) {
       image.src = source;
       media.dataset.state = state;
       activeMediaState = state;
+      activeMediaSource = source;
       requestAnimationFrame(() => media.classList.remove('is-changing'));
     };
     if (reducedMotion.matches) swap();
@@ -152,6 +156,14 @@ function setStateMedia(state) {
   preload.onload = commit;
   preload.onerror = commit;
   preload.src = source;
+}
+
+function selectedClubArt() {
+  if (!me || !me.registered_club) return null;
+  const selected = lastClubs.find(club => (
+    String(club.id) === String(me.registered_club_id) || club.name === me.registered_club
+  ));
+  return selected ? safeProjectImage(selected) || fallbackArt(selected) : null;
 }
 
 function renderStatus() {
@@ -463,7 +475,8 @@ function renderClubs(clubs) {
   lastClubs = Array.isArray(clubs) ? clubs : [];
   const box = $('#clubs');
   const mine = me && me.registered_club;
-  $('#project-count').textContent = String(lastClubs.length);
+  const projectCount = $('#project-count');
+  if (projectCount) projectCount.textContent = String(lastClubs.length);
   $('#hint').textContent = mine
     ? '已选 1 / 1'
     : (canRegister ? '请选择 1 个项目' : '开放后可选择 1 个项目');
@@ -546,8 +559,8 @@ async function performRefresh({profile = false, forceTime = false} = {}) {
     }
   }
 
-  renderStatus();
   renderClubs(clubs);
+  renderStatus();
   $('#clubs').classList.remove('is-stale');
   updateFreshness();
 }
