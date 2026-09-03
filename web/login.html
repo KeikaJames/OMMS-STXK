@@ -7,6 +7,7 @@
 <title>登录 · 鄂尔多斯市实验中学社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
+<script src="/easter-egg.js" defer></script>
 </head>
 <body class="home">
 <svg width="0" height="0" aria-hidden="true" style="position:absolute"><filter id="glassdistort" x="-15%" y="-15%" width="130%" height="130%"><feTurbulence type="fractalNoise" baseFrequency="0.009 0.013" numOctaves="2" seed="7" result="n"/><feGaussianBlur in="n" stdDeviation="1.4" result="sn"/><feDisplacementMap in="SourceGraphic" in2="sn" scale="11" xChannelSelector="R" yChannelSelector="G"/></filter></svg>
@@ -49,15 +50,23 @@ $('#seg').addEventListener('click', e => {
 });
 function fail(m){ const e = $('#err'); e.textContent = m; }
 async function go(){
+  const btn = $('#go'); if (btn.disabled) return;
   const u = $('#u').value.trim(), p = $('#p').value;
   if (!u || !p){ fail('请输入用户名和密码'); return; }
   fail('');
-  const btn = $('#go'); btn.disabled = true; const txt = btn.textContent;
+  btn.disabled = true; const txt = btn.textContent;
   btn.innerHTML = '<span class="spin" aria-hidden="true"></span>';
   try{
     const r = await fetch(kind === 'student' ? '/api/login' : '/api/admin_login', {
       method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username:u, password:p})
     });
+    if (r.status === 429 || r.status === 503){
+      const retry = Math.max(1, parseInt(r.headers.get('Retry-After') || '1', 10) || 1);
+      let d = null; try { d = await r.json(); } catch(e) {}
+      fail((d && d.message) || ('登录繁忙,请在 '+retry+' 秒后重试'));
+      btn.disabled = false; btn.textContent = txt;
+      return;
+    }
     const d = await r.json();
     if (d.success){ location.href = kind === 'student' ? '/student/dashboard' : '/admin/dashboard'; return; }
     fail(d.message || '登录失败,请重试');

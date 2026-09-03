@@ -7,6 +7,7 @@
 <title>选课主页 · 鄂尔多斯市实验中学社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
+<script src="/easter-egg.js" defer></script>
 </head>
 <body>
 <a class="skip" href="#main">跳到主内容</a>
@@ -50,6 +51,10 @@ let canRegister = false;
 let openAt = null;        // 开放时刻(毫秒)
 let inflight = false;     // 单飞:同一时刻只允许一个写操作
 let backoffUntil = 0;     // 503 退避截止
+let lastTimeRefresh = 0;  // 时间设置低频刷新；秒级倒计时完全在本地运行
+let lastProfileRefresh = 0;
+let reconcileTimer = null;
+let reconcileGeneration = 0;
 
 function toast(msg, kind){
   const t = document.createElement('div');
@@ -90,14 +95,30 @@ function tickClock(){
   }
 }
 
-async function refresh(){
+async function refresh({profile = false} = {}){
   try{
-    const [tRes, cRes, sRes] = await Promise.all([
-      api('/api/check_registration_time'), api('/api/get_clubs'), api('/api/get_student_info')
+    const needTime = openAt === null || Date.now() - lastTimeRefresh >= 30000;
+    const needProfile = profile || me === null || Date.now() - lastProfileRefresh >= 60000;
+    const [cRes, tRes, sRes] = await Promise.all([
+      api('/api/get_clubs'),
+      needTime ? api('/api/check_registration_time') : Promise.resolve(null),
+      needProfile ? api('/api/get_student_info') : Promise.resolve(null)
     ]);
-    const t = await tRes.json(), clubs = await cRes.json(); me = await sRes.json();
-    canRegister = !!t.can_register;
-    openAt = t.start_time ? new Date(t.start_time.replace(/-/g,'/')).getTime() : null;
+    const clubs = await cRes.json();
+    if (tRes){
+      const t = await tRes.json();
+      canRegister = !!t.can_register;
+      openAt = t.start_time ? new Date(t.start_time.replace(/-/g,'/')).getTime() : null;
+      lastTimeRefresh = Date.now();
+    } else if (!canRegister && openAt !== null && Date.now() >= openAt){
+      canRegister = true;
+    }
+    if (sRes && sRes.ok){
+      const profileData = await sRes.json();
+      if (profileData && typeof profileData.student_id !== 'undefined'){
+        me = profileData; lastProfileRefresh = Date.now();
+      }
+    }
     renderStatus(); renderClubs(clubs);
   }catch(e){ if (e.message !== 'unauth') console.error(e); }
 }
@@ -181,6 +202,22 @@ function busy(btn, on){
   else { btn.disabled = false; btn.textContent = btn.dataset.txt || btn.textContent; }
 }
 
+function reconcileFinalState(){
+  const generation = ++reconcileGeneration;
+  if (reconcileTimer) clearTimeout(reconcileTimer);
+  const delays = [1000, 2000, 4000, 8000];
+  let round = 0;
+  backoffUntil = Math.max(backoffUntil, Date.now() + delays.reduce((a,b) => a+b, 0));
+  const step = () => {
+    lastProfileRefresh = 0;
+    refresh({profile:true}).finally(() => {
+      if (generation !== reconcileGeneration) return;
+      reconcileTimer = round < delays.length ? setTimeout(step, delays[round++]) : null;
+    });
+  };
+  reconcileTimer = setTimeout(step, delays[round++]);
+}
+
 async function guardedWrite(btn, fn){
   if (inflight) return;
   if (Date.now() < backoffUntil){ toast('系统繁忙,请稍候重试', 'err'); return; }
@@ -196,20 +233,34 @@ function doRegister(btn, clubId){
     if (r.status === 503 || r.status === 429){
       const ra = parseInt(r.headers.get('Retry-After') || '2', 10);
       backoffUntil = Date.now() + (isNaN(ra)?2:ra)*1000;
-      toast('系统繁忙,'+ (isNaN(ra)?2:ra) +' 秒后可重试', 'err'); return;
+      const delay = (isNaN(ra)?2:ra);
+      toast('请求超时,正在确认最终报名状态', 'err');
+      lastProfileRefresh = 0;
+      backoffUntil = Math.max(backoffUntil, Date.now() + delay*1000);
+      reconcileFinalState(); return;
     }
     const d = await r.json();
     toast(d.message || (d.success ? '报名成功' : '报名失败'), d.success ? 'ok' : 'err');
-    await refresh();
+    await refresh({profile:true});
   });
 }
 
 function doCancel(btn){
   guardedWrite(btn, async () => {
     const r = await api('/api/cancel_registration', {method:'POST', body:'{}'});
+    if (r.status === 503 || r.status === 429){
+      const ra = parseInt(r.headers.get('Retry-After') || '2', 10);
+      backoffUntil = Date.now() + (isNaN(ra)?2:ra)*1000;
+      let d = null; try { d = await r.json(); } catch(e) {}
+      const delay = (isNaN(ra)?2:ra);
+      toast((d && d.message) || '退选状态待确认,正在重新读取', 'err');
+      lastProfileRefresh = 0;
+      backoffUntil = Math.max(backoffUntil, Date.now() + delay*1000);
+      reconcileFinalState(); return;
+    }
     const d = await r.json();
     toast(d.message || (d.success ? '已退选' : '退选失败'), d.success ? 'ok' : 'err');
-    await refresh();
+    await refresh({profile:true});
   });
 }
 
@@ -219,6 +270,7 @@ $('#logout').onclick = async () => {
 };
 
 setInterval(tickClock, 1000);
+window.addEventListener('focus', () => refresh({profile:true}));
 (function loop(){ refresh().finally(() => setTimeout(loop, 4000 + Math.floor(Math.random()*2500))); })();
 </script>
 </body>

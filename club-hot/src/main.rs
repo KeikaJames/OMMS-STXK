@@ -18,15 +18,19 @@ mod state;
 mod types;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use deadpool_redis::{Config as RedisConfig, Runtime as RedisRuntime};
+use deadpool_redis::{
+    Config as RedisConfig, PoolConfig as RedisPoolConfig, Runtime as RedisRuntime,
+};
 use tower::ServiceBuilder;
 use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use crate::db::Db;
@@ -57,32 +61,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // --- SQLite pools (write=1, read=N) ---
     let db = Db::new(&cfg.db_path, cfg.read_pool_size)?;
+    db.ensure_schema_guards().await?;
 
     // --- Redis pool ---
-    let redis_cfg = RedisConfig::from_url(cfg.redis_url.clone());
+    let mut redis_cfg = RedisConfig::from_url(cfg.redis_url.clone());
+    let mut redis_pool_cfg = RedisPoolConfig::new(cfg.redis_pool_size);
+    redis_pool_cfg.timeouts.wait = Some(Duration::from_millis(cfg.redis_pool_wait_ms));
+    redis_pool_cfg.timeouts.create = Some(Duration::from_millis(cfg.redis_pool_wait_ms));
+    redis_pool_cfg.timeouts.recycle = Some(Duration::from_millis(cfg.redis_pool_wait_ms));
+    redis_cfg.pool = Some(redis_pool_cfg);
     let redis = redis_cfg
         .create_pool(Some(RedisRuntime::Tokio1))
         .map_err(|e| format!("redis pool: {e}"))?;
 
+    let registration_gate = Arc::new(tokio::sync::Semaphore::new(cfg.registration_concurrency));
+    let reconcile_requested = Arc::new(AtomicBool::new(false));
     let state = AppState {
         db: db.clone(),
         redis: redis.clone(),
         cfg: Arc::new(cfg.clone()),
+        auth_gate: Arc::new(tokio::sync::Semaphore::new(cfg.auth_concurrency)),
+        registration_gate: registration_gate.clone(),
+        reconcile_requested: reconcile_requested.clone(),
     };
 
-    // --- Startup: rebuild stock from SQLite ground truth + seed open_at ---
+    // --- Startup reconciliation is guarded by the same cross-service
+    // maintenance fence used by Python. If an older operation is active, keep
+    // live Redis untouched and retry after its lease drains. ---
     let seats = redis_seats::Seats::new(redis.clone());
-    if let Err(e) = redis_seats::rebuild_stock(&seats, &db).await {
-        tracing::error!(error = %e, "initial rebuild_stock failed (continuing degraded)");
+    if !try_reconcile_stock(&seats, &db).await {
+        reconcile_requested.store(true, Ordering::Release);
     }
-    redis_seats::seed_open_at(&seats, &db).await;
+    let recovery_seats = seats.clone();
+    let recovery_db = db.clone();
+    let recovery_flag = reconcile_requested.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !recovery_flag.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            if try_reconcile_stock(&recovery_seats, &recovery_db).await {
+                tracing::info!("deferred stock reconciliation completed");
+            } else {
+                recovery_flag.store(true, Ordering::Release);
+            }
+        }
+    });
     let redis_up = seats.alive().await;
     tracing::info!(redis = redis_up, "startup complete");
 
     // --- Router ---
-    let app = Router::new()
+    let probes = Router::new()
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
+        .with_state(state.clone());
+    let api = Router::new()
         .route("/api/login", post(handlers::login))
         .route("/api/register_club", post(handlers::register_club))
         .route(
@@ -105,16 +139,66 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 .layer(HandleErrorLayer::new(handle_overload))
                 .load_shed()
                 .layer(GlobalConcurrencyLimitLayer::new(cfg.max_concurrency))
-                .timeout(Duration::from_secs(cfg.request_timeout_secs)),
+                .timeout(Duration::from_secs(cfg.request_timeout_secs))
+                .layer(TraceLayer::new_for_http()),
         );
+    // Probes deliberately sit outside the public API concurrency/timeout layer,
+    // so a queue of registrations cannot hide process liveness.
+    let app = probes.merge(api);
 
     // --- Serve ---
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
     tracing::info!(bind = %cfg.bind, "club-hot listening");
-    axum::serve(listener, app.into_make_service())
+    let serve_result = axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+
+    // Timed-out HTTP requests can leave detached registration finalizers. Give
+    // those side-effecting tasks a bounded drain window before dropping Tokio.
+    let drain = async {
+        while registration_gate.available_permits() < cfg.registration_concurrency {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    if tokio::time::timeout(
+        Duration::from_secs(cfg.request_timeout_secs.saturating_add(5)),
+        drain,
+    )
+    .await
+    .is_err()
+    {
+        tracing::error!("registration finalizers did not drain before shutdown deadline");
+    }
+    serve_result?;
     Ok(())
+}
+
+async fn try_reconcile_stock(seats: &redis_seats::Seats, db: &Db) -> bool {
+    let token = match seats.begin_maintenance().await {
+        Ok(Some(token)) => token,
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::warn!(error = %e, "maintenance fence unavailable for reconciliation");
+            return false;
+        }
+    };
+    let rebuilt = match redis_seats::rebuild_stock(seats, db, &token).await {
+        Ok(()) => match redis_seats::seed_open_at(seats, db).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, "open_at reconciliation failed");
+                false
+            }
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "stock reconciliation failed");
+            false
+        }
+    };
+    if let Err(e) = seats.end_maintenance(&token).await {
+        tracing::warn!(error = %e, "maintenance fence cleanup failed");
+    }
+    rebuilt
 }
 
 /// Map a shed/timeout error from the tower stack to a 503 JSON body, matching

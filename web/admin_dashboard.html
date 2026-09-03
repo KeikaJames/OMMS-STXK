@@ -7,6 +7,7 @@
 <title>管理控制台 · 鄂尔多斯市实验中学社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
+<script src="/easter-egg.js" defer></script>
 </head>
 <body>
 <a class="skip" href="#main">跳到主内容</a>
@@ -242,7 +243,10 @@ $('#save-apw').onclick = async () => {
   const r = await api('/api/admin_change_password', {method:'POST', body:JSON.stringify({current:cur, new:np})});
   const d = await r.json();
   toast(d.success ? '管理员密码已修改' : (d.message || '修改失败'), d.success?'ok':'err');
-  if (d.success){ $('#ap-cur').value = $('#ap-new').value = ''; }
+  if (d.success){
+    $('#ap-cur').value = $('#ap-new').value = '';
+    setTimeout(() => { location.href = '/'; }, 700);
+  }
 };
 
 async function loadSettings(){
@@ -252,8 +256,8 @@ async function loadSettings(){
 
 $('#logout').onclick = async () => { try{ await fetch('/api/logout', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); }catch(e){} location.href = '/'; };
 
-loadOverview(); loadStudents(); loadClubs(); loadSettings();
-setInterval(loadOverview, 6000);
+loadStudents(); loadClubs(); loadSettings();
+(function loopOverview(){ loadOverview().finally(() => setTimeout(loopOverview, 6000)); })();
 </script>
 </body>
 </html>
