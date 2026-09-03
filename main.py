@@ -1843,6 +1843,11 @@ STATIC = {
     "/easter-egg.js": ("easter-egg.js", "application/javascript; charset=utf-8"),
     "/student-dashboard.js": ("student-dashboard.js", "application/javascript; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/motion.css": ("motion.css", "text/css; charset=utf-8"),
+    "/motion.js": ("motion.js", "application/javascript; charset=utf-8"),
+    "/vendor/gsap.min.js": ("vendor/gsap.min.js", "application/javascript; charset=utf-8"),
+    "/vendor/vanilla-tilt.min.js": ("vendor/vanilla-tilt.min.js", "application/javascript; charset=utf-8"),
+    "/vendor/confetti.min.js": ("vendor/confetti.min.js", "application/javascript; charset=utf-8"),
 }
 
 
