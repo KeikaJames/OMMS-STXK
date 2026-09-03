@@ -14,12 +14,15 @@ const UI = Object.freeze({
     loading: '/img/editorial-desk.jpg',
     idle: '/img/editorial-desk.jpg',
     countdown: '/img/editorial-telescope.jpg',
+    opening: '/img/editorial-magnet.jpg',
     open: '/img/editorial-grassland.jpg',
     reconciling: '/img/editorial-magnet.jpg',
     selected: '/img/editorial-bird.jpg'
   }),
   pollingMinMs: 4000,
   pollingJitterMs: 2500,
+  pollingSlowMs: 15000,
+  pollingMaxBackoffMs: 30000,
   timeRefreshMs: 30000,
   profileRefreshMs: 60000,
   reconcileDelaysMs: [1000, 2000, 4000, 8000]
@@ -39,6 +42,13 @@ let lastClubs = [];
 let confirmingCancelFor = null;
 let activeMediaState = 'loading';
 let mediaSwapGeneration = 0;
+let refreshInFlight = null;
+let queuedProfileRefresh = false;
+let queuedTimeRefresh = false;
+let pollTimer = null;
+let pollFailures = 0;
+let openConfirmationQueued = false;
+let cooldownTimer = null;
 
 const clubNodes = new Map();
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
@@ -93,8 +103,16 @@ function tickClock() {
     return;
   }
 
+  const remainingMs = openAt - now.getTime();
+  if (remainingMs <= 0) {
+    label.textContent = '正在确认';
+    clock.textContent = '00:00';
+    requestOpenConfirmation();
+    return;
+  }
+
   label.textContent = '距开放';
-  let seconds = Math.max(0, Math.round((openAt - now.getTime()) / 1000));
+  let seconds = Math.max(0, Math.ceil(remainingMs / 1000));
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   seconds %= 60;
@@ -105,6 +123,7 @@ function deriveViewState() {
   if (reconcileTarget) return 'reconciling';
   if (me && me.registered_club) return 'selected';
   if (canRegister) return 'open';
+  if (openAt !== null && Date.now() >= openAt) return 'opening';
   if (openAt !== null) return 'countdown';
   return 'idle';
 }
@@ -156,6 +175,9 @@ function renderStatus() {
   } else if (state === 'countdown') {
     statusText.textContent = '等待开放';
     detail.textContent = '到达开放时间后，报名按钮会自动启用';
+  } else if (state === 'opening') {
+    statusText.textContent = '正在确认开放';
+    detail.textContent = '正在向服务器确认本次选课是否已开放';
   } else {
     statusText.textContent = '尚未设置开放时间';
     detail.textContent = '请等待老师设置本次选课时间';
@@ -200,6 +222,48 @@ function protectMedia(media) {
   media.addEventListener('contextmenu', event => event.preventDefault());
   media.addEventListener('dragstart', event => event.preventDefault());
   media.addEventListener('copy', event => event.preventDefault());
+}
+
+function isAnimatedMedia(source) {
+  return /\.gif(?:\?|$)/i.test(source || '');
+}
+
+function bindClubMediaMotion(card) {
+  const media = card.querySelector('.club-media');
+  let frame = 0;
+  let latest = null;
+  let rect = null;
+
+  const reset = () => {
+    latest = null;
+    rect = null;
+    if (frame) cancelAnimationFrame(frame);
+    frame = 0;
+    media.style.setProperty('--media-pan-x', '0px');
+    media.style.setProperty('--media-pan-y', '0px');
+  };
+
+  const draw = () => {
+    frame = 0;
+    if (!latest || !rect || reducedMotion.matches) return;
+    const x = Math.max(-1, Math.min(1, ((latest.clientX - rect.left) / rect.width - .5) * 2));
+    const y = Math.max(-1, Math.min(1, ((latest.clientY - rect.top) / rect.height - .5) * 2));
+    media.style.setProperty('--media-pan-x', (x * 4).toFixed(2) + 'px');
+    media.style.setProperty('--media-pan-y', (y * 3).toFixed(2) + 'px');
+  };
+
+  media.addEventListener('pointerenter', event => {
+    if (event.pointerType === 'touch' || reducedMotion.matches) return;
+    rect = media.getBoundingClientRect();
+  });
+  media.addEventListener('pointermove', event => {
+    if (event.pointerType === 'touch' || reducedMotion.matches) return;
+    latest = event;
+    rect ||= media.getBoundingClientRect();
+    if (!frame) frame = requestAnimationFrame(draw);
+  });
+  media.addEventListener('pointerleave', reset);
+  media.addEventListener('pointercancel', reset);
 }
 
 function createClubCard(club) {
@@ -264,6 +328,7 @@ function createClubCard(club) {
   action.className = 'act';
   content.append(top, seats, capacity, action);
   card.append(media, content);
+  bindClubMediaMotion(card);
   return card;
 }
 
@@ -319,6 +384,11 @@ function renderAction(card, club, mode) {
     action.appendChild(actionState('已满'));
   } else if (mode === 'not-started') {
     action.appendChild(actionState('未开始'));
+  } else if (mode === 'reconciling') {
+    action.appendChild(actionState('正在确认'));
+  } else if (mode === 'cooldown') {
+    const seconds = Math.max(1, Math.ceil((backoffUntil - Date.now()) / 1000));
+    action.appendChild(actionState('请在 ' + seconds + ' 秒后重试'));
   } else {
     const register = document.createElement('button');
     register.className = 'btn btn-primary btn-sm';
@@ -345,7 +415,7 @@ function updateClubCard(card, club, mine, index) {
   const stillSource = card.querySelector('.club-media source');
 
   image.dataset.fallback = fallback;
-  stillSource.srcset = fallback;
+  stillSource.srcset = isAnimatedMedia(source) ? fallback : source;
   if (image.dataset.source !== source) {
     image.dataset.source = source;
     image.src = source;
@@ -374,7 +444,9 @@ function updateClubCard(card, club, mine, index) {
   capacity.querySelector('i').style.width = (full ? 0 : remainingPercent) + '%';
 
   let mode = 'register';
-  if (isMine && confirmingCancelFor === key) mode = 'confirm';
+  if (reconcileTarget) mode = 'reconciling';
+  else if (Date.now() < backoffUntil) mode = 'cooldown';
+  else if (isMine && confirmingCancelFor === key) mode = 'confirm';
   else if (isMine) mode = 'mine';
   else if (mine) mode = 'other';
   else if (full) mode = 'full';
@@ -433,42 +505,137 @@ function updateFreshness() {
   $('#updated-at').textContent = '最近更新 ' + formatTime(new Date());
 }
 
-async function refresh({profile = false} = {}) {
-  try {
-    const needTime = openAt === null || Date.now() - lastTimeRefresh >= UI.timeRefreshMs;
-    const needProfile = profile || me === null || Date.now() - lastProfileRefresh >= UI.profileRefreshMs;
-    const [clubsResponse, timeResponse, studentResponse] = await Promise.all([
-      api('/api/get_clubs'),
-      needTime ? api('/api/check_registration_time') : Promise.resolve(null),
-      needProfile ? api('/api/get_student_info') : Promise.resolve(null)
-    ]);
-
-    const clubs = await clubsResponse.json();
-    if (timeResponse) {
-      const time = await timeResponse.json();
-      canRegister = Boolean(time.can_register);
-      openAt = time.start_time
-        ? new Date(time.start_time.replace(/-/g, '/')).getTime()
-        : null;
-      lastTimeRefresh = Date.now();
-    } else if (!canRegister && openAt !== null && Date.now() >= openAt) {
-      canRegister = true;
-    }
-
-    if (studentResponse && studentResponse.ok) {
-      const profileData = await studentResponse.json();
-      if (profileData && typeof profileData.student_id !== 'undefined') {
-        me = profileData;
-        lastProfileRefresh = Date.now();
-      }
-    }
-
-    renderStatus();
-    renderClubs(clubs);
-    updateFreshness();
-  } catch (error) {
-    if (error.message !== 'unauth') console.error(error);
+async function readJson(response, fallbackMessage) {
+  if (!response.ok) {
+    let payload = null;
+    try { payload = await response.json(); } catch (error) { /* body is optional */ }
+    throw new Error((payload && payload.message) || fallbackMessage);
   }
+  return response.json();
+}
+
+async function performRefresh({profile = false, forceTime = false} = {}) {
+  const needTime = forceTime || openAt === null || Date.now() - lastTimeRefresh >= UI.timeRefreshMs;
+  const needProfile = profile || me === null || Date.now() - lastProfileRefresh >= UI.profileRefreshMs;
+  const [clubsResponse, timeResponse, studentResponse] = await Promise.all([
+    api('/api/get_clubs'),
+    needTime ? api('/api/check_registration_time') : Promise.resolve(null),
+    needProfile ? api('/api/get_student_info') : Promise.resolve(null)
+  ]);
+
+  const clubs = await readJson(clubsResponse, '暂时无法读取选修项目');
+  if (!Array.isArray(clubs)) throw new Error('项目数据格式异常');
+
+  if (timeResponse) {
+    const time = await readJson(timeResponse, '暂时无法确认开放时间');
+    if (!time || typeof time.can_register !== 'boolean') {
+      throw new Error('开放时间数据格式异常');
+    }
+    canRegister = time.can_register;
+    openAt = time.start_time
+      ? new Date(time.start_time.replace(/-/g, '/')).getTime()
+      : null;
+    lastTimeRefresh = Date.now();
+  }
+
+  if (studentResponse) {
+    const profileData = await readJson(studentResponse, '暂时无法读取学生信息');
+    if (profileData && typeof profileData.student_id !== 'undefined') {
+      me = profileData;
+      lastProfileRefresh = Date.now();
+    }
+  }
+
+  renderStatus();
+  renderClubs(clubs);
+  $('#clubs').classList.remove('is-stale');
+  updateFreshness();
+}
+
+function refresh({profile = false, forceTime = false} = {}) {
+  if (refreshInFlight) {
+    queuedProfileRefresh ||= profile;
+    queuedTimeRefresh ||= forceTime;
+    return refreshInFlight;
+  }
+
+  let nextProfile = profile;
+  let nextForceTime = forceTime;
+  const run = async () => {
+    do {
+      queuedProfileRefresh = false;
+      queuedTimeRefresh = false;
+      try {
+        await performRefresh({profile: nextProfile, forceTime: nextForceTime});
+        pollFailures = 0;
+      } catch (error) {
+        pollFailures = Math.min(pollFailures + 1, 5);
+        const clubs = $('#clubs');
+        clubs.setAttribute('aria-busy', 'false');
+        clubs.classList.add('is-stale');
+        if (!lastClubs.length) $('#hint').textContent = '暂时无法同步，正在重试';
+        if (pollFailures === 1 && error.message !== 'unauth') {
+          toast(error.message || '暂时无法同步选课信息，正在重试', 'err');
+        }
+      }
+      nextProfile = queuedProfileRefresh;
+      nextForceTime = queuedTimeRefresh;
+    } while (nextProfile || nextForceTime);
+  };
+
+  refreshInFlight = run().finally(() => { refreshInFlight = null; });
+  return refreshInFlight;
+}
+
+function requestOpenConfirmation() {
+  if (openConfirmationQueued || document.hidden) return;
+  openConfirmationQueued = true;
+  window.setTimeout(() => {
+    openConfirmationQueued = false;
+    refresh({forceTime: true});
+  }, 0);
+}
+
+function scheduleCooldownRender() {
+  if (cooldownTimer) clearTimeout(cooldownTimer);
+  const delay = Math.max(0, backoffUntil - Date.now());
+  if (!delay) return;
+  cooldownTimer = window.setTimeout(() => {
+    cooldownTimer = null;
+    renderClubs(lastClubs);
+  }, delay + 30);
+}
+
+function pollDelay() {
+  const base = reconcileTarget || (me && me.registered_club) || !canRegister
+    ? UI.pollingSlowMs
+    : UI.pollingMinMs;
+  const backoff = Math.min(UI.pollingMaxBackoffMs, base * (2 ** pollFailures));
+  return backoff + Math.floor(Math.random() * UI.pollingJitterMs);
+}
+
+function stopPolling() {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+}
+
+function schedulePoll(delay = pollDelay()) {
+  stopPolling();
+  if (document.hidden) return;
+  pollTimer = window.setTimeout(async () => {
+    pollTimer = null;
+    if (document.hidden) return;
+    await refresh();
+    schedulePoll();
+  }, delay);
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    stopPolling();
+    return;
+  }
+  refresh({profile: true, forceTime: true}).finally(() => schedulePoll());
 }
 
 function busy(button, on) {
@@ -488,6 +655,7 @@ function finishReconciliation(generation) {
   reconcileTimer = null;
   renderStatus();
   renderClubs(lastClubs);
+  scheduleCooldownRender();
 }
 
 function reconciliationResolved() {
@@ -502,7 +670,6 @@ function reconcileFinalState(target) {
   const delays = UI.reconcileDelaysMs;
   let round = 0;
   reconcileTarget = target;
-  backoffUntil = Math.max(backoffUntil, Date.now() + delays.reduce((sum, delay) => sum + delay, 0));
   renderStatus();
   renderClubs(lastClubs);
 
@@ -561,6 +728,7 @@ function doRegister(button, clubId) {
       const retryAfter = parseInt(response.headers.get('Retry-After') || '2', 10);
       const delay = Number.isNaN(retryAfter) ? 2 : retryAfter;
       backoffUntil = Math.max(backoffUntil, Date.now() + delay * 1000);
+      scheduleCooldownRender();
       toast('请求已提交，正在确认最终报名状态', 'pending');
       lastProfileRefresh = 0;
       reconcileFinalState('registered');
@@ -579,6 +747,7 @@ function doCancel(button) {
       const retryAfter = parseInt(response.headers.get('Retry-After') || '2', 10);
       const delay = Number.isNaN(retryAfter) ? 2 : retryAfter;
       backoffUntil = Math.max(backoffUntil, Date.now() + delay * 1000);
+      scheduleCooldownRender();
       let data = null;
       try { data = await response.json(); } catch (error) { /* response body is optional */ }
       toast((data && data.message) || '退选请求已提交，正在确认最终状态', 'pending');
@@ -608,8 +777,13 @@ $('#logout').onclick = async () => {
 };
 
 protectMedia($('#state-media'));
-setInterval(tickClock, 1000);
-window.addEventListener('focus', () => refresh({profile: true}));
+tickClock();
+window.setInterval(() => {
+  if (!document.hidden) tickClock();
+}, 1000);
+window.addEventListener('focus', handleVisibilityChange);
+window.addEventListener('pageshow', handleVisibilityChange);
+document.addEventListener('visibilitychange', handleVisibilityChange);
 
 if ('requestIdleCallback' in window) {
   requestIdleCallback(() => {
@@ -620,9 +794,6 @@ if ('requestIdleCallback' in window) {
   });
 }
 
-(function poll() {
-  refresh().finally(() => {
-    const delay = UI.pollingMinMs + Math.floor(Math.random() * UI.pollingJitterMs);
-    setTimeout(poll, delay);
-  });
-})();
+if (!document.hidden) {
+  refresh({profile: true, forceTime: true}).finally(() => schedulePoll());
+}

@@ -410,6 +410,7 @@ body.page-student {
 }
 
 .state-media[data-state="countdown"] img { object-position: 64% 54%; }
+.state-media[data-state="opening"] img { object-position: 52% 51%; }
 .state-media[data-state="open"] img { object-position: 55% 55%; }
 .state-media[data-state="reconciling"] img { object-position: 52% 51%; }
 .state-media[data-state="selected"] img { object-position: 52% 43%; }
@@ -490,6 +491,7 @@ body.page-student {
 }
 
 .page-student .status.open .dot { background: var(--store-action); }
+.page-student .status.opening .dot { background: var(--store-urgent); }
 .page-student .status.selected .dot { background: var(--store-success); }
 .page-student .status.reconciling .dot { background: var(--store-urgent); }
 
@@ -650,14 +652,24 @@ body.page-student {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  transform: scale(1.001);
+  transform: translate3d(var(--media-pan-x, 0px), var(--media-pan-y, 0px), 0) scale(1.001);
   transition: transform 420ms var(--store-ease), opacity 160ms ease;
   -webkit-user-drag: none;
   user-select: none;
 }
 
 .page-student .club:hover .club-media img {
-  transform: scale(1.018);
+  transform: translate3d(var(--media-pan-x, 0px), var(--media-pan-y, 0px), 0) scale(1.018);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .page-student .club:hover .club-media img {
+    will-change: transform;
+  }
+}
+
+.page-student .clubs.is-stale {
+  opacity: .78;
 }
 
 .page-student .club.full .club-media img {
@@ -2187,6 +2199,11 @@ body.page-admin {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 20px;
   margin-top: 139px;
+}
+
+.page-admin section[data-view][hidden],
+.page-admin .admin-home[hidden] {
+  display: none !important;
 }
 
 .page-admin .admin-home-card {

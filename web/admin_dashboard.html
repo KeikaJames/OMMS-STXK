@@ -230,6 +230,22 @@ async function api(path, opts){
   if (r.status === 401){ location.href = '/'; throw new Error('unauth'); }
   return r;
 }
+
+async function requireSuccess(response, fallbackMessage){
+  let data = null;
+  try { data = await response.json(); } catch (error) { /* response body is optional */ }
+  if (!response.ok || !data || data.success !== true) {
+    throw new Error((data && data.message) || fallbackMessage);
+  }
+  return data;
+}
+
+async function readAdminJson(response, fallbackMessage){
+  let data = null;
+  try { data = await response.json(); } catch (error) { /* response body is optional */ }
+  if (!response.ok) throw new Error((data && data.message) || fallbackMessage);
+  return data;
+}
 function splitRoom(n){ const m = n.match(/^(.*?)（\s*([0-9A-Za-z]+)\s*）\s*$/); return m ? {name:m[1].trim(), room:m[2]} : {name:n, room:null}; }
 
 const projectArt = ['/img/editorial-study.jpg', '/img/editorial-telescope.jpg', '/img/editorial-bird.jpg'];
@@ -238,6 +254,14 @@ let editingClubId = null;
 const previewUrls = new Map();
 let pendingCredentials = [];
 let activeAdminView = 'home';
+let activePrimaryEntry = null;
+let overviewLoadVersion = 0;
+let studentsLoadVersion = 0;
+let clubsLoadVersion = 0;
+let settingsLoadVersion = 0;
+let studentImportInFlight = false;
+let clubImportInFlight = false;
+let overviewTimer = null;
 
 const adminMenu = {
   home: [],
@@ -274,22 +298,53 @@ function renderSecondaryNav(view, pane){
     button.dataset.pane = item.pane;
     button.textContent = item.label;
     button.classList.toggle('on', selected);
-    button.setAttribute('aria-current', selected ? 'page' : 'false');
+    if (selected) button.setAttribute('aria-current', 'page');
     nav.appendChild(button);
   });
 }
 
+function readRoute() {
+  try {
+    const raw = location.hash.replace(/^#/, '');
+    if (!raw || raw === 'home') return {view: 'home', pane: null};
+    const [view, pane] = raw.split('/').map(part => decodeURIComponent(part));
+    return adminMenu[view] ? {view, pane: pane || null} : {view: 'home', pane: null};
+  } catch (error) {
+    return {view: 'home', pane: null};
+  }
+}
+
+function writeRoute(view, pane, replace) {
+  const next = '#' + (view === 'home' ? 'home' : view + '/' + pane);
+  if (location.hash === next) return;
+  history[replace ? 'replaceState' : 'pushState'](null, '', next);
+}
+
 function activateRoute(view, pane, options = {}){
+  const previousView = activeAdminView;
   const items = adminMenu[view];
   if (!items) return;
   const selectedPane = items.length
     ? (items.some(item => item.pane === pane) ? pane : items[0].pane)
     : null;
+  const primaryEntries = [...$('#seg').querySelectorAll('button[data-v]')];
+  if (options.primaryPane) {
+    activePrimaryEntry = primaryEntries.find(button => (
+      button.dataset.v === view && button.dataset.pane === options.primaryPane
+    )) || null;
+  } else if (view === 'home' || view === 'settings') {
+    activePrimaryEntry = null;
+  } else if (previousView !== view || !activePrimaryEntry || activePrimaryEntry.dataset.v !== view) {
+    activePrimaryEntry = primaryEntries.find(button => (
+      button.dataset.v === view && button.dataset.pane === selectedPane
+    )) || primaryEntries.find(button => button.dataset.v === view) || null;
+  }
   activeAdminView = view;
-  $('#seg').querySelectorAll('button[data-v]').forEach(button => {
-    const selected = button.dataset.v === view && button.dataset.pane === selectedPane;
+  primaryEntries.forEach(button => {
+    const selected = button === activePrimaryEntry;
     button.classList.toggle('on', selected);
-    button.setAttribute('aria-current', selected ? 'page' : 'false');
+    if (selected) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
   });
   $$('section[data-view]').forEach(section => {
     section.hidden = section.dataset.view !== view;
@@ -301,6 +356,12 @@ function activateRoute(view, pane, options = {}){
     });
   }
   renderSecondaryNav(view, selectedPane);
+  if (options.history !== false) writeRoute(view, selectedPane, Boolean(options.replace));
+  if (view === 'home' || view === 'overview') {
+    loadOverview().finally(() => scheduleOverviewPolling());
+  } else {
+    stopOverviewPolling();
+  }
   if (options.focus && section && selectedPane){
     const heading = section.querySelector('.admin-pane[data-pane="' + selectedPane + '"] h2');
     if (heading){ heading.tabIndex = -1; heading.focus({preventScroll: true}); }
@@ -354,29 +415,36 @@ function showEditorError(card, message){
 
 function bindAdminImageMotion(card){
   const media = card.querySelector('.admin-project-media');
-  let frame = 0, latest = null;
+  let frame = 0, latest = null, rect = null;
   const reduce = matchMedia('(prefers-reduced-motion: reduce)');
   const draw = () => {
     frame = 0;
-    if (!latest || reduce.matches) return;
-    const rect = media.getBoundingClientRect();
+    if (!latest || !rect || reduce.matches) return;
     const x = Math.max(-1, Math.min(1, ((latest.clientX - rect.left) / rect.width - .5) * 2));
     const y = Math.max(-1, Math.min(1, ((latest.clientY - rect.top) / rect.height - .5) * 2));
     media.style.setProperty('--media-pan-x', (x * 7).toFixed(2) + 'px');
     media.style.setProperty('--media-pan-y', (y * 5).toFixed(2) + 'px');
   };
-  card.addEventListener('pointermove', event => {
-    if (event.pointerType === 'touch' || reduce.matches) return;
-    latest = event;
-    if (!frame) frame = requestAnimationFrame(draw);
-  });
-  card.addEventListener('pointerleave', () => {
+  const reset = () => {
     latest = null;
+    rect = null;
     if (frame) cancelAnimationFrame(frame);
     frame = 0;
     media.style.setProperty('--media-pan-x', '0px');
     media.style.setProperty('--media-pan-y', '0px');
+  };
+  media.addEventListener('pointerenter', event => {
+    if (event.pointerType === 'touch' || reduce.matches) return;
+    rect = media.getBoundingClientRect();
   });
+  media.addEventListener('pointermove', event => {
+    if (event.pointerType === 'touch' || reduce.matches) return;
+    latest = event;
+    rect ||= media.getBoundingClientRect();
+    if (!frame) frame = requestAnimationFrame(draw);
+  });
+  media.addEventListener('pointerleave', reset);
+  media.addEventListener('pointercancel', reset);
 }
 
 async function uploadProjectImage(clubId, revision, file, requestIdValue){
@@ -405,7 +473,10 @@ async function uploadProjectImage(clubId, revision, file, requestIdValue){
 $('#seg').addEventListener('click', event => {
   const button = event.target.closest('button[data-v]');
   if (!button) return;
-  activateRoute(button.dataset.v, button.dataset.pane || (adminMenu[button.dataset.v] || [])[0]?.pane, {focus: true});
+  activateRoute(button.dataset.v, button.dataset.pane || (adminMenu[button.dataset.v] || [])[0]?.pane, {
+    focus: true,
+    primaryPane: button.dataset.pane
+  });
 });
 
 $('#subnav').addEventListener('click', event => {
@@ -419,15 +490,34 @@ $('#home-trigger').onclick = () => activateRoute('home');
 $$('[data-home-route]').forEach(button => {
   button.addEventListener('click', () => {
     const [view, pane] = button.dataset.homeRoute.split(':');
-    activateRoute(view, pane, {focus: true});
+    activateRoute(view, pane, {focus: true, primaryPane: pane});
   });
 });
 
+window.addEventListener('popstate', () => {
+  const route = readRoute();
+  activateRoute(route.view, route.pane, {history: false});
+});
+window.addEventListener('hashchange', () => {
+  const route = readRoute();
+  activateRoute(route.view, route.pane, {history: false});
+});
+
 async function loadOverview(){
+  const version = ++overviewLoadVersion;
   try{
-    const [clubs, regs, t] = await Promise.all([
-      (await api('/api/get_clubs')).json(), (await api('/api/get_registrations')).json(), (await api('/api/check_registration_time')).json()
+    const [clubsResponse, registrationsResponse, timeResponse] = await Promise.all([
+      api('/api/get_clubs'), api('/api/get_registrations'), api('/api/check_registration_time')
     ]);
+    const [clubs, regs, t] = await Promise.all([
+      readAdminJson(clubsResponse, '暂时无法读取项目'),
+      readAdminJson(registrationsResponse, '暂时无法读取报名数据'),
+      readAdminJson(timeResponse, '暂时无法读取开放时间')
+    ]);
+    if (version !== overviewLoadVersion) return;
+    if (!Array.isArray(clubs) || !Array.isArray(regs) || !t || typeof t !== 'object') {
+      throw new Error('概览数据格式异常');
+    }
     const total = regs.length, reg = regs.filter(r => r.club_name && r.club_name !== '未报名').length;
     $('#m-clubs').textContent = clubs.length;
     $('#m-students').textContent = total;
@@ -460,23 +550,38 @@ async function loadOverview(){
       row.append(nm, ct, bar);
       box.appendChild(row);
     });
-  }catch(e){ if (e.message !== 'unauth') console.error(e); }
+  }catch(e){ if (version === overviewLoadVersion && e.message !== 'unauth') console.error(e); }
 }
 
 async function loadStudents(){
-  const rows = await (await api('/api/get_all_students')).json();
+  const version = ++studentsLoadVersion;
   const tb = $('#stu-tbl');
-  if (!rows.length){ tb.innerHTML = '<tbody><tr><td class="empty" style="padding:30px">还没有学生</td></tr></tbody>'; return; }
-  tb.innerHTML = '<thead><tr><th>姓名</th><th>班级</th><th>学号</th><th>账号</th><th></th></tr></thead><tbody></tbody>';
-  const body = tb.querySelector('tbody');
-  rows.forEach(s => {
-    const tr = document.createElement('tr');
-    ['name','class','student_id','username'].forEach(k => { const td = document.createElement('td'); if (k==='student_id') td.className='mono'; td.textContent = s[k]; tr.appendChild(td); });
-    const td = document.createElement('td'); td.style.textAlign = 'right';
-    const del = document.createElement('button'); del.className = 'btn btn-quiet'; del.style.color = 'var(--danger)'; del.type='button'; del.textContent = '删除';
-    del.onclick = () => confirmInline(del, async () => { await api('/api/delete_student', {method:'POST', body:JSON.stringify({student_id:s.id})}); toast('已删除', 'ok'); loadStudents(); loadOverview(); });
-    td.appendChild(del); tr.appendChild(td); body.appendChild(tr);
-  });
+  try {
+    const rows = await readAdminJson(await api('/api/get_all_students'), '暂时无法读取学生名单');
+    if (version !== studentsLoadVersion) return;
+    if (!Array.isArray(rows)) throw new Error('学生数据格式异常');
+    if (!rows.length){ tb.innerHTML = '<tbody><tr><td class="empty" style="padding:30px">还没有学生</td></tr></tbody>'; return; }
+    tb.innerHTML = '<thead><tr><th>姓名</th><th>班级</th><th>学号</th><th>账号</th><th></th></tr></thead><tbody></tbody>';
+    const body = tb.querySelector('tbody');
+    rows.forEach(s => {
+      const tr = document.createElement('tr');
+      ['name','class','student_id','username'].forEach(k => { const td = document.createElement('td'); if (k==='student_id') td.className='mono'; td.textContent = s[k]; tr.appendChild(td); });
+      const td = document.createElement('td'); td.style.textAlign = 'right';
+      const del = document.createElement('button'); del.className = 'btn btn-quiet'; del.style.color = 'var(--danger)'; del.type='button'; del.textContent = '删除';
+      del.onclick = () => confirmInline(del, async () => {
+        const data = await requireSuccess(
+          await api('/api/delete_student', {method:'POST', body:JSON.stringify({student_id:s.id})}),
+          '删除学生失败'
+        );
+        toast(data.message || '已删除', 'ok');
+        await Promise.all([loadStudents(), loadOverview()]);
+      });
+      td.appendChild(del); tr.appendChild(td); body.appendChild(tr);
+    });
+  } catch (error) {
+    if (version !== studentsLoadVersion || error.message === 'unauth') return;
+    tb.innerHTML = '<tbody><tr><td class="empty" style="padding:30px">暂时无法读取学生名单</td></tr></tbody>';
+  }
 }
 
 function renderHomeProjects(clubs){
@@ -522,9 +627,21 @@ function renderHomeProjects(clubs){
 }
 
 async function loadClubs(){
-  const clubs = await (await api('/api/get_clubs')).json();
+  const version = ++clubsLoadVersion;
+  const box = $('#club-list');
+  let clubs;
+  try {
+    const response = await api('/api/get_clubs');
+    clubs = await readAdminJson(response, '暂时无法读取项目');
+    if (!Array.isArray(clubs)) throw new Error('项目数据格式异常');
+  } catch (error) {
+    if (version !== clubsLoadVersion || error.message === 'unauth') return;
+    box.innerHTML = '<p class="empty" style="grid-column:1/-1">暂时无法读取项目，请稍后重试</p>';
+    return;
+  }
+  if (version !== clubsLoadVersion) return;
   renderHomeProjects(clubs);
-  const box = $('#club-list'); box.innerHTML = '';
+  box.innerHTML = '';
   if (!clubs.length){ box.innerHTML = '<p class="empty" style="grid-column:1/-1">还没有选修项目</p>'; return; }
   clubs.forEach((club, index) => {
     const info = splitRoom(club.name);
@@ -581,10 +698,12 @@ async function loadClubs(){
     const exp = document.createElement('a'); exp.className = 'btn btn-secondary btn-sm'; exp.textContent = '导出名单'; exp.href = '/api/export_club_data?club_id=' + club.id;
     const del = document.createElement('button'); del.className = 'btn btn-quiet btn-sm admin-delete'; del.type = 'button'; del.textContent = '删除';
     del.onclick = () => confirmInline(del, async () => {
-      const response = await api('/api/delete_club', {method:'POST', body:JSON.stringify({club_id:club.id})});
-      const data = await response.json();
-      toast(data.message || (data.success ? '已删除' : '删除失败'), data.success ? 'ok' : 'err');
-      loadClubs(); loadOverview();
+      const data = await requireSuccess(
+        await api('/api/delete_club', {method:'POST', body:JSON.stringify({club_id:club.id})}),
+        '删除项目失败'
+      );
+      toast(data.message || '已删除', 'ok');
+      await Promise.all([loadClubs(), loadOverview()]);
     });
     actions.append(edit, exp, del);
     view.append(top, seats, bar, actions);
@@ -758,12 +877,47 @@ function confirmInline(btn, fn){
   const txt = btn.textContent, orig = btn.onclick;
   btn.dataset.armed = '1'; btn.textContent = '确认?'; btn.style.fontWeight = '600';
   const reset = () => { btn.textContent = txt; btn.style.fontWeight = ''; btn.onclick = orig; delete btn.dataset.armed; };
-  btn.onclick = async () => { reset(); try{ await fn(); }catch(e){} };
+  btn.onclick = async () => {
+    reset();
+    btn.disabled = true;
+    try {
+      await fn();
+    } catch (error) {
+      if (error.message !== 'unauth') toast(error.message || '操作失败，请重试', 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  };
   setTimeout(() => { if (btn.dataset.armed) reset(); }, 3000);
 }
 
-function parseLines(txt, n){
-  return txt.split(/\n+/).map(l => l.trim()).filter(Boolean).map(l => l.split(/[,，\t]+/).map(x => x.trim())).filter(p => p.length >= n);
+function parseDelimitedRows(text, fieldCount){
+  const valid = [];
+  const invalid = [];
+  text.split(/\n/).forEach((raw, index) => {
+    const line = raw.trim();
+    if (!line) return;
+    const cells = line.split(/[,，\t]+/).map(value => value.trim());
+    if (cells.length < fieldCount || cells.slice(0, fieldCount).some(value => !value)) {
+      invalid.push(index + 1);
+      return;
+    }
+    valid.push({line: index + 1, cells});
+  });
+  return {valid, invalid};
+}
+
+function setButtonPending(button, pending, label){
+  if (pending) {
+    button.dataset.label = button.textContent;
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = label;
+    return;
+  }
+  button.disabled = false;
+  button.removeAttribute('aria-busy');
+  button.textContent = button.dataset.label || button.textContent;
 }
 
 function csvCell(v){ v = String(v == null ? '' : v); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; }
@@ -805,6 +959,7 @@ function renderCredentialDelivery(){
   clear.onclick = () => {
     pendingCredentials = [];
     renderCredentialDelivery();
+    updateStudentImportCheck();
     toast('已从当前页面移除初始密码', 'ok');
   };
   actions.append(download, clear);
@@ -831,31 +986,44 @@ function renderCredentialDelivery(){
 
 function updateStudentImportCheck(){
   const input = $('#imp-stu');
-  const lines = input.value.split(/\n/).map(line => line.trim()).filter(Boolean);
-  const valid = lines.filter(line => {
-    const cells = line.split(/[,，\t]+/).map(value => value.trim());
-    return cells.length >= 3 && cells[0] && cells[1] && cells[2];
-  }).length;
+  const parsed = parseDelimitedRows(input.value, 3);
   const note = $('#imp-stu-check');
   const button = $('#imp-stu-go');
-  if (!lines.length){
+  if (!parsed.valid.length && !parsed.invalid.length){
     note.textContent = '粘贴名单后会在这里检查格式。';
     button.disabled = true;
     return;
   }
-  const invalid = lines.length - valid;
-  note.textContent = invalid
-    ? '已识别 ' + valid + ' 行可导入，另有 ' + invalid + ' 行需要补齐姓名、班级或学号。'
-    : '已识别 ' + valid + ' 行，格式正确；下一步将创建账号。';
-  button.disabled = valid === 0;
+  if (pendingCredentials.length){
+    note.textContent = '上一批账号仍待交付，请先下载或完成交付。';
+    button.disabled = true;
+    return;
+  }
+  note.textContent = parsed.invalid.length
+    ? '第 ' + parsed.invalid.join('、') + ' 行缺少姓名、班级或学号；修正后才能导入。'
+    : '已识别 ' + parsed.valid.length + ' 行，格式正确；下一步将创建账号。';
+  button.disabled = studentImportInFlight || !parsed.valid.length || Boolean(parsed.invalid.length);
 }
 
 $('#imp-stu-go').onclick = async () => {
-  const rows = parseLines($('#imp-stu').value, 3);
-  if (!rows.length){ toast('没有可导入的行', 'err'); return; }
-  const students = rows.map(p => ({name:p[0], class:p[1], student_id:p[2]}));
+  if (studentImportInFlight) return;
+  if (pendingCredentials.length){
+    toast('请先完成上一批账号交付', 'err');
+    activateRoute('students', 'students-accounts', {focus: true});
+    return;
+  }
+  const parsed = parseDelimitedRows($('#imp-stu').value, 3);
+  if (!parsed.valid.length){ toast('没有可导入的行', 'err'); return; }
+  if (parsed.invalid.length){
+    toast('请先修正第 ' + parsed.invalid.join('、') + ' 行', 'err');
+    return;
+  }
+  const students = parsed.valid.map(row => ({name: row.cells[0], class: row.cells[1], student_id: row.cells[2]}));
   const result = $('#imp-stu-result');
+  const button = $('#imp-stu-go');
   result.textContent = '';
+  studentImportInFlight = true;
+  setButtonPending(button, true, '正在创建账号');
   try {
     const response = await api('/api/import_students', {method:'POST', body:JSON.stringify({students})});
     const data = await response.json();
@@ -878,15 +1046,35 @@ $('#imp-stu-go').onclick = async () => {
   } catch (error) {
     result.textContent = error.message || '导入失败，请检查网络后重试。';
     toast(error.message || '导入失败', 'err');
+  } finally {
+    studentImportInFlight = false;
+    setButtonPending(button, false);
+    updateStudentImportCheck();
   }
 };
 
 $('#imp-club-go').onclick = async () => {
-  const rows = parseLines($('#imp-club').value, 2);
-  if (!rows.length){ toast('没有可导入的行', 'err'); return; }
-  const clubs = rows.map(p => ({name:p[0], max_students:parseInt(p[1],10)})).filter(c => c.max_students > 0);
+  if (clubImportInFlight) return;
+  const parsed = parseDelimitedRows($('#imp-club').value, 2);
+  if (!parsed.valid.length){ toast('没有可导入的行', 'err'); return; }
+  const invalid = parsed.invalid.slice();
+  const clubs = parsed.valid.map(row => {
+    const maxStudents = Number(row.cells[1]);
+    if (!Number.isInteger(maxStudents) || maxStudents < 1) {
+      invalid.push(row.line);
+      return null;
+    }
+    return {name: row.cells[0], max_students: maxStudents};
+  }).filter(Boolean);
+  if (invalid.length){
+    toast('请检查第 ' + [...new Set(invalid)].join('、') + ' 行的项目名称和人数上限', 'err');
+    return;
+  }
   const result = $('#imp-club-out');
+  const button = $('#imp-club-go');
   result.textContent = '';
+  clubImportInFlight = true;
+  setButtonPending(button, true, '正在导入项目');
   try {
     const response = await api('/api/import_clubs', {method:'POST', body:JSON.stringify({clubs})});
     const data = await response.json();
@@ -899,10 +1087,20 @@ $('#imp-club-go').onclick = async () => {
   } catch (error) {
     result.textContent = error.message || '项目导入失败，请稍后重试。';
     toast(error.message || '项目导入失败', 'err');
+  } finally {
+    clubImportInFlight = false;
+    setButtonPending(button, false);
   }
 };
 
-$('#del-all-stu').onclick = () => confirmInline($('#del-all-stu'), async () => { await api('/api/delete_all_students', {method:'POST', body:JSON.stringify({confirm:true})}); toast('已清空学生', 'ok'); loadStudents(); loadOverview(); });
+$('#del-all-stu').onclick = () => confirmInline($('#del-all-stu'), async () => {
+  const data = await requireSuccess(
+    await api('/api/delete_all_students', {method:'POST', body:JSON.stringify({confirm:true})}),
+    '清空学生失败'
+  );
+  toast(data.message || '已清空学生', 'ok');
+  await Promise.all([loadStudents(), loadOverview()]);
+});
 
 $('#save-time').onclick = async () => {
   const v = $('#open-at').value; if (!v){ toast('请选择时间', 'err'); return; }
@@ -926,8 +1124,40 @@ $('#save-apw').onclick = async () => {
 };
 
 async function loadSettings(){
-  const t = await (await api('/api/check_registration_time')).json();
-  if (t.start_time){ $('#open-at').value = t.start_time.slice(0,16).replace(' ', 'T'); }
+  const version = ++settingsLoadVersion;
+  try {
+    const response = await api('/api/check_registration_time');
+    const t = await readAdminJson(response, '暂时无法读取开放时间');
+    if (version !== settingsLoadVersion) return;
+    if (t.start_time){ $('#open-at').value = t.start_time.slice(0,16).replace(' ', 'T'); }
+  } catch (error) {
+    if (version === settingsLoadVersion && error.message !== 'unauth') console.error(error);
+  }
+}
+
+function stopOverviewPolling(){
+  if (overviewTimer) clearTimeout(overviewTimer);
+  overviewTimer = null;
+}
+
+function scheduleOverviewPolling(delay = 6000){
+  stopOverviewPolling();
+  if (document.hidden || !['home', 'overview'].includes(activeAdminView)) return;
+  overviewTimer = window.setTimeout(async () => {
+    overviewTimer = null;
+    await loadOverview();
+    scheduleOverviewPolling();
+  }, delay);
+}
+
+function handleAdminVisibility(){
+  if (document.hidden) {
+    stopOverviewPolling();
+    return;
+  }
+  if (['home', 'overview'].includes(activeAdminView)) {
+    loadOverview().finally(() => scheduleOverviewPolling());
+  }
 }
 
 $('#logout').onclick = async () => { try{ await fetch('/api/logout', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); }catch(e){} location.href = '/'; };
@@ -935,9 +1165,10 @@ $('#logout').onclick = async () => { try{ await fetch('/api/logout', {method:'PO
 $('#imp-stu').addEventListener('input', updateStudentImportCheck);
 renderCredentialDelivery();
 updateStudentImportCheck();
-activateRoute('home');
+const initialRoute = readRoute();
+activateRoute(initialRoute.view, initialRoute.pane, {history: false});
 loadStudents(); loadClubs(); loadSettings();
-(function loopOverview(){ loadOverview().finally(() => setTimeout(loopOverview, 6000)); })();
+document.addEventListener('visibilitychange', handleAdminVisibility);
 </script>
 </body>
 </html>
