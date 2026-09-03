@@ -281,6 +281,19 @@ def _session_cookie_token(raw):
         token = value
     return token
 
+
+def _session_cookie_token_from_headers(headers):
+    """Return a session token only when exactly one Cookie field was received.
+
+    HTTP permits repeated field lines in general, but accepting a first Cookie
+    line while ignoring later ones weakens the explicit single-cookie invariant
+    and makes direct/backend behavior depend on proxy normalization.
+    """
+    values = headers.get_all("Cookie") or []
+    if len(values) != 1:
+        return None
+    return _session_cookie_token(values[0])
+
 # ==========================================================================
 # Redis 客户端(优雅降级:不可用时读路径回落、写路径拒绝)
 # ==========================================================================
@@ -1142,6 +1155,7 @@ PAGES = {
 STATIC = {
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/easter-egg.js": ("easter-egg.js", "application/javascript; charset=utf-8"),
+    "/student-dashboard.js": ("student-dashboard.js", "application/javascript; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
 
@@ -1196,7 +1210,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
 
     # ---- 会话 ----
     def _session(self):
-        return RG.session_get(_session_cookie_token(self.headers.get("Cookie")))
+        return RG.session_get(_session_cookie_token_from_headers(self.headers))
 
     def _set_session_cookie(self, token):
         secure = "; Secure" if COOKIE_SECURE else ""
@@ -1621,7 +1635,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         self._json(200, {"success": True}, extra=[self._set_session_cookie(token)])
 
     def _h_logout(self, sess, data):
-        token = _session_cookie_token(self.headers.get("Cookie"))
+        token = _session_cookie_token_from_headers(self.headers)
         if token:
             RG.session_del(token)
         self._json(200, {"success": True}, extra=[self._clear_cookie()])
@@ -1656,6 +1670,20 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(400, {"success": False, "message": "缺少或非法的社团ID"})
         if club_id <= 0:
             return self._json(400, {"success": False, "message": "缺少或非法的社团ID"})
+
+        # `stock:club:{id}` is intentionally absent for a nonexistent club.
+        # Distinguish that normal business rejection from a missing Redis key
+        # for a real club before entering the acquire/reconcile protocol.
+        try:
+            with DB_POOL.connection() as conn:
+                club_exists = conn.execute(
+                    "SELECT EXISTS(SELECT 1 FROM clubs WHERE id = ?)", (club_id,)
+                ).fetchone()[0]
+        except Exception as e:  # noqa: BLE001
+            log.error("报名社团存在性检查失败 sid=%s club=%s: %s", sid, club_id, e)
+            return self._json(503, {"success": False, "message": "系统繁忙,请稍后重试"})
+        if not club_exists:
+            return self._json(200, {"success": False, "message": "社团不存在"})
 
         operation_id = secrets.token_urlsafe(18)
         reservation_value = RG.reservation_value(club_id, operation_id)
@@ -1723,12 +1751,26 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             except RuntimeError as re:
                 log.error("报名回滚同步失败 sid=%s op=%s: %s", sid, operation_id, re)
                 RECONCILE_REQUESTED.set()
-            RECONCILE_REQUESTED.set()
             is_full = "club full" in str(e).lower()
-            if not is_full:
+            try:
                 with DB_POOL.connection() as conn:
+                    club_exists = conn.execute(
+                        "SELECT EXISTS(SELECT 1 FROM clubs WHERE id = ?)", (club_id,)
+                    ).fetchone()[0]
                     existing = conn.execute(
                         "SELECT club_id FROM registrations WHERE student_id = ?", (sid,)).fetchone()
+            except Exception as lookup_error:  # noqa: BLE001
+                log.error("报名冲突后的 SQLite 检查失败 sid=%s club=%s: %s",
+                          sid, club_id, lookup_error)
+                RECONCILE_REQUESTED.set()
+                return self._json(503, {"success": False, "message": "系统繁忙,请稍后重试"})
+            if not club_exists:
+                # The pre-check passed but a maintenance-protected admin delete
+                # won the race. Exact rollback restored Redis, so this is a
+                # business missing response rather than global stock drift.
+                return self._json(200, {"success": False, "message": "社团不存在"})
+            RECONCILE_REQUESTED.set()
+            if not is_full:
                 if existing and int(existing[0]) == club_id:
                     return self._json(200, {"success": True, "message": "您已报名该社团"})
             message = "该社团已满员" if is_full else "您已报名其他社团或请勿重复提交"

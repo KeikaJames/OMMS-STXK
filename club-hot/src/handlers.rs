@@ -239,6 +239,23 @@ pub async fn register_club(
         return busy("名额状态正在安全对账，请稍后重试");
     }
 
+    // A stock key exists only for a real club. Check SQLite first so a random
+    // user-supplied id is a normal missing-club response rather than a false
+    // Redis-drift signal that pauses every registration/cancellation request.
+    match state.db.club_exists(ClubId(club_id)).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return json_status(
+                StatusCode::OK,
+                json!({ "success": false, "message": "社团不存在" }),
+            );
+        }
+        Err(e) => {
+            tracing::error!(club_id, error = %e, "club existence check failed");
+            return busy("系统繁忙，请稍后重试");
+        }
+    }
+
     let seats = Seats::new(state.redis.clone());
     let sid = sess.student_id;
     if state.reconcile_requested.load(Ordering::Acquire) {
@@ -353,8 +370,8 @@ pub async fn register_club(
             Ok(RegistrationInsertOutcome::ClubMissing) => {
                 if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
                     tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
                 }
-                reconcile_requested.store(true, Ordering::Release);
                 RegistrationFinalize::Missing
             }
             Err(e) => {

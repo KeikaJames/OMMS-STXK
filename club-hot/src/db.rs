@@ -171,6 +171,25 @@ impl Db {
         Ok(rows)
     }
 
+    /// Fast read-side existence check used before Redis seat acquisition.
+    /// A random/nonexistent club id must be a normal business rejection, not
+    /// evidence that Redis stock has drifted and needs a global rebuild.
+    pub async fn club_exists(&self, id: ClubId) -> AppResult<bool> {
+        let conn = self.read.get().await?;
+        let id = id.get();
+        let exists = conn
+            .interact(move |conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM clubs WHERE id = ?1)",
+                    [id],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .await
+            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+        Ok(exists)
+    }
+
     /// For stock rebuild: each club with its max and the live COUNT of
     /// registrations (authoritative — we never trust `current_students`).
     pub async fn club_stock_snapshot(&self) -> AppResult<Vec<ClubStock>> {

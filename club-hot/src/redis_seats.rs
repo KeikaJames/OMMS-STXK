@@ -916,10 +916,19 @@ pub async fn rebuild_stock(seats: &Seats, db: &Db, maintenance_token: &str) -> A
     }
     pipe.set(K_INIT, "1").ignore();
     pipe.del(K_CACHE_CLUBS).ignore();
-    redis_deadline(pipe.query_async::<()>(&mut conn)).await?;
+    let committed: Option<()> = redis_deadline(pipe.query_async(&mut conn)).await?;
+    require_watch_commit(committed)?;
 
     tracing::info!(clubs = clubs.len(), "Redis stock rebuilt");
     Ok(())
+}
+
+/// Redis returns Nil from EXEC when a watched key changed. `()` would parse
+/// that Nil as success in redis-rs, so keep the Option boundary explicit.
+fn require_watch_commit(committed: Option<()>) -> AppResult<()> {
+    committed.ok_or_else(|| {
+        AppError::Internal("maintenance lease changed during stock publish".to_string())
+    })
 }
 
 /// Seed `open_at` from `settings.registration_start_time` at startup. Parses the
@@ -943,4 +952,24 @@ pub fn reservation_value(club_id: i64, operation_id: &str) -> String {
 /// A URL-safe random identifier for one registration generation.
 pub fn new_operation_id() -> String {
     gen_token()
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::require_watch_commit;
+    use redis::FromRedisValue;
+
+    #[test]
+    fn watched_exec_abort_is_not_a_successful_rebuild() {
+        assert!(require_watch_commit(Some(())).is_ok());
+        assert!(require_watch_commit(None).is_err());
+    }
+
+    #[test]
+    fn redis_exec_nil_deserializes_to_none_not_success() {
+        let parsed = Option::<()>::from_redis_value(redis::Value::Nil).unwrap();
+        assert_eq!(None, parsed);
+        let committed = Option::<()>::from_redis_value(redis::Value::Array(vec![])).unwrap();
+        assert_eq!(Some(()), committed);
+    }
 }

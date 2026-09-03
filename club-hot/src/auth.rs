@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use axum::http::{HeaderMap, header};
 
 use crate::error::AppResult;
 use crate::state::AppState;
@@ -131,6 +132,18 @@ pub fn session_token_from_cookie(cookie_header: &str) -> Option<String> {
     token
 }
 
+/// Apply the single-Cookie-field invariant before parsing its contents.
+/// `HeaderMap::get` returns only the first line, so it must not be used for
+/// authentication when a peer supplied multiple Cookie header fields.
+pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(header::COOKIE).iter();
+    let raw = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    session_token_from_cookie(raw)
+}
+
 /// Build the `Set-Cookie` value for a freshly minted session.
 /// Mirrors Python exactly. `Secure` is enabled only in the TLS deployment;
 /// the isolated HTTP assessment stack deliberately keeps it false.
@@ -141,7 +154,8 @@ pub fn set_session_cookie(token: &str, ttl: i64, secure: bool) -> String {
 
 #[cfg(test)]
 mod cookie_tests {
-    use super::{session_token_from_cookie, verify_password};
+    use super::{session_token_from_cookie, session_token_from_headers, verify_password};
+    use axum::http::{HeaderMap, header::COOKIE};
 
     #[test]
     fn cookie_parser_rejects_duplicates_and_ignores_malformed_other_pairs() {
@@ -152,6 +166,14 @@ mod cookie_tests {
         assert_eq!(session_token_from_cookie("session=one; session=two"), None);
         assert_eq!(session_token_from_cookie("session=; session=two"), None);
         assert_eq!(session_token_from_cookie("Session=one"), None);
+    }
+
+    #[test]
+    fn cookie_parser_rejects_multiple_header_fields() {
+        let mut headers = HeaderMap::new();
+        headers.append(COOKIE, "session=one".parse().unwrap());
+        headers.append(COOKIE, "theme=dark".parse().unwrap());
+        assert_eq!(session_token_from_headers(&headers), None);
     }
 
     #[test]
@@ -184,13 +206,7 @@ pub async fn student_session(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> AppResult<Option<StudentSession>> {
-    let Some(raw) = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Ok(None);
-    };
-    let Some(token) = session_token_from_cookie(raw) else {
+    let Some(token) = session_token_from_headers(headers) else {
         return Ok(None);
     };
     let seats = crate::redis_seats::Seats::new(state.redis.clone());

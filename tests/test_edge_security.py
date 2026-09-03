@@ -172,7 +172,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             .replace("error_log /tmp/club_nginx_error.log warn;", f"error_log {cls.temp_path / 'nginx-error.log'} warn;")
             .replace("pid /tmp/club_nginx.pid;", f"pid {cls.temp_path / 'nginx.pid'};")
             .replace("zone=hotip:10m rate=250r/s", "zone=hotip:10m rate=1r/s")
-            .replace("limit_req zone=hotip burst=1000 nodelay;", "limit_req zone=hotip burst=2 nodelay;")
+            .replace("limit_req zone=hotip burst=1000 nodelay;", "limit_req zone=hotip burst=20 nodelay;")
         )
         if "127.0.0.1:2001" in config or "127.0.0.1:2002" in config:
             raise RuntimeError("edge regression config still points at a non-isolated backend")
@@ -344,7 +344,13 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             stream = sock.makefile("rb")
             return cls._read_response(stream), cls._read_response(stream)
 
-    def test_nginx_headers_and_random_cookie_rotation_are_bounded_by_ip(self) -> None:
+    @classmethod
+    def _raw_edge_request(cls, request: bytes) -> tuple[int, dict[str, str], bytes]:
+        with socket.create_connection(("127.0.0.1", cls.edge_port), timeout=5.0) as sock:
+            sock.sendall(request)
+            return cls._read_response(sock.makefile("rb"))
+
+    def test_z_nginx_headers_and_random_cookie_rotation_are_bounded_by_ip(self) -> None:
         self._reset_state()
         status, headers, _body = self._request_raw(self.edge_port, "GET", "/")
         self.assertEqual(200, status)
@@ -361,10 +367,10 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         self.assertIn("content-security-policy", static_headers)
 
         # Every random cookie gets its own shape-only session bucket. The
-        # private config lowers hotip to 1r/s burst=2, so a 429 proves the
+        # private config lowers hotip to 1r/s burst=20, so a 429 proves the
         # independent IP bucket is actually applied.
         responses = []
-        for _ in range(8):
+        for _ in range(40):
             fake = secrets.token_urlsafe(32)
             status, response_headers, _body = self._request_raw(
                 self.edge_port, "GET", "/api/get_clubs", cookie=f"session={fake}"
@@ -410,6 +416,64 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         self.assertTrue(stored and stored[0].startswith("$argon2"))
         token = self._login(self.edge_port, "edge1", "student-password")
         self.assertEqual(43, len(token))
+
+    def test_missing_club_is_not_a_global_reconcile_trigger(self) -> None:
+        self._reset_state()
+        python_token = self._login(self.python_port, "edge1", "student-password")
+        rust_token = self._login(self.rust_port, "edge2", "student-password")
+        for port, token in ((self.python_port, python_token), (self.rust_port, rust_token)):
+            for club_id in (900001, 900002, 900003):
+                status, _headers, body = self._request_raw(
+                    port,
+                    "POST",
+                    "/api/register_club",
+                    body={"club_id": club_id},
+                    cookie=f"session={token}",
+                )
+                self.assertEqual(200, status)
+                self.assertEqual(
+                    {"success": False, "message": "社团不存在"},
+                    json.loads(body),
+                )
+        self.assertEqual("3", self.redis.get("stock:club:1"))
+        self.assertEqual([], self.redis.keys("resv:*"))
+        self.assertEqual([], self.redis.keys("seat:op:*"))
+
+        for port in (self.python_port, self.rust_port):
+            status, _headers, body = self._request_raw(port, "GET", "/readyz")
+            self.assertEqual(200, status)
+            self.assertEqual("ready", json.loads(body).get("status"))
+
+        for port, token in ((self.python_port, python_token), (self.rust_port, rust_token)):
+            status, _headers, body = self._request_raw(
+                port,
+                "POST",
+                "/api/register_club",
+                body={"club_id": 1},
+                cookie=f"session={token}",
+            )
+            self.assertEqual(200, status)
+            self.assertTrue(json.loads(body).get("success"))
+        self.assertEqual("1", self.redis.get("stock:club:1"))
+
+    def test_edge_rejects_multiple_cookie_header_fields_without_revoking_session(self) -> None:
+        self._reset_state()
+        student_token = self._login(self.edge_port, "edge1", "student-password")
+        admin_token = self._login(self.edge_port, "admin", "admin-password", admin=True)
+        cases = [
+            ("/api/get_student_info", student_token),
+            ("/api/get_registrations", admin_token),
+        ]
+        for path, token in cases:
+            raw = (
+                f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.edge_port}\r\n"
+                f"Cookie: session={token}\r\nCookie: theme=dark\r\nConnection: close\r\n\r\n"
+            ).encode("ascii")
+            self.assertEqual(401, self._raw_edge_request(raw)[0])
+            status, _headers, _body = self._request_raw(
+                self.edge_port, "GET", path, cookie=f"session={token}"
+            )
+            self.assertEqual(200, status)
 
     def test_python_and_rust_share_generation_and_duplicate_cookie_contract(self) -> None:
         self._reset_state()

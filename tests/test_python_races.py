@@ -378,6 +378,13 @@ class PythonRaceRegressionTests(unittest.TestCase):
             stream = sock.makefile("rb")
             return [cls._read_raw_response(stream), cls._read_raw_response(stream)]
 
+    @classmethod
+    def _one_raw_request(cls, request: bytes) -> tuple[int, dict[str, str], bytes]:
+        with socket.create_connection(("127.0.0.1", cls.http_port), timeout=5.0) as sock:
+            sock.settimeout(5.0)
+            sock.sendall(request)
+            return cls._read_raw_response(sock.makefile("rb"))
+
     @staticmethod
     def _session_token_from_set_cookie(headers: dict[str, str]) -> str:
         value = headers.get("set-cookie", "")
@@ -685,6 +692,24 @@ class PythonRaceRegressionTests(unittest.TestCase):
         )
         self.assertEqual(401, status)
         self.assertIsInstance(payload, dict)
+
+    def test_multiple_cookie_header_fields_are_rejected_without_deleting_session(self) -> None:
+        sessions = self._seed_scenario(users=1, capacity=1, redis_stock=1)
+        token = sessions[1]
+        request = (
+            f"GET /api/get_student_info HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\n"
+            f"Cookie: session={token}\r\nCookie: theme=dark\r\nConnection: close\r\n\r\n"
+        ).encode("ascii")
+        status, _headers, _body = self._one_raw_request(request)
+        self.assertEqual(401, status)
+
+        logout = (
+            f"POST /api/logout HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: 2\r\n"
+            f"Cookie: session={token}\r\nCookie: theme=dark\r\nConnection: close\r\n\r\n{{}}"
+        ).encode("ascii")
+        self.assertEqual(200, self._one_raw_request(logout)[0])
+        self.assertEqual(200, self._request_json("GET", "/api/get_student_info", token=token)[0])
 
     def test_new_login_revokes_old_token_and_password_change_revokes_current_token(self) -> None:
         """F5: only the most recent session generation remains usable."""
