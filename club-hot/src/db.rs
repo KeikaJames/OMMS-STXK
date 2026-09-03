@@ -47,6 +47,7 @@ pub enum RegistrationInsertOutcome {
     ClubMissing,
     ClubDisabled,
     SeatSyncPending,
+    RegistrationLocked,
     Ineligible,
 }
 
@@ -71,6 +72,7 @@ pub enum CancelRegistrationOutcome {
     Cancelled(CancelledRegistration),
     NotRegistered,
     SeatSyncPending,
+    RegistrationLocked,
 }
 
 #[derive(Clone)]
@@ -203,6 +205,7 @@ impl Db {
                 Ok(())
             };
             ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")?;
+            ensure_column("settings", "registration_locked", "registration_locked INTEGER NOT NULL DEFAULT 0")?;
             for (column, definition) in [
                 ("description", "description TEXT NOT NULL DEFAULT ''"),
                 ("advisor_name", "advisor_name TEXT NOT NULL DEFAULT ''"),
@@ -481,6 +484,22 @@ impl Db {
         Ok(v.flatten())
     }
 
+    pub async fn registration_locked(&self) -> AppResult<bool> {
+        let conn = self.read.get().await?;
+        let value = conn
+            .interact(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(registration_locked,0) FROM settings ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+        Ok(value.unwrap_or(false))
+    }
+
     /// Look up the student row used to build a session after a successful login.
     /// Returns the identity/profile fields plus password hash or legacy plaintext.
     pub async fn find_student_by_username(
@@ -599,6 +618,14 @@ impl Db {
         let outcome = conn
             .interact(move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let locked: bool = tx.query_row(
+                    "SELECT COALESCE(registration_locked,0) FROM settings ORDER BY id DESC LIMIT 1",
+                    [], |r| r.get(0),
+                ).optional()?.unwrap_or(false);
+                if locked {
+                    tx.rollback()?;
+                    return Ok::<_, rusqlite::Error>(RegistrationInsertOutcome::RegistrationLocked);
+                }
                 let club: Option<(i64, bool, bool, String, String)> = tx
                     .query_row(
                         "SELECT max_students,enabled,seat_sync_pending,allowed_grades,allowed_classes \
@@ -687,21 +714,26 @@ impl Db {
         let freed = conn
             .interact(move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let registration: Option<(i64, i64, Option<String>, bool)> = tx
+                let registration: Option<(i64, i64, Option<String>, bool, bool)> = tx
                     .query_row(
-                        "SELECT r.id, r.club_id, r.operation_id, c.seat_sync_pending \
+                        "SELECT r.id, r.club_id, r.operation_id, c.seat_sync_pending, \
+                         COALESCE((SELECT registration_locked FROM settings ORDER BY id DESC LIMIT 1),0) \
                          FROM registrations r JOIN clubs c ON c.id=r.club_id WHERE r.student_id = ?1",
                         [sid_i],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                     )
                     .optional()?;
-                let Some((registration_id, club_id, operation_id, seat_sync_pending)) = registration else {
+                let Some((registration_id, club_id, operation_id, seat_sync_pending, registration_locked)) = registration else {
                     tx.rollback()?;
                     return Ok::<CancelRegistrationOutcome, rusqlite::Error>(CancelRegistrationOutcome::NotRegistered);
                 };
                 if seat_sync_pending {
                     tx.rollback()?;
                     return Ok(CancelRegistrationOutcome::SeatSyncPending);
+                }
+                if registration_locked {
+                    tx.rollback()?;
+                    return Ok(CancelRegistrationOutcome::RegistrationLocked);
                 }
                 let deleted = tx.execute(
                     "DELETE FROM registrations WHERE id = ?1 AND student_id = ?2",

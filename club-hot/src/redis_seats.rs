@@ -57,18 +57,20 @@ pub fn k_op(student_id: i64) -> String {
 }
 
 pub const K_OPENAT: &str = "open_at";
+pub const K_REGISTRATION_LOCK: &str = "registration_locked";
 pub const K_CACHE_CLUBS: &str = "cache:clubs";
 pub const K_INIT: &str = "seats:initialized";
 pub const K_MAINT: &str = "seats:maintenance";
 
 /// Acquire Lua — byte-for-byte equivalent to `LUA_ACQUIRE` in `main.py`.
 /// Open-time check, maintenance gate, duplicate check, and decrement all happen
-/// in one Redis operation. KEYS=stock/stureg/resv/open_at/maintenance/seat-op;
+/// in one Redis operation. KEYS=stock/stureg/resv/open_at/maintenance/seat-op/lock;
 /// ARGV=reservation_value/reservation-ttl/operation-ttl.
 const LUA_ACQUIRE: &str = r#"
     local reservation_ttl = tonumber(ARGV[2])
     local operation_ttl = tonumber(ARGV[3])
     if not reservation_ttl or reservation_ttl <= 0 or not operation_ttl or operation_ttl <= 0 then return -5 end
+    if redis.call('GET', KEYS[7]) == '1' then return -6 end
     if redis.call('GET', KEYS[6]) == ARGV[1] then
         if redis.call('GET', KEYS[3]) ~= ARGV[1] then
             redis.call('SET', KEYS[3], ARGV[1], 'EX', reservation_ttl)
@@ -252,6 +254,8 @@ pub enum AcquireOutcome {
     Maintenance,
     /// Registration is not open according to Redis TIME/open_at.
     NotOpen,
+    /// Administrator locked the published registration list.
+    Locked,
 }
 
 impl AcquireOutcome {
@@ -263,6 +267,7 @@ impl AcquireOutcome {
             -2 => AcquireOutcome::Uninitialized,
             -3 => AcquireOutcome::Maintenance,
             -4 => AcquireOutcome::NotOpen,
+            -6 => AcquireOutcome::Locked,
             _ => AcquireOutcome::Uninitialized,
         }
     }
@@ -314,6 +319,7 @@ impl Seats {
                     .key(K_OPENAT)
                     .key(K_MAINT)
                     .key(k_op(student_id))
+                    .key(K_REGISTRATION_LOCK)
                     .arg(reservation_value)
                     .arg(ttl)
                     .arg(OPERATION_TTL_SECS)
@@ -609,19 +615,17 @@ impl Seats {
         )
     }
 
-    /// Unified clock: prefer Redis `TIME`, fall back to local wall clock.
-    pub async fn now_epoch(&self) -> i64 {
-        if let Ok(mut conn) = self.pool.get().await {
-            // TIME -> [secs, usecs] as strings.
-            if let Ok((secs, _usecs)) =
+    /// Same clock with millisecond precision for browser offset calculation.
+    pub async fn now_epoch_ms(&self) -> i64 {
+        if let Ok(mut conn) = self.pool.get().await
+            && let Ok((secs, usecs)) =
                 redis_deadline(redis::cmd("TIME").query_async::<(i64, i64)>(&mut conn)).await
-            {
-                return secs;
-            }
+        {
+            return secs.saturating_mul(1000) + usecs / 1000;
         }
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
     }
 
@@ -772,6 +776,22 @@ impl Seats {
         )
         .await?;
         Ok(true)
+    }
+
+    pub async fn registration_locked_get(&self) -> Option<bool> {
+        let mut conn = self.pool.get().await.ok()?;
+        let value: Option<String> = redis_deadline(conn.get(K_REGISTRATION_LOCK)).await.ok()?;
+        Some(value.as_deref() == Some("1"))
+    }
+
+    pub async fn registration_lock_seed(&self, locked: bool) -> AppResult<()> {
+        let mut conn = self.pool.get().await.map_err(|_| AppError::RedisDown)?;
+        if locked {
+            let _: () = redis_deadline(conn.set(K_REGISTRATION_LOCK, "1")).await?;
+        } else {
+            let _: () = redis_deadline(conn.del(K_REGISTRATION_LOCK)).await?;
+        }
+        Ok(())
     }
 
     /// Whether `seats:initialized` is set — used by `/readyz`.
@@ -939,13 +959,15 @@ fn require_watch_commit(committed: Option<()>) -> AppResult<()> {
 /// Seed `open_at` from `settings.registration_start_time` at startup. Parses the
 /// `YYYY-MM-DD HH:MM:SS` local-time string to an epoch. Best-effort.
 pub async fn seed_open_at(seats: &Seats, db: &Db) -> AppResult<()> {
-    let Some(value) = db.registration_start_time().await? else {
-        return Ok(());
-    };
-    let epoch = crate::auth::parse_local_datetime(&value).ok_or_else(|| {
-        AppError::Internal(format!("registration_start_time unparseable: {value}"))
-    })?;
-    seats.open_at_seed(epoch).await?;
+    if let Some(value) = db.registration_start_time().await? {
+        let epoch = crate::auth::parse_local_datetime(&value).ok_or_else(|| {
+            AppError::Internal(format!("registration_start_time unparseable: {value}"))
+        })?;
+        seats.open_at_seed(epoch).await?;
+    }
+    seats
+        .registration_lock_seed(db.registration_locked().await?)
+        .await?;
     Ok(())
 }
 

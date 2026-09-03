@@ -350,6 +350,7 @@ pub async fn register_club(
             }
             AcquireOutcome::Maintenance => return RegistrationFinalize::Maintenance,
             AcquireOutcome::NotOpen => return RegistrationFinalize::NotOpen,
+            AcquireOutcome::Locked => return RegistrationFinalize::RegistrationLocked,
             AcquireOutcome::Ok => {}
         }
         let inserted = db
@@ -421,6 +422,13 @@ pub async fn register_club(
                 }
                 RegistrationFinalize::SeatSyncPending
             }
+            Ok(RegistrationInsertOutcome::RegistrationLocked) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                RegistrationFinalize::RegistrationLocked
+            }
             Ok(RegistrationInsertOutcome::Ineligible) => {
                 if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
                     tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
@@ -481,6 +489,7 @@ pub async fn register_club(
             json!({"success": false, "message": "不符合该社团报名限制"}),
         ),
         Ok(RegistrationFinalize::SeatSyncPending) => busy("该社团名额正在同步，请稍后重试"),
+        Ok(RegistrationFinalize::RegistrationLocked) => busy("报名已锁定"),
         Ok(RegistrationFinalize::Uninitialized) => busy("名额状态暂不可用，请联系管理员"),
         Ok(RegistrationFinalize::Maintenance) => busy("系统维护中，请稍后重试"),
         Ok(RegistrationFinalize::NotOpen) => json_status(
@@ -506,6 +515,7 @@ enum RegistrationFinalize {
     Disabled,
     Ineligible,
     SeatSyncPending,
+    RegistrationLocked,
     Uninitialized,
     Maintenance,
     NotOpen,
@@ -575,6 +585,7 @@ pub async fn cancel_registration(State(state): State<AppState>, headers: HeaderM
             }
             Ok(CancelRegistrationOutcome::NotRegistered) => CancelFinalize::NotRegistered,
             Ok(CancelRegistrationOutcome::SeatSyncPending) => CancelFinalize::SeatSyncPending,
+            Ok(CancelRegistrationOutcome::RegistrationLocked) => CancelFinalize::RegistrationLocked,
             Err(e) => {
                 tracing::error!(student_id = sid, error = %e, "cancel failed");
                 CancelFinalize::Failed
@@ -597,6 +608,7 @@ pub async fn cancel_registration(State(state): State<AppState>, headers: HeaderM
             json!({ "success": false, "message": "您还未报名任何社团" }),
         ),
         Ok(CancelFinalize::SeatSyncPending) => busy("该社团名额正在同步，请稍后重试"),
+        Ok(CancelFinalize::RegistrationLocked) => busy("报名已锁定"),
         Ok(CancelFinalize::SyncFailed) => fail(
             StatusCode::SERVICE_UNAVAILABLE,
             "退选已记录，后台将在操作排空后安全对账",
@@ -612,6 +624,7 @@ enum CancelFinalize {
     Success,
     NotRegistered,
     SeatSyncPending,
+    RegistrationLocked,
     SyncFailed,
     Failed,
 }
@@ -684,6 +697,7 @@ pub async fn check_registration_time(State(state): State<AppState>) -> Response 
     let seats = Seats::new(state.redis.clone());
     let mut open_at = seats.open_at_get().await;
     let mut start_str: Option<String> = None;
+    let db_locked = state.db.registration_locked().await.unwrap_or(false);
 
     if let Some(epoch) = open_at {
         // Render the epoch back to a human string for the client.
@@ -694,14 +708,22 @@ pub async fn check_registration_time(State(state): State<AppState>) -> Response 
         open_at = auth::parse_local_datetime(&s);
     }
 
-    let now = seats.now_epoch().await;
+    let server_now = seats.now_epoch_ms().await;
+    let locked = db_locked || seats.registration_locked_get().await.unwrap_or(false);
     let can = match open_at {
-        Some(o) => now >= o,
+        Some(o) => server_now >= o.saturating_mul(1000) && !locked,
         None => false,
     };
     json_status(
         StatusCode::OK,
-        json!({ "can_register": can, "start_time": start_str }),
+        json!({
+            "can_register": can,
+            "start_time": start_str,
+            "open_at": open_at.map(|value| value.saturating_mul(1000)),
+            "server_now": server_now,
+            "registration_locked": locked,
+            "end_time": Value::Null,
+        }),
     )
 }
 

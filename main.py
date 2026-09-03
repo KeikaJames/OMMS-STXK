@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-社团选课系统 —— Python 服务(硬化版 / 管理面 + 迁移期热路径)
-
-设计要点(见 ~/.claude/plans/debug-bug-virtual-emerson.md):
-  * 连接池:queue.Queue 阻塞池(修掉手搓池的死锁/泄漏),每连接 WAL/FK/busy_timeout/autocommit。
-  * 名额:Redis 原子 Lua 抢占(并发不超卖;进程被强杀的窗口可能少卖,靠重启 rebuild 对账修正),
-    SQLite 仅落库;current_students 为派生镜像。
-  * 安全:argon2 口令哈希、随机每人口令、服务端 session(Redis)+ HttpOnly/SameSite Cookie、
-          全接口角色鉴权、IDOR 修复(身份只取自 session)、静态白名单(消灭整库/源码下载)、
-          import 入库消毒(防存储型 XSS)、登录限流。
-  * Redis 不可用:写端点(报名/退选)拒绝(绝不回落无锁路径);只读端点回落 SQLite。
-
-与 Rust 热服务(club-hot)共享同一 SQLite 文件与 Redis(键契约一致),可被 nginx 按路由灰度替换。
-"""
 
 import http.server
 import socketserver
@@ -128,19 +114,21 @@ K_SESS_VERSION = "sess:version:{}:{}"  # principal generation; login/password ch
 K_SESS_ROLE_MUTATION = "sess:mutation:role:{}"
 K_SESS_PRINCIPAL_MUTATION = "sess:mutation:{}:{}"
 K_OPENAT = "open_at"             # 报名开放 epoch 秒
+K_REGISTRATION_LOCK = "registration_locked"  # "1" => 报名与退选均冻结
 K_CACHE_CLUBS = "cache:clubs"
 K_INIT = "seats:initialized"
 K_MAINT = "seats:maintenance"
 K_OP = "seat:op:{}"
 
 # 抢名额 Lua:开放时间检查、维护闸门、查重与扣减在同一个 Redis 原子操作内。
-# KEYS=stock/student:reg/resv/open_at/maintenance/seat:op;
+# KEYS=stock/student:reg/resv/open_at/maintenance/seat:op/registration-lock;
 # ARGV=reservation_value/reservation_ttl/operation_ttl。
 # 返回 1 成功 / 0 满员 / -1 已报名 / -2 库存未初始化 / -3 维护中 / -4 未开放。
 LUA_ACQUIRE = """
 local reservation_ttl = tonumber(ARGV[2])
 local operation_ttl = tonumber(ARGV[3])
 if not reservation_ttl or reservation_ttl <= 0 or not operation_ttl or operation_ttl <= 0 then return -5 end
+if redis.call('GET', KEYS[7]) == '1' then return -6 end
 if redis.call('GET', KEYS[6]) == ARGV[1] then
   if redis.call('GET', KEYS[3]) ~= ARGV[1] then
     redis.call('SET', KEYS[3], ARGV[1], 'EX', reservation_ttl)
@@ -170,6 +158,18 @@ if type(decremented) == 'table' and decremented.err then
   redis.call('DEL', KEYS[3])
   redis.call('DEL', KEYS[6])
   return -5
+end
+return 1
+"""
+
+# 管理员锁定在 maintenance fence 内切换。锁定值由 SQLite 持久化；此 Redis
+# 镜像让 Python/Rust 的抢位 Lua 在同一瞬间停止放行。
+LUA_REGISTRATION_LOCK = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if ARGV[2] == '1' then
+  redis.call('SET', KEYS[2], '1')
+else
+  redis.call('DEL', KEYS[2])
 end
 return 1
 """
@@ -364,6 +364,7 @@ class RedisGate:
         self._session_create = None
         self._login_fail_script = None
         self._capacity_adjust = None
+        self._registration_lock = None
         if _redis is not None:
             try:
                 self._r = _redis.Redis.from_url(
@@ -380,6 +381,7 @@ class RedisGate:
                 self._session_create = self._r.register_script(LUA_SESSION_CREATE)
                 self._login_fail_script = self._r.register_script(LUA_LOGIN_FAIL)
                 self._capacity_adjust = self._r.register_script(LUA_CAPACITY_ADJUST)
+                self._registration_lock = self._r.register_script(LUA_REGISTRATION_LOCK)
                 log.info("Redis 已连接: %s", url)
             except Exception as e:  # noqa: BLE001
                 log.warning("Redis 连接失败(将降级): %s", e)
@@ -414,7 +416,7 @@ class RedisGate:
                 return int(self._acquire(
                     keys=[K_STOCK.format(club_id), K_STUREG.format(student_id),
                           K_RESV.format(student_id), K_OPENAT, K_MAINT,
-                          K_OP.format(student_id)],
+                          K_OP.format(student_id), K_REGISTRATION_LOCK],
                     args=[reservation_value, RESV_TTL, SEAT_OP_TTL],
                 ))
             except Exception as e:  # noqa: BLE001
@@ -802,6 +804,52 @@ class RedisGate:
             except Exception:  # noqa: BLE001
                 pass
         return None
+
+    def now_epoch_ms(self):
+        """Unified wall clock in milliseconds, preferring Redis TIME."""
+        if self._r is not None:
+            try:
+                sec, usec = self._r.time()
+                return int(sec) * 1000 + int(usec) // 1000
+            except Exception:  # noqa: BLE001
+                pass
+        return int(time.time() * 1000)
+
+    def registration_locked_get(self):
+        """Return True/False from Redis, or None only when it is unavailable."""
+        if self._r is None:
+            return None
+        try:
+            return self._r.get(K_REGISTRATION_LOCK) == "1"
+        except Exception:  # noqa: BLE001
+            return None
+
+    def registration_lock_seed(self, locked):
+        """Startup/rebuild projection of durable settings into Redis."""
+        if self._r is None:
+            raise RuntimeError("redis unavailable")
+        try:
+            if locked:
+                self._r.set(K_REGISTRATION_LOCK, "1")
+            else:
+                self._r.delete(K_REGISTRATION_LOCK)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("redis unavailable") from e
+
+    def registration_lock_set(self, maintenance_token, locked):
+        if self._registration_lock is None:
+            raise RuntimeError("redis unavailable")
+        try:
+            changed = int(self._registration_lock(
+                keys=[K_MAINT, K_REGISTRATION_LOCK],
+                args=[maintenance_token, "1" if locked else "0"],
+            ))
+            if changed != 1:
+                raise RuntimeError("maintenance changed")
+        except RuntimeError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("redis unavailable") from e
 
     def cache_del(self, *keys):
         if self._r is not None:
@@ -1417,6 +1465,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 registration_start_time TEXT,
+                registration_locked INTEGER NOT NULL DEFAULT 0,
                 admin_username TEXT DEFAULT 'admin',
                 admin_password TEXT DEFAULT NULL);
             CREATE TABLE IF NOT EXISTS audit_events (
@@ -1449,6 +1498,7 @@ def init_db():
                 cur.execute("ALTER TABLE {} ADD COLUMN {}".format(table, definition))
 
         ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")
+        ensure_column("settings", "registration_locked", "registration_locked INTEGER NOT NULL DEFAULT 0")
         for name, definition in (
             ("description", "description TEXT NOT NULL DEFAULT ''"),
             ("advisor_name", "advisor_name TEXT NOT NULL DEFAULT ''"),
@@ -1640,7 +1690,10 @@ def rebuild_stock(maintenance_token=None):
             rows = cur.fetchall()
             cur.execute("SELECT student_id, club_id, operation_id FROM registrations")
             regs = cur.fetchall()
-            cur.execute("SELECT registration_start_time FROM settings ORDER BY id DESC LIMIT 1")
+            cur.execute(
+                "SELECT registration_start_time, registration_locked "
+                "FROM settings ORDER BY id DESC LIMIT 1"
+            )
             time_row = cur.fetchone()
             conn.commit()
         open_at_epoch = None
@@ -1670,6 +1723,10 @@ def rebuild_stock(maintenance_token=None):
             pipe.set(K_STUREG.format(sid), value)
         if open_at_epoch is not None:
             pipe.set(K_OPENAT, open_at_epoch)
+        if time_row and bool(time_row[1]):
+            pipe.set(K_REGISTRATION_LOCK, "1")
+        else:
+            pipe.delete(K_REGISTRATION_LOCK)
         pipe.set(K_INIT, "1")
         pipe.execute()
         # A full maintenance-fenced rebuild is authoritative for every club,
@@ -1706,7 +1763,10 @@ def seed_open_at():
     try:
         with DB_POOL.connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT registration_start_time FROM settings ORDER BY id DESC LIMIT 1")
+            cur.execute(
+                "SELECT registration_start_time, registration_locked "
+                "FROM settings ORDER BY id DESC LIMIT 1"
+            )
             row = cur.fetchone()
         if row and row[0]:
             try:
@@ -1716,6 +1776,11 @@ def seed_open_at():
                 log.warning("settings.registration_start_time 格式非法,未写入 open_at")
             except RuntimeError as e:
                 log.warning("Redis 开放时间播种失败: %s", e)
+        if row:
+            try:
+                RG.registration_lock_seed(bool(row[1]))
+            except RuntimeError as e:
+                log.warning("Redis 报名锁播种失败: %s", e)
     except Exception as e:  # noqa: BLE001
         log.error("seed_open_at 失败: %s", e)
 
@@ -1751,6 +1816,7 @@ POST_ROUTES = {
     "/api/import_students": ("_h_import_students", ROLE_ADMIN),
     "/api/import_clubs": ("_h_import_clubs", ROLE_ADMIN),
     "/api/update_registration_time": ("_h_update_time", ROLE_ADMIN),
+    "/api/update_registration_lock": ("_h_update_registration_lock", ROLE_ADMIN),
     "/api/delete_student": ("_h_delete_student", ROLE_ADMIN),
     "/api/delete_all_students": ("_h_delete_all_students", ROLE_ADMIN),
     "/api/delete_club": ("_h_delete_club", ROLE_ADMIN),
@@ -2129,24 +2195,37 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_check_time(self, sess):
         open_at = RG.open_at_get()
         start_str = None
-        if open_at is None:
-            try:
-                with DB_POOL.connection() as conn:
-                    cur = conn.cursor()
-                    cur.execute("SELECT registration_start_time FROM settings ORDER BY id DESC LIMIT 1")
-                    row = cur.fetchone()
-                if row and row[0]:
+        db_locked = False
+        try:
+            with DB_POOL.connection() as conn:
+                row = conn.execute(
+                    "SELECT registration_start_time, registration_locked "
+                    "FROM settings ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            if row:
+                db_locked = bool(row[1])
+                if open_at is None and row[0]:
                     start_str = row[0]
                     try:
                         open_at = int(datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").timestamp())
                     except ValueError:
                         open_at = None
-            except Exception:  # noqa: BLE001
-                pass
-        else:
+        except Exception:  # noqa: BLE001
+            pass
+        if open_at is not None and start_str is None:
             start_str = datetime.fromtimestamp(open_at).strftime("%Y-%m-%d %H:%M:%S")
-        can = (open_at is not None) and (RG.now_epoch() >= open_at)
-        self._json(200, {"can_register": can, "start_time": start_str})
+        redis_locked = RG.registration_locked_get()
+        locked = db_locked or bool(redis_locked)
+        server_now = RG.now_epoch_ms()
+        can = (open_at is not None) and (server_now >= open_at * 1000) and not locked
+        self._json(200, {
+            "can_register": can,
+            "start_time": start_str,
+            "open_at": open_at * 1000 if open_at is not None else None,
+            "server_now": server_now,
+            "registration_locked": locked,
+            "end_time": None,
+        }, extra=[("Cache-Control", "no-store")])
 
     def _h_get_clubs(self, sess):
         try:
@@ -2401,6 +2480,9 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                               extra=[("Retry-After", "2")])
         if code == -4:
             return self._json(200, {"success": False, "message": "报名尚未开始"})
+        if code == -6:
+            return self._json(503, {"success": False, "message": "报名已锁定"},
+                              extra=[("Retry-After", "2")])
         if code == 0:
             return self._json(200, {"success": False, "message": "该社团已满员"})
         if code == -1:
@@ -2578,7 +2660,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 # work, while this one closes the race with a just-committed
                 # admin capacity/adjustment whose Redis repair is pending.
                 pending = cur.execute(
-                    "SELECT seat_sync_pending FROM clubs WHERE id=?", (club_id,)
+                    "SELECT seat_sync_pending, COALESCE((SELECT registration_locked FROM settings "
+                    "ORDER BY id DESC LIMIT 1), 0) FROM clubs WHERE id=?", (club_id,)
                 ).fetchone()
                 if not pending:
                     conn.rollback()
@@ -2587,6 +2670,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     conn.rollback()
                     return self._json(503, {"success": False,
                                             "message": "该社团名额正在同步，请稍后重试"},
+                                      extra=[("Retry-After", "2")])
+                if pending[1]:
+                    conn.rollback()
+                    return self._json(503, {"success": False, "message": "报名已锁定"},
                                       extra=[("Retry-After", "2")])
                 cur.execute("DELETE FROM registrations WHERE student_id = ?", (sid,))
                 if cur.rowcount != 1:
@@ -3795,6 +3882,81 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             RECONCILE_REQUESTED.set()
             self._json(503, {"success": False,
                              "message": "时间已保存,热路径同步失败,请重试"})
+
+    def _h_update_registration_lock(self, sess, data):
+        locked = data.get("locked")
+        if type(locked) is not bool:
+            return self._json(400, {"success": False, "message": "locked 必须为布尔值"})
+        request_id = admin_request_id(data)
+        reason = clean_text(data.get("reason"), maxlen=400)
+        if request_id is None or not reason:
+            return self._json(400, {"success": False, "message": "锁定参数格式错误"})
+        actor = sess.get("username", "admin")
+        maintenance = RG.begin_maintenance()
+        if not maintenance:
+            return self._json(503, {"success": False,
+                                    "message": "有报名请求处理中，请稍后锁定名单"},
+                              extra=[("Retry-After", "2")])
+        previous_locked = None
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                replay = cur.execute(
+                    "SELECT after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                    "AND action='registration.lock_updated' AND request_id=?",
+                    (actor, request_id),
+                ).fetchone()
+                if replay:
+                    conn.rollback()
+                    after = json.loads(replay[0]) if replay[0] else {"locked": locked}
+                    if bool(after.get("locked")) != locked:
+                        return self._json(409, {"success": False,
+                                                "message": "request_id 已用于相反的锁定操作"})
+                    RG.registration_lock_set(maintenance, locked)
+                    return self._json(200, {"success": True, "replayed": True,
+                                            "request_id": request_id, "locked": locked})
+                row = cur.execute(
+                    "SELECT id, registration_locked FROM settings ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if not row:
+                    conn.rollback()
+                    return self._json(500, {"success": False, "message": "系统设置不存在"})
+                settings_id, previous_locked = row[0], bool(row[1])
+                # Publish the Redis decision under the same maintenance fence
+                # before committing SQLite.  If the SQL transaction fails we
+                # restore the old mirror while still owning that fence.
+                RG.registration_lock_set(maintenance, locked)
+                if previous_locked == locked:
+                    conn.rollback()
+                    return self._json(200, {"success": True, "locked": locked,
+                                            "changed": False, "request_id": request_id})
+                cur.execute("UPDATE settings SET registration_locked=? WHERE id=?",
+                            (int(locked), settings_id))
+                event_id = "registration-lock-" + secrets.token_urlsafe(18)
+                append_audit_event(
+                    cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                    action="registration.lock_updated", target_type="settings", target_id=settings_id,
+                    request_id=request_id, reason=reason,
+                    before={"locked": previous_locked}, after={"locked": locked},
+                )
+                conn.commit()
+            self._json(200, {"success": True, "event_id": event_id,
+                             "request_id": request_id, "locked": locked, "changed": True})
+        except sqlite3.Error as exc:
+            log.error("更新报名锁失败: %s", exc)
+            if previous_locked is not None:
+                try:
+                    RG.registration_lock_set(maintenance, previous_locked)
+                except RuntimeError:
+                    log.error("报名锁数据库回滚后的 Redis 恢复失败")
+            self._json(500, {"success": False, "message": "更新报名锁失败"})
+        except RuntimeError:
+            self._json(503, {"success": False, "request_id": request_id,
+                             "message": "报名锁同步暂不可用，请稍后重试"},
+                       extra=[("Retry-After", "2")])
+        finally:
+            RG.end_maintenance(maintenance)
 
     def _h_delete_student(self, sess, data):
         sid = data.get("student_id")
