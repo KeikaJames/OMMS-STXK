@@ -69,12 +69,12 @@ return 1                                                    -- 抢到
 
 ## 跑起来
 
-单机起 Python 一个进程可以用于开发和小规模，但登录、报名和退选仍需要 Redis server；`redis` 客户端包与 `argon2-cffi` 是完整/安全运行所需，只有 `pypinyin` 是纯功能可选项:
+单机起 Python 一个进程可以用于开发和小规模，但登录、报名和退选仍需要 Redis server；`redis` 客户端包与 `argon2-cffi` 是完整/安全运行所需，`pypinyin` 用于更好的账号生成。若管理员要上传社团 JPEG/PNG/WebP/GIF 图片，还需安装 `Pillow`：
 
 ```bash
 brew services start redis                # macOS 示例；其他系统用各自服务管理器
 redis-cli ping                           # 必须返回 PONG
-pip install redis argon2-cffi pypinyin
+pip install redis argon2-cffi pypinyin Pillow
 python3 main.py                          # 打开 http://127.0.0.1:2001
 ```
 
@@ -87,6 +87,16 @@ bash run.sh                              # 打开 http://127.0.0.1:8080
 ```
 
 `run.sh` 会先在旧入口仍在线时完成 Rust 构建、Redis 与 nginx 配置预检；构建失败会保留旧站点。预检通过后才摘流、等待在途报名/退选排空、启动 Python(:2001)并安全对账，再启动当前源码的 Rust(:2002)和 nginx(:8080)。新 Rust 未通过 readiness 时会明确改用低容量 Python backup。
+
+## 管理运营接口
+
+管理员可以在界面中使用以下能力；新增的单项重置、社团编辑、图片和手工调剂动作要求原因与前端生成的请求 ID，并写入 append-only 审计事件：
+
+- 重置单名学生密码：旧 session 立即撤销，临时密码只在首次响应中显示一次。
+- 更新社团名称、容量、描述、指导老师、时间地点、年级/班级限制与启用状态。容量变化在 maintenance fence 下用定向 Redis 更新处理；若发布中断，仅对应社团会短暂显示“名额同步中”，正常路径不会触发全量库存对账。
+- 手工加入、移出或转移学生报名。普通调剂仍遵守容量和资格限制；如需越过资格限制，管理员必须显式标记并说明原因，容量不会被绕过。
+- 查看分页审计历史与固定 60 秒的运行快照；快照只显示聚合 QPS、状态码、上游分布、限流计数和名额状态，不泄露请求日志、IP、Cookie 或密码。
+- “预演压测”页面只提供隔离 CLI 命令与最近结果说明；网页不会启动进程或对运行中的数据库、Redis、8080 服务发压。
 
 ## 高并发验证
 

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 
 use crate::auth;
-use crate::db::RegistrationInsertOutcome;
+use crate::db::{CancelRegistrationOutcome, ClubAdmission, RegistrationInsertOutcome};
 use crate::redis_seats::{AcquireOutcome, Seats, new_operation_id, reservation_value};
 use crate::state::AppState;
 use crate::types::{ClubId, StudentId};
@@ -239,6 +239,39 @@ pub async fn register_club(
         return busy("名额状态正在安全对账，请稍后重试");
     }
 
+    match state
+        .db
+        .club_admission(StudentId(sess.student_id), ClubId(club_id))
+        .await
+    {
+        Ok(ClubAdmission::Allowed) => {}
+        Ok(ClubAdmission::ClubMissing) => {
+            return json_status(
+                StatusCode::OK,
+                json!({"success": false, "message": "社团不存在"}),
+            );
+        }
+        Ok(ClubAdmission::ClubDisabled) => {
+            return json_status(
+                StatusCode::OK,
+                json!({"success": false, "message": "该社团当前未开放报名"}),
+            );
+        }
+        Ok(ClubAdmission::SeatSyncPending) => {
+            return busy("该社团名额正在同步，请稍后重试");
+        }
+        Ok(ClubAdmission::Ineligible(message)) => {
+            return json_status(
+                StatusCode::OK,
+                json!({"success": false, "message": message}),
+            );
+        }
+        Err(e) => {
+            tracing::error!(club_id, error = %e, "club admission check failed");
+            return busy("系统繁忙，请稍后重试");
+        }
+    }
+
     // A stock key exists only for a real club. Check SQLite first so a random
     // user-supplied id is a normal missing-club response rather than a false
     // Redis-drift signal that pauses every registration/cancellation request.
@@ -374,6 +407,27 @@ pub async fn register_club(
                 }
                 RegistrationFinalize::Missing
             }
+            Ok(RegistrationInsertOutcome::ClubDisabled) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                RegistrationFinalize::Disabled
+            }
+            Ok(RegistrationInsertOutcome::SeatSyncPending) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                RegistrationFinalize::SeatSyncPending
+            }
+            Ok(RegistrationInsertOutcome::Ineligible) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                RegistrationFinalize::Ineligible
+            }
             Err(e) => {
                 tracing::error!(student_id = sid, club_id, error = %e, "registration persist failed");
                 if let Err(release_error) =
@@ -418,6 +472,15 @@ pub async fn register_club(
             StatusCode::OK,
             json!({ "success": false, "message": "社团不存在" }),
         ),
+        Ok(RegistrationFinalize::Disabled) => json_status(
+            StatusCode::OK,
+            json!({"success": false, "message": "该社团当前未开放报名"}),
+        ),
+        Ok(RegistrationFinalize::Ineligible) => json_status(
+            StatusCode::OK,
+            json!({"success": false, "message": "不符合该社团报名限制"}),
+        ),
+        Ok(RegistrationFinalize::SeatSyncPending) => busy("该社团名额正在同步，请稍后重试"),
         Ok(RegistrationFinalize::Uninitialized) => busy("名额状态暂不可用，请联系管理员"),
         Ok(RegistrationFinalize::Maintenance) => busy("系统维护中，请稍后重试"),
         Ok(RegistrationFinalize::NotOpen) => json_status(
@@ -440,6 +503,9 @@ enum RegistrationFinalize {
     AlreadySameClub,
     Full,
     Missing,
+    Disabled,
+    Ineligible,
+    SeatSyncPending,
     Uninitialized,
     Maintenance,
     NotOpen,
@@ -482,7 +548,7 @@ pub async fn cancel_registration(State(state): State<AppState>, headers: HeaderM
     let finalize = tokio::spawn(async move {
         let _permit = permit;
         let result = match db.cancel_registration(StudentId(sid)).await {
-            Ok(Some(registration)) => {
+            Ok(CancelRegistrationOutcome::Cancelled(registration)) => {
                 let club_id = registration.club_id.get();
                 let value = registration
                     .operation_id
@@ -507,7 +573,8 @@ pub async fn cancel_registration(State(state): State<AppState>, headers: HeaderM
                     }
                 }
             }
-            Ok(None) => CancelFinalize::NotRegistered,
+            Ok(CancelRegistrationOutcome::NotRegistered) => CancelFinalize::NotRegistered,
+            Ok(CancelRegistrationOutcome::SeatSyncPending) => CancelFinalize::SeatSyncPending,
             Err(e) => {
                 tracing::error!(student_id = sid, error = %e, "cancel failed");
                 CancelFinalize::Failed
@@ -529,6 +596,7 @@ pub async fn cancel_registration(State(state): State<AppState>, headers: HeaderM
             StatusCode::OK,
             json!({ "success": false, "message": "您还未报名任何社团" }),
         ),
+        Ok(CancelFinalize::SeatSyncPending) => busy("该社团名额正在同步，请稍后重试"),
         Ok(CancelFinalize::SyncFailed) => fail(
             StatusCode::SERVICE_UNAVAILABLE,
             "退选已记录，后台将在操作排空后安全对账",
@@ -543,6 +611,7 @@ pub async fn cancel_registration(State(state): State<AppState>, headers: HeaderM
 enum CancelFinalize {
     Success,
     NotRegistered,
+    SeatSyncPending,
     SyncFailed,
     Failed,
 }
@@ -583,11 +652,25 @@ pub async fn get_clubs(State(state): State<AppState>) -> Response {
             None => r.current_students, // redis unavailable
         };
         let clamped = used.clamp(0, r.max_students);
+        let allowed_grades = serde_json::from_str::<Value>(&r.allowed_grades)
+            .unwrap_or_else(|_| Value::Array(Vec::new()));
+        let allowed_classes = serde_json::from_str::<Value>(&r.allowed_classes)
+            .unwrap_or_else(|_| Value::Array(Vec::new()));
         data.push(json!({
             "id": r.id,
             "name": r.name,
             "max_students": r.max_students,
             "current_students": clamped,
+            "description": r.description,
+            "advisor_name": r.advisor_name,
+            "meeting_time": r.meeting_time,
+            "location": r.location,
+            "image_path": r.image_path,
+            "allowed_grades": allowed_grades,
+            "allowed_classes": allowed_classes,
+            "enabled": r.enabled,
+            "revision": r.revision,
+            "seat_sync_pending": r.seat_sync_pending,
         }));
     }
     json_status(StatusCode::OK, Value::Array(data))
