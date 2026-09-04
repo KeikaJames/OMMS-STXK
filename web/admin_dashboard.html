@@ -265,6 +265,7 @@ let clubImportInFlight = false;
 let overviewTimer = null;
 let studentImportDraft = null;
 const knownStudentIds = new Set();
+let studentDirectoryReady = false;
 
 const adminMenu = {
   home: [],
@@ -567,6 +568,7 @@ async function loadStudents(){
     rows.forEach(student => {
       if (student && student.student_id) knownStudentIds.add(String(student.student_id));
     });
+    studentDirectoryReady = true;
     if (studentImportDraft) updateStudentImportCheck({preserveDraft: true});
     if (!rows.length){ tb.innerHTML = '<tbody><tr><td class="empty" style="padding:30px">还没有学生</td></tr></tbody>'; return; }
     tb.innerHTML = '<thead><tr><th>姓名</th><th>班级</th><th>学号</th><th>账号</th><th></th></tr></thead><tbody></tbody>';
@@ -588,6 +590,7 @@ async function loadStudents(){
     });
   } catch (error) {
     if (version !== studentsLoadVersion || error.message === 'unauth') return;
+    studentDirectoryReady = false;
     tb.innerHTML = '<tbody><tr><td class="empty" style="padding:30px">暂时无法读取学生名单</td></tr></tbody>';
   }
 }
@@ -1185,6 +1188,12 @@ function updateStudentImportCheck({preserveDraft = false} = {}){
   if (pendingCredentials.length){
     note.textContent = '上一批账号仍待交付，请先下载或完成交付。';
     button.disabled = true;
+    return;
+  }
+  if (!studentDirectoryReady) {
+    note.textContent = '正在核对已有学生学号，请稍候。';
+    button.disabled = true;
+    button.textContent = '正在核对名单';
     return;
   }
   const validation = validateStudentImportDraft(studentImportDraft);
