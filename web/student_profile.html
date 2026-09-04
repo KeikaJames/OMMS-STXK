@@ -7,6 +7,7 @@
 <title>个人信息 · 鄂尔多斯市实验中学社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
+<script src="/easter-egg.js" defer></script>
 </head>
 <body>
 <a class="skip" href="#main">跳到主内容</a>
@@ -84,7 +85,10 @@ $('#save').addEventListener('click', async () => {
     if (r.status === 401){ location.href = '/'; return; }
     const d = await r.json();
     toast(d.message || (d.success ? '密码已修改' : '修改失败'), d.success ? 'ok' : 'err');
-    if (d.success){ $('#cp').value = $('#np').value = $('#np2').value = ''; }
+    if (d.success){
+      $('#cp').value = $('#np').value = $('#np2').value = '';
+      setTimeout(() => { location.href = '/'; }, 700);
+    }
   }catch(e){ toast('网络错误', 'err'); }
   btn.disabled = false; btn.textContent = txt;
 });

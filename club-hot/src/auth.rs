@@ -9,9 +9,11 @@
 
 use std::sync::OnceLock;
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use axum::http::{HeaderMap, header};
 
+use crate::error::AppResult;
 use crate::state::AppState;
 
 /// Process-wide local UTC offset, captured once on the main thread *before* the
@@ -107,29 +109,85 @@ fn ct_eq(a: &str, b: &str) -> bool {
 
 // --- cookies ---------------------------------------------------------------
 
-/// Extract the `session` cookie value from a raw `Cookie:` header.
-/// Handles multiple `;`-separated pairs; ignores attributes.
+/// Extract exactly one unambiguous `session` cookie from a raw `Cookie:` header.
+///
+/// Python formerly used `SimpleCookie` (last duplicate wins) while Rust used
+/// the first duplicate.  Rejecting duplicate names makes auth, logout, and
+/// rate-limit behaviour deterministic even if an upstream/client emits an
+/// ambiguous Cookie header.
 pub fn session_token_from_cookie(cookie_header: &str) -> Option<String> {
+    let mut token: Option<String> = None;
     for part in cookie_header.split(';') {
-        let part = part.trim();
-        if let Some(val) = part.strip_prefix("session=") {
-            if !val.is_empty() {
-                return Some(val.to_string());
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        if name.trim() == "session" {
+            let value = value.trim();
+            if token.is_some() || value.is_empty() {
+                return None;
             }
+            token = Some(value.to_string());
         }
     }
-    None
+    token
+}
+
+/// Apply the single-Cookie-field invariant before parsing its contents.
+/// `HeaderMap::get` returns only the first line, so it must not be used for
+/// authentication when a peer supplied multiple Cookie header fields.
+pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(header::COOKIE).iter();
+    let raw = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    session_token_from_cookie(raw)
 }
 
 /// Build the `Set-Cookie` value for a freshly minted session.
-/// Mirrors Python exactly: HttpOnly; SameSite=Strict; Path=/; Max-Age=ttl.
-pub fn set_session_cookie(token: &str, ttl: i64) -> String {
-    format!("session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl}")
+/// Mirrors Python exactly. `Secure` is enabled only in the TLS deployment;
+/// the isolated HTTP assessment stack deliberately keeps it false.
+pub fn set_session_cookie(token: &str, ttl: i64, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl}{secure}")
 }
 
-/// Build the `Set-Cookie` value that clears the session (logout).
-pub fn clear_session_cookie() -> String {
-    "session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".to_string()
+#[cfg(test)]
+mod cookie_tests {
+    use super::{session_token_from_cookie, session_token_from_headers, verify_password};
+    use axum::http::{HeaderMap, header::COOKIE};
+
+    #[test]
+    fn cookie_parser_rejects_duplicates_and_ignores_malformed_other_pairs() {
+        assert_eq!(
+            session_token_from_cookie("x; session=one; y=2"),
+            Some("one".into())
+        );
+        assert_eq!(session_token_from_cookie("session=one; session=two"), None);
+        assert_eq!(session_token_from_cookie("session=; session=two"), None);
+        assert_eq!(session_token_from_cookie("Session=one"), None);
+    }
+
+    #[test]
+    fn cookie_parser_rejects_multiple_header_fields() {
+        let mut headers = HeaderMap::new();
+        headers.append(COOKIE, "session=one".parse().unwrap());
+        headers.append(COOKIE, "theme=dark".parse().unwrap());
+        assert_eq!(session_token_from_headers(&headers), None);
+    }
+
+    #[test]
+    fn legacy_plaintext_password_remains_compatible_during_one_time_upgrade() {
+        assert!(verify_password("student-password", "student-password").ok);
+        assert!(!verify_password("student-password", "wrong-password").ok);
+    }
+
+    #[test]
+    fn python_argon2_cffi_hash_verifies_in_rust() {
+        let python_hash = "$argon2id$v=19$m=65536,t=3,p=4$ZwUxbnMzOherbEkDhuvTlg$53zarfOwxfaDdhJ9Slnvd6aqcoV4qFllM8UlLDig+AA";
+        assert!(verify_password(python_hash, "student-password").ok);
+        assert!(!verify_password(python_hash, "wrong-password").ok);
+    }
 }
 
 // --- session payload -------------------------------------------------------
@@ -139,9 +197,6 @@ pub fn clear_session_cookie() -> String {
 #[derive(Debug, Clone)]
 pub struct StudentSession {
     pub student_id: i64,
-    pub name: String,
-    pub class: String,
-    pub student_no: String,
 }
 
 /// Pull the student session out of state for the given request headers.
@@ -150,32 +205,21 @@ pub struct StudentSession {
 pub async fn student_session(
     state: &AppState,
     headers: &axum::http::HeaderMap,
-) -> Option<StudentSession> {
-    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    let token = session_token_from_cookie(raw)?;
+) -> AppResult<Option<StudentSession>> {
+    let Some(token) = session_token_from_headers(headers) else {
+        return Ok(None);
+    };
     let seats = crate::redis_seats::Seats::new(state.redis.clone());
-    let payload = seats.session_get(&token).await?;
+    let Some(payload) = seats.session_get(&token).await? else {
+        return Ok(None);
+    };
     if payload.get("role").and_then(|v| v.as_str()) != Some("student") {
-        return None;
+        return Ok(None);
     }
-    Some(StudentSession {
-        student_id: payload.get("student_id").and_then(|v| v.as_i64())?,
-        name: payload
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        class: payload
-            .get("class")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        student_no: payload
-            .get("student_no")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-    })
+    Ok(payload
+        .get("student_id")
+        .and_then(|v| v.as_i64())
+        .map(|student_id| StudentSession { student_id }))
 }
 
 // --- time ------------------------------------------------------------------
