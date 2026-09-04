@@ -42,9 +42,3 @@ impl std::fmt::Display for ClubId {
         write!(f, "{}", self.0)
     }
 }
-
-/// School-issued student number `students.student_id` (a TEXT column, e.g. a
-/// learner card number). Distinct from [`StudentId`] on purpose.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct StudentNo(pub String);

@@ -1,0 +1,32 @@
+/* 学生端动效层 —— 只描述"运动中的状态",静止时与 app.css 视觉完全一致。
+   依赖 motion.js;GSAP 缺失或用户开启"减少动态效果"时全部退化为即时呈现。 */
+
+/* 进场前隐藏:由 <head> 内联脚本在允许动效时加 html.motion,并带 1.6s 兜底移除 */
+html.motion .m-in { opacity: 0; }
+
+/* ---- 登录页 ---- */
+/* 随指针游走的纸面光斑:soft-light 只提亮铅笔底图,不改色 */
+.home-light { position: fixed; inset: 0; z-index: 0; pointer-events: none; opacity: 0;
+  background: radial-gradient(560px circle at var(--mx, 50%) var(--my, 42%), rgba(255,255,255,.9), rgba(255,255,255,.35) 38%, transparent 72%);
+  mix-blend-mode: soft-light; }
+body.home .home-main { z-index: 1; }
+body.home .card { position: relative; transform-style: preserve-3d; }
+body.home .card .js-tilt-glare { border-radius: inherit; }
+.home-head h1 .ch { display: inline-block; }
+
+/* 分段控件滑块:静止外观 = 原 .seg button.on */
+.seg.has-thumb { position: relative; }
+.seg.has-thumb button { position: relative; z-index: 1; }
+.seg.has-thumb button.on { background: transparent; box-shadow: none; }
+.seg.has-thumb .seg-thumb { position: absolute; top: 2px; bottom: 2px; left: 0; width: 0; background: #fff; border-radius: 10px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 0 0 .5px rgba(0,0,0,.04); pointer-events: none; }
+
+/* ---- 选课页 ---- */
+.status { position: relative; }
+.status.locked .dot { background: var(--amber); }
+.status.locked .lab { color: var(--amber); font-weight: 600; }
+.status .clock .d { display: inline-block; }
+.status .clock.t10 { color: var(--brand); }
+.club { position: relative; }
+/* 状态切换时的扩散光环(临时元素,动画结束即移除) */
+.m-ping { position: absolute; inset: 0; border-radius: inherit; pointer-events: none; }

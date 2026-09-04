@@ -3,6 +3,7 @@
 // Presentation controller for the student page. Registration truth always
 // comes from the same-origin API; imagery and motion never decide state.
 const $ = selector => document.querySelector(selector);
+const M = () => window.Motion;
 
 const UI = Object.freeze({
   clubArt: [
@@ -16,6 +17,7 @@ const UI = Object.freeze({
     countdown: '/img/editorial-telescope.jpg',
     opening: '/img/editorial-magnet.jpg',
     open: '/img/editorial-grassland.jpg',
+    locked: '/img/editorial-magnet.jpg',
     reconciling: '/img/editorial-magnet.jpg',
     selected: '/img/editorial-bird.jpg'
   }),
@@ -30,7 +32,12 @@ const UI = Object.freeze({
 
 let me = null;
 let canRegister = false;
+let locked = false;
 let openAt = null;
+let clockOffset = 0;
+let bestRtt = Infinity;
+let bestRttAt = 0;
+let openTimer = null;
 let inflight = false;
 let backoffUntil = 0;
 let lastTimeRefresh = 0;
@@ -53,6 +60,7 @@ let cooldownTimer = null;
 
 const clubNodes = new Map();
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+const serverNowMs = () => Date.now() + clockOffset;
 
 function toast(message, kind = '') {
   const item = document.createElement('div');
@@ -60,7 +68,9 @@ function toast(message, kind = '') {
   item.setAttribute('role', kind === 'err' ? 'alert' : 'status');
   item.textContent = message;
   $('#toasts').appendChild(item);
-  window.setTimeout(() => item.remove(), kind === 'err' ? 5200 : 3600);
+  const duration = kind === 'err' ? 5200 : 3600;
+  if (M()) M().toast(item, duration);
+  else window.setTimeout(() => item.remove(), duration);
 }
 
 async function api(path, options) {
@@ -86,28 +96,50 @@ function formatTime(date) {
   return pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
 }
 
+function setClock(text, prefix = null) {
+  const clock = $('#clock');
+  if (M()) {
+    M().digits(clock, text, prefix);
+    return;
+  }
+  clock.textContent = '';
+  if (prefix) {
+    const marker = document.createElement('span');
+    marker.className = 'clk-now';
+    marker.textContent = prefix;
+    clock.appendChild(marker);
+  }
+  clock.appendChild(document.createTextNode(text));
+}
+
 function tickClock() {
-  const now = new Date();
+  const currentTime = serverNowMs();
+  const now = new Date(currentTime);
   const pad = value => String(value).padStart(2, '0');
   const label = $('#clock-label');
-  const clock = $('#clock');
+
+  if (locked) {
+    label.textContent = '当前时间';
+    setClock(formatTime(now));
+    return;
+  }
 
   if (canRegister) {
     label.textContent = '当前时间';
-    clock.innerHTML = '<span class="clk-now">现在</span>' + formatTime(now);
+    setClock(formatTime(now), '现在');
     return;
   }
 
   if (openAt === null) {
     label.textContent = '当前时间';
-    clock.textContent = formatTime(now);
+    setClock(formatTime(now));
     return;
   }
 
-  const remainingMs = openAt - now.getTime();
+  const remainingMs = openAt - currentTime;
   if (remainingMs <= 0) {
     label.textContent = '正在确认';
-    clock.textContent = '00:00';
+    setClock('00:00');
     requestOpenConfirmation();
     return;
   }
@@ -117,14 +149,17 @@ function tickClock() {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   seconds %= 60;
-  clock.textContent = (hours > 0 ? pad(hours) + ':' : '') + pad(minutes) + ':' + pad(seconds);
+  const value = (hours > 0 ? pad(hours) + ':' : '') + pad(minutes) + ':' + pad(seconds);
+  setClock(value);
+  if (remainingMs <= 10000 && M()) M().tick($('#clock'));
 }
 
 function deriveViewState() {
   if (reconcileTarget) return 'reconciling';
+  if (locked) return 'locked';
   if (me && me.registered_club) return 'selected';
   if (canRegister) return 'open';
-  if (openAt !== null && Date.now() >= openAt) return 'opening';
+  if (openAt !== null && serverNowMs() >= openAt) return 'opening';
   if (openAt !== null) return 'countdown';
   return 'idle';
 }
@@ -177,6 +212,9 @@ function renderStatus() {
   if (state === 'reconciling') {
     statusText.textContent = '正在确认结果';
     detail.textContent = '请不要重复提交，页面会自动读取最终状态';
+  } else if (state === 'locked') {
+    statusText.textContent = '名单已锁定';
+    detail.textContent = '管理员已锁定本次选课，当前不能报名或退选';
   } else if (state === 'selected') {
     const selected = splitRoom(me.registered_club);
     statusText.textContent = '已完成选择';
@@ -377,19 +415,26 @@ function renderAction(card, club, mode) {
   }
 
   action.className = 'act';
-  if (mode === 'mine') {
+  if (mode === 'mine' || mode === 'locked-mine') {
     const badge = document.createElement('span');
     badge.className = 'badge-ok grow';
     badge.textContent = '你已选择';
-    const cancel = document.createElement('button');
-    cancel.className = 'btn btn-secondary btn-sm';
-    cancel.type = 'button';
-    cancel.textContent = '退选';
-    cancel.onclick = () => {
-      confirmingCancelFor = String(club.id ?? club.name);
-      renderClubs(lastClubs);
-    };
-    action.append(badge, cancel);
+    action.appendChild(badge);
+    if (mode === 'locked-mine') {
+      action.appendChild(actionState('名单已锁定'));
+    } else {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn btn-secondary btn-sm';
+      cancel.type = 'button';
+      cancel.textContent = '退选';
+      cancel.onclick = () => {
+        confirmingCancelFor = String(club.id ?? club.name);
+        renderClubs(lastClubs);
+      };
+      action.appendChild(cancel);
+    }
+  } else if (mode === 'locked') {
+    action.appendChild(actionState('名单已锁定'));
   } else if (mode === 'other') {
     action.appendChild(actionState('已选其他项目'));
   } else if (mode === 'full') {
@@ -458,6 +503,8 @@ function updateClubCard(card, club, mine, index) {
   let mode = 'register';
   if (reconcileTarget) mode = 'reconciling';
   else if (Date.now() < backoffUntil) mode = 'cooldown';
+  else if (locked && isMine) mode = 'locked-mine';
+  else if (locked) mode = 'locked';
   else if (isMine && confirmingCancelFor === key) mode = 'confirm';
   else if (isMine) mode = 'mine';
   else if (mine) mode = 'other';
@@ -479,7 +526,7 @@ function renderClubs(clubs) {
   if (projectCount) projectCount.textContent = String(lastClubs.length);
   $('#hint').textContent = mine
     ? '已选 1 / 1'
-    : (canRegister ? '请选择 1 个项目' : '开放后可选择 1 个项目');
+    : (locked ? '名单已锁定' : (canRegister ? '请选择 1 个项目' : '开放后可选择 1 个项目'));
   box.setAttribute('aria-busy', 'false');
 
   if (!lastClubs.length) {
@@ -530,6 +577,7 @@ async function readJson(response, fallbackMessage) {
 async function performRefresh({profile = false, forceTime = false} = {}) {
   const needTime = forceTime || openAt === null || Date.now() - lastTimeRefresh >= UI.timeRefreshMs;
   const needProfile = profile || me === null || Date.now() - lastProfileRefresh >= UI.profileRefreshMs;
+  const sentAt = Date.now();
   const [clubsResponse, timeResponse, studentResponse] = await Promise.all([
     api('/api/get_clubs'),
     needTime ? api('/api/check_registration_time') : Promise.resolve(null),
@@ -544,11 +592,23 @@ async function performRefresh({profile = false, forceTime = false} = {}) {
     if (!time || typeof time.can_register !== 'boolean') {
       throw new Error('开放时间数据格式异常');
     }
-    canRegister = time.can_register;
-    openAt = time.start_time
-      ? new Date(time.start_time.replace(/-/g, '/')).getTime()
-      : null;
+    const rtt = Date.now() - sentAt;
+    if (typeof time.server_now === 'number') {
+      const sample = time.server_now - (sentAt + rtt / 2);
+      const jumped = Math.abs(sample - clockOffset) > Math.max(2000, rtt);
+      if (rtt <= bestRtt || Date.now() - bestRttAt > 300000 || jumped) {
+        clockOffset = sample;
+        bestRtt = rtt;
+        bestRttAt = Date.now();
+      }
+    }
+    locked = Boolean(time.registration_locked);
+    canRegister = time.can_register && !locked;
+    openAt = typeof time.open_at === 'number'
+      ? time.open_at
+      : (time.start_time ? new Date(time.start_time.replace(/-/g, '/')).getTime() : null);
     lastTimeRefresh = Date.now();
+    scheduleOpenConfirmation();
   }
 
   if (studentResponse) {
@@ -607,6 +667,19 @@ function requestOpenConfirmation() {
     openConfirmationQueued = false;
     refresh({forceTime: true});
   }, 0);
+}
+
+function scheduleOpenConfirmation() {
+  if (openTimer) clearTimeout(openTimer);
+  openTimer = null;
+  if (canRegister || locked || openAt === null) return;
+  const wait = openAt - serverNowMs();
+  if (wait > 86400000) return;
+  openTimer = window.setTimeout(() => {
+    openTimer = null;
+    renderStatus();
+    requestOpenConfirmation();
+  }, Math.max(0, wait + 50));
 }
 
 function scheduleCooldownRender() {
@@ -749,6 +822,7 @@ function doRegister(button, clubId) {
     }
     const data = await response.json();
     toast(data.message || (data.success ? '报名成功' : '报名失败'), data.success ? 'ok' : 'err');
+    if (data.success && M()) M().confetti(button);
     await refresh({profile: true});
   });
 }
@@ -790,6 +864,7 @@ $('#logout').onclick = async () => {
 };
 
 protectMedia($('#state-media'));
+if (M()) M().enterPage('.store-hero, .status-section, .offerings');
 tickClock();
 window.setInterval(() => {
   if (!document.hidden) tickClock();

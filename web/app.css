@@ -505,6 +505,7 @@ body.page-student {
 
 .page-student .status.open .dot { background: var(--store-action); }
 .page-student .status.opening .dot { background: var(--store-urgent); }
+.page-student .status.locked .dot { background: var(--store-urgent); }
 .page-student .status.selected .dot { background: var(--store-success); }
 .page-student .status.reconciling .dot { background: var(--store-urgent); }
 

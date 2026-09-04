@@ -12,9 +12,11 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 
 use crate::auth;
-use crate::redis_seats::{AcquireOutcome, Seats};
+use crate::db::{CancelRegistrationOutcome, ClubAdmission, RegistrationInsertOutcome};
+use crate::redis_seats::{AcquireOutcome, Seats, new_operation_id, reservation_value};
 use crate::state::AppState;
 use crate::types::{ClubId, StudentId};
 
@@ -38,6 +40,15 @@ fn fail(status: StatusCode, msg: &str) -> Response {
     json_status(status, json!({ "success": false, "message": msg }))
 }
 
+fn busy(msg: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        Json(json!({ "success": false, "message": msg })),
+    )
+        .into_response()
+}
+
 /// 401 for student endpoints missing a session.
 fn unauthorized() -> Response {
     fail(StatusCode::UNAUTHORIZED, "未登录或会话已过期")
@@ -57,7 +68,6 @@ pub struct LoginReq {
 
 pub async fn login(
     State(state): State<AppState>,
-    headers: HeaderMap,
     body: Result<Json<LoginReq>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
@@ -69,20 +79,21 @@ pub async fn login(
     if username.is_empty() || password.is_empty() {
         return fail(StatusCode::BAD_REQUEST, "用户名和密码不能为空");
     }
+    if username.len() > 80 || password.len() > 256 {
+        return fail(StatusCode::BAD_REQUEST, "用户名或密码过长");
+    }
 
     let seats = Seats::new(state.redis.clone());
-    let ip = client_ip(&headers);
-
-    // Throttle: block if either the username or IP failure count is over cap.
+    // A campus egress IP is shared by many students. Account-level throttling
+    // belongs here; Nginx supplies the bounded source-IP resource ceiling.
     let u_key = format!("u:{username}");
-    let ip_key = format!("ip:{ip}");
-    if seats.login_blocked(&u_key, state.cfg.login_max_fails).await
-        || seats
-            .login_blocked(&ip_key, state.cfg.login_ip_max_fails)
-            .await
-    {
+    if seats.login_blocked(&u_key, state.cfg.login_max_fails).await {
         return fail(StatusCode::TOO_MANY_REQUESTS, "尝试过于频繁，请稍后再试");
     }
+    let role_epoch = match seats.session_role_epoch("student").await {
+        Ok(epoch) => epoch,
+        Err(e) => return e.into_response(),
+    };
 
     let row = match state.db.find_student_by_username(username.clone()).await {
         Ok(r) => r,
@@ -90,27 +101,62 @@ pub async fn login(
     };
     let Some(row) = row else {
         seats.login_fail(&u_key).await;
-        seats.login_fail(&ip_key).await;
         return fail(StatusCode::UNAUTHORIZED, "用户名或密码错误");
     };
 
-    let v = auth::verify_password(&row.password, &password);
+    let principal_version = match seats
+        .session_principal_version("student", &row.id.to_string())
+        .await
+    {
+        Ok(version) => version,
+        Err(e) => return e.into_response(),
+    };
+
+    let permit = match tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.auth_gate.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return busy("登录繁忙，请稍后重试"),
+    };
+    let stored = row.password.clone();
+    let password_for_hash = password.clone();
+    let (v, upgraded_hash) = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let v = auth::verify_password(&stored, &password_for_hash);
+        let upgraded = if v.ok && v.needs_upgrade {
+            auth::hash_password(&password_for_hash).ok()
+        } else {
+            None
+        };
+        (v, upgraded)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!(error = %e, "password worker failed");
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, "服务器错误");
+        }
+    };
     if !v.ok {
         seats.login_fail(&u_key).await;
-        seats.login_fail(&ip_key).await;
         return fail(StatusCode::UNAUTHORIZED, "用户名或密码错误");
     }
 
-    // Upgrade legacy plaintext to argon2 on first successful login (best-effort).
-    if v.needs_upgrade {
-        if let Ok(new_hash) = auth::hash_password(&password) {
-            if let Err(e) = state.db.update_password(StudentId(row.id), new_hash).await {
-                tracing::warn!(error = %e, "password upgrade write failed");
-            }
-        }
+    // Verify that the database record survived the Argon2 work unchanged. The
+    // generation script below fences a later delete/password change; this read
+    // also catches one that completed before the generation snapshot.
+    let current = match state.db.find_student_by_username(username.clone()).await {
+        Ok(Some(current)) => current,
+        Ok(None) => return fail(StatusCode::UNAUTHORIZED, "用户名或密码错误"),
+        Err(e) => return e.into_response(),
+    };
+    if current.id != row.id || current.password != row.password {
+        return fail(StatusCode::UNAUTHORIZED, "用户名或密码错误");
     }
-
-    seats.login_ok(&u_key).await;
 
     let payload = json!({
         "role": "student",
@@ -119,12 +165,32 @@ pub async fn login(
         "class": row.class,
         "student_no": row.student_no,
     });
-    let token = match seats.session_create(&payload, state.cfg.session_ttl).await {
-        Ok(t) => t,
+    let token = match seats
+        .session_create(
+            &payload,
+            state.cfg.session_ttl,
+            role_epoch,
+            principal_version,
+        )
+        .await
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => return busy("账号状态已变化，请重新登录"),
         Err(e) => return e.into_response(), // Redis down -> 503
     };
 
-    let cookie = auth::set_session_cookie(&token, state.cfg.session_ttl);
+    // Upgrade legacy plaintext to argon2 on first successful login (best-effort).
+    if let Some(new_hash) = upgraded_hash
+        && let Err(e) = state
+            .db
+            .update_password_if_matches(StudentId(row.id), new_hash, row.password.clone())
+            .await
+    {
+        tracing::warn!(error = %e, "password upgrade write failed");
+    }
+    seats.login_ok(&u_key).await;
+
+    let cookie = auth::set_session_cookie(&token, state.cfg.session_ttl, state.cfg.cookie_secure);
     json_with_cookie(
         StatusCode::OK,
         json!({
@@ -154,8 +220,10 @@ pub async fn register_club(
     headers: HeaderMap,
     body: Result<Json<RegisterReq>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Some(sess) = auth::student_session(&state, &headers).await else {
-        return unauthorized();
+    let sess = match auth::student_session(&state, &headers).await {
+        Ok(Some(sess)) => sess,
+        Ok(None) => return unauthorized(),
+        Err(e) => return e.into_response(),
     };
     let req = match body {
         Ok(Json(r)) => r,
@@ -164,131 +232,401 @@ pub async fn register_club(
     let Some(club_id) = req.club_id else {
         return fail(StatusCode::BAD_REQUEST, "缺少或非法的社团ID");
     };
+    if club_id <= 0 {
+        return fail(StatusCode::BAD_REQUEST, "缺少或非法的社团ID");
+    }
+    if state.reconcile_requested.load(Ordering::Acquire) {
+        return busy("名额状态正在安全对账，请稍后重试");
+    }
+
+    match state
+        .db
+        .club_admission(StudentId(sess.student_id), ClubId(club_id))
+        .await
+    {
+        Ok(ClubAdmission::Allowed) => {}
+        Ok(ClubAdmission::ClubMissing) => {
+            return json_status(
+                StatusCode::OK,
+                json!({"success": false, "message": "社团不存在"}),
+            );
+        }
+        Ok(ClubAdmission::ClubDisabled) => {
+            return json_status(
+                StatusCode::OK,
+                json!({"success": false, "message": "该社团当前未开放报名"}),
+            );
+        }
+        Ok(ClubAdmission::SeatSyncPending) => {
+            return busy("该社团名额正在同步，请稍后重试");
+        }
+        Ok(ClubAdmission::Ineligible(message)) => {
+            return json_status(
+                StatusCode::OK,
+                json!({"success": false, "message": message}),
+            );
+        }
+        Err(e) => {
+            tracing::error!(club_id, error = %e, "club admission check failed");
+            return busy("系统繁忙，请稍后重试");
+        }
+    }
+
+    // A stock key exists only for a real club. Check SQLite first so a random
+    // user-supplied id is a normal missing-club response rather than a false
+    // Redis-drift signal that pauses every registration/cancellation request.
+    match state.db.club_exists(ClubId(club_id)).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return json_status(
+                StatusCode::OK,
+                json!({ "success": false, "message": "社团不存在" }),
+            );
+        }
+        Err(e) => {
+            tracing::error!(club_id, error = %e, "club existence check failed");
+            return busy("系统繁忙，请稍后重试");
+        }
+    }
 
     let seats = Seats::new(state.redis.clone());
     let sid = sess.student_id;
-
-    // Backend time gate: must have open_at and now >= open_at.
-    let open_at = seats.open_at_get().await;
-    let now = seats.now_epoch().await;
-    if open_at.is_none() || now < open_at.unwrap() {
-        return json_status(
-            StatusCode::OK,
-            json!({ "success": false, "message": "报名尚未开始" }),
-        );
+    if state.reconcile_requested.load(Ordering::Acquire) {
+        return busy("名额状态正在安全对账，请稍后重试");
     }
 
-    // Atomic acquire. Redis down -> 503.
-    let mut outcome = match seats.acquire(sid, club_id, state.cfg.resv_ttl).await {
-        Ok(o) => o,
-        Err(_) => return fail(StatusCode::SERVICE_UNAVAILABLE, "系统繁忙，请稍后重试"),
+    // Wait for a finalizer slot BEFORE decrementing Redis. Requests cancelled
+    // while queued therefore have no side effect, and at most this small number
+    // of reservations can be waiting on SQLite.
+    let permit = match tokio::time::timeout(
+        std::time::Duration::from_millis(state.cfg.registration_queue_timeout_ms),
+        state.registration_gate.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return busy("报名队列繁忙，请稍后重试"),
     };
 
-    // -2 = this club's stock key is missing. Once initialized, recover only THIS club's
-    // key from its committed count (SET NX, can't oversell since a missing key means no
-    // in-flight reservation for it); never full-rebuild here (would re-add seats reserved
-    // on other clubs). Cold start: full rebuild.
-    if outcome == AcquireOutcome::Uninitialized {
-        if seats.initialized().await {
-            let exists = crate::redis_seats::init_club_stock(&seats, &state.db, club_id)
-                .await
-                .unwrap_or(false);
-            if !exists {
-                return json_status(
-                    StatusCode::OK,
-                    json!({ "success": false, "message": "该社团不存在" }),
-                );
-            }
-        } else {
-            let _ = crate::redis_seats::rebuild_stock(&seats, &state.db).await;
-        }
-        outcome = match seats.acquire(sid, club_id, state.cfg.resv_ttl).await {
-            Ok(o) => o,
-            Err(_) => return fail(StatusCode::SERVICE_UNAVAILABLE, "系统繁忙，请稍后重试"),
-        };
-    }
-
-    match outcome {
-        AcquireOutcome::Full => {
-            return json_status(
-                StatusCode::OK,
-                json!({ "success": false, "message": "该社团已满员" }),
-            );
-        }
-        AcquireOutcome::Already => {
-            return json_status(
-                StatusCode::OK,
-                json!({ "success": false, "message": "您已报名其他社团或请勿重复提交" }),
-            );
-        }
-        AcquireOutcome::Uninitialized => {
-            return json_status(
-                StatusCode::OK,
-                json!({ "success": false, "message": "社团不存在或暂不可报名" }),
-            );
-        }
-        AcquireOutcome::Ok => {}
-    }
-
-    // Won the seat -> persist to SQLite (blocking pool handles the work).
+    let operation_id = new_operation_id();
+    let reservation = reservation_value(club_id, &operation_id);
     let when = auth::now_local_string();
-    match state
-        .db
-        .insert_registration(StudentId(sid), ClubId(club_id), when)
-        .await
-    {
-        Ok(()) => {
-            seats.confirm(sid, club_id).await;
+    let db = state.db.clone();
+    let reconcile_requested = state.reconcile_requested.clone();
+    let resv_ttl = state.cfg.resv_ttl;
+    // Acquire and every subsequent side effect live inside the detached task.
+    // Tower timeout or a client disconnect can stop waiting for the reply, but
+    // the task still commits+confirms or rolls back the exact reservation.
+    let finalize = tokio::spawn(async move {
+        let _permit = permit;
+        if reconcile_requested.load(Ordering::Acquire) {
+            return RegistrationFinalize::Unavailable;
+        }
+        let outcome = match seats.acquire(sid, club_id, &reservation, resv_ttl).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!(student_id = sid, club_id, error = %e, "seat acquire failed");
+                reconcile_requested.store(true, Ordering::Release);
+                return RegistrationFinalize::Unavailable;
+            }
+        };
+        match outcome {
+            AcquireOutcome::Full => return RegistrationFinalize::Full,
+            AcquireOutcome::Already => {
+                return match db.registered_club_id(StudentId(sid)).await {
+                    Ok(Some(existing)) if existing == club_id => {
+                        RegistrationFinalize::AlreadySameClub
+                    }
+                    Ok(_) => RegistrationFinalize::Already,
+                    Err(e) => {
+                        tracing::error!(student_id = sid, error = %e, "idempotency lookup failed");
+                        RegistrationFinalize::Failed
+                    }
+                };
+            }
+            AcquireOutcome::Uninitialized => {
+                reconcile_requested.store(true, Ordering::Release);
+                return RegistrationFinalize::Uninitialized;
+            }
+            AcquireOutcome::Maintenance => return RegistrationFinalize::Maintenance,
+            AcquireOutcome::NotOpen => return RegistrationFinalize::NotOpen,
+            AcquireOutcome::Locked => return RegistrationFinalize::RegistrationLocked,
+            AcquireOutcome::Ok => {}
+        }
+        let inserted = db
+            .insert_registration(StudentId(sid), ClubId(club_id), when, operation_id.clone())
+            .await;
+        match inserted {
+            Ok(RegistrationInsertOutcome::Inserted { registration_id }) => {
+                match seats.confirm(sid, &reservation).await {
+                    Ok(confirmed) => {
+                        if !confirmed {
+                            reconcile_requested.store(true, Ordering::Release);
+                        }
+                        RegistrationFinalize::Success {
+                            registration_id,
+                            confirmed,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(student_id = sid, club_id, error = %e, "confirm failed after DB commit");
+                        reconcile_requested.store(true, Ordering::Release);
+                        RegistrationFinalize::Success {
+                            registration_id,
+                            confirmed: false,
+                        }
+                    }
+                }
+            }
+            Ok(RegistrationInsertOutcome::AlreadyRegistered) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                }
+                reconcile_requested.store(true, Ordering::Release);
+                match db.registered_club_id(StudentId(sid)).await {
+                    Ok(Some(existing)) if existing == club_id => {
+                        RegistrationFinalize::AlreadySameClub
+                    }
+                    Ok(_) => RegistrationFinalize::Already,
+                    Err(e) => {
+                        tracing::error!(student_id = sid, error = %e, "idempotency lookup failed");
+                        RegistrationFinalize::Failed
+                    }
+                }
+            }
+            Ok(RegistrationInsertOutcome::ClubFull) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                }
+                reconcile_requested.store(true, Ordering::Release);
+                RegistrationFinalize::Full
+            }
+            Ok(RegistrationInsertOutcome::ClubMissing) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                RegistrationFinalize::Missing
+            }
+            Ok(RegistrationInsertOutcome::ClubDisabled) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                RegistrationFinalize::Disabled
+            }
+            Ok(RegistrationInsertOutcome::SeatSyncPending) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                RegistrationFinalize::SeatSyncPending
+            }
+            Ok(RegistrationInsertOutcome::RegistrationLocked) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                RegistrationFinalize::RegistrationLocked
+            }
+            Ok(RegistrationInsertOutcome::Ineligible) => {
+                if let Err(e) = seats.rollback_reservation(sid, club_id, &reservation).await {
+                    tracing::error!(student_id = sid, club_id, error = %e, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                RegistrationFinalize::Ineligible
+            }
+            Err(e) => {
+                tracing::error!(student_id = sid, club_id, error = %e, "registration persist failed");
+                if let Err(release_error) =
+                    seats.rollback_reservation(sid, club_id, &reservation).await
+                {
+                    tracing::error!(student_id = sid, club_id, error = %release_error, "reservation rollback failed");
+                    reconcile_requested.store(true, Ordering::Release);
+                }
+                reconcile_requested.store(true, Ordering::Release);
+                RegistrationFinalize::Failed
+            }
+        }
+    });
+
+    match finalize.await {
+        Ok(RegistrationFinalize::Success {
+            registration_id,
+            confirmed,
+        }) => {
+            tracing::debug!(registration_id, confirmed, "registration finalized");
             json_status(
                 StatusCode::OK,
-                json!({ "success": true, "message": "报名成功" }),
+                json!({
+                    "success": true,
+                    "message": if confirmed { "报名成功" } else { "报名成功，状态同步稍有延迟" }
+                }),
             )
         }
-        Err(e) => {
-            tracing::error!(student_id = sid, club_id, error = %e, "registration persist failed");
-            seats.release(sid, club_id).await; // compensate the acquire
-            json_status(
-                StatusCode::OK,
-                json!({ "success": false, "message": "报名失败，请重试" }),
-            )
+        Ok(RegistrationFinalize::Already) => json_status(
+            StatusCode::OK,
+            json!({ "success": false, "message": "您已报名其他社团或请勿重复提交" }),
+        ),
+        Ok(RegistrationFinalize::AlreadySameClub) => json_status(
+            StatusCode::OK,
+            json!({ "success": true, "message": "您已报名该社团" }),
+        ),
+        Ok(RegistrationFinalize::Full) => json_status(
+            StatusCode::OK,
+            json!({ "success": false, "message": "该社团已满员" }),
+        ),
+        Ok(RegistrationFinalize::Missing) => json_status(
+            StatusCode::OK,
+            json!({ "success": false, "message": "社团不存在" }),
+        ),
+        Ok(RegistrationFinalize::Disabled) => json_status(
+            StatusCode::OK,
+            json!({"success": false, "message": "该社团当前未开放报名"}),
+        ),
+        Ok(RegistrationFinalize::Ineligible) => json_status(
+            StatusCode::OK,
+            json!({"success": false, "message": "不符合该社团报名限制"}),
+        ),
+        Ok(RegistrationFinalize::SeatSyncPending) => busy("该社团名额正在同步，请稍后重试"),
+        Ok(RegistrationFinalize::RegistrationLocked) => busy("报名已锁定"),
+        Ok(RegistrationFinalize::Uninitialized) => busy("名额状态暂不可用，请联系管理员"),
+        Ok(RegistrationFinalize::Maintenance) => busy("系统维护中，请稍后重试"),
+        Ok(RegistrationFinalize::NotOpen) => json_status(
+            StatusCode::OK,
+            json!({ "success": false, "message": "报名尚未开始" }),
+        ),
+        Ok(RegistrationFinalize::Unavailable) => busy("系统繁忙，请稍后重试"),
+        Ok(RegistrationFinalize::Failed) | Err(_) => {
+            fail(StatusCode::INTERNAL_SERVER_ERROR, "报名失败，请重试")
         }
     }
+}
+
+enum RegistrationFinalize {
+    Success {
+        registration_id: i64,
+        confirmed: bool,
+    },
+    Already,
+    AlreadySameClub,
+    Full,
+    Missing,
+    Disabled,
+    Ineligible,
+    SeatSyncPending,
+    RegistrationLocked,
+    Uninitialized,
+    Maintenance,
+    NotOpen,
+    Unavailable,
+    Failed,
 }
 
 // ===========================================================================
 // 3. POST /api/cancel_registration
 // ===========================================================================
 
-pub async fn cancel_registration(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    let Some(sess) = auth::student_session(&state, &headers).await else {
-        return unauthorized();
+pub async fn cancel_registration(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let sess = match auth::student_session(&state, &headers).await {
+        Ok(Some(sess)) => sess,
+        Ok(None) => return unauthorized(),
+        Err(e) => return e.into_response(),
     };
     let sid = sess.student_id;
 
-    match state.db.cancel_registration(StudentId(sid)).await {
-        Ok(Some(club_id)) => {
-            let seats = Seats::new(state.redis.clone());
-            seats.release(sid, club_id.get()).await; // give the seat back
-            json_status(
-                StatusCode::OK,
-                json!({ "success": true, "message": "取消报名成功" }),
-            )
+    let permit = match tokio::time::timeout(
+        std::time::Duration::from_millis(state.cfg.registration_queue_timeout_ms),
+        state.registration_gate.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return busy("报名状态正在处理，请稍后重试"),
+    };
+    if state.reconcile_requested.load(Ordering::Acquire) {
+        return busy("名额状态正在安全对账，请稍后重试");
+    }
+    let seats = Seats::new(state.redis.clone());
+    let operation_lock = match seats.begin_student_op(sid).await {
+        Ok(Some(token)) => token,
+        Ok(None) => return busy("报名状态正在处理，请稍后重试"),
+        Err(_) => return busy("系统繁忙，请稍后重试"),
+    };
+    let db = state.db.clone();
+    let reconcile_requested = state.reconcile_requested.clone();
+    let finalize = tokio::spawn(async move {
+        let _permit = permit;
+        let result = match db.cancel_registration(StudentId(sid)).await {
+            Ok(CancelRegistrationOutcome::Cancelled(registration)) => {
+                let club_id = registration.club_id.get();
+                let value = registration
+                    .operation_id
+                    .as_deref()
+                    .map(|op| reservation_value(club_id, op))
+                    .unwrap_or_else(|| club_id.to_string());
+                let cancel_event = registration.operation_id.unwrap_or_else(|| {
+                    format!(
+                        "legacy-{}-{}-{}",
+                        registration.registration_id, sid, club_id
+                    )
+                });
+                match seats
+                    .release_registration(&cancel_event, sid, club_id, &value)
+                    .await
+                {
+                    Ok(_) => CancelFinalize::Success,
+                    Err(e) => {
+                        tracing::error!(student_id = sid, error = %e, "cancel Redis finalize failed");
+                        reconcile_requested.store(true, Ordering::Release);
+                        CancelFinalize::SyncFailed
+                    }
+                }
+            }
+            Ok(CancelRegistrationOutcome::NotRegistered) => CancelFinalize::NotRegistered,
+            Ok(CancelRegistrationOutcome::SeatSyncPending) => CancelFinalize::SeatSyncPending,
+            Ok(CancelRegistrationOutcome::RegistrationLocked) => CancelFinalize::RegistrationLocked,
+            Err(e) => {
+                tracing::error!(student_id = sid, error = %e, "cancel failed");
+                CancelFinalize::Failed
+            }
+        };
+        if let Err(e) = seats.end_student_op(sid, &operation_lock).await {
+            tracing::warn!(student_id = sid, error = %e, "student operation lock cleanup failed");
+            reconcile_requested.store(true, Ordering::Release);
         }
-        Ok(None) => json_status(
+        result
+    });
+
+    match finalize.await {
+        Ok(CancelFinalize::Success) => json_status(
+            StatusCode::OK,
+            json!({ "success": true, "message": "取消报名成功" }),
+        ),
+        Ok(CancelFinalize::NotRegistered) => json_status(
             StatusCode::OK,
             json!({ "success": false, "message": "您还未报名任何社团" }),
         ),
-        Err(e) => {
-            tracing::error!(student_id = sid, error = %e, "cancel failed");
-            json_status(
-                StatusCode::OK,
-                json!({ "success": false, "message": "取消报名失败，请重试" }),
-            )
-        }
+        Ok(CancelFinalize::SeatSyncPending) => busy("该社团名额正在同步，请稍后重试"),
+        Ok(CancelFinalize::RegistrationLocked) => busy("报名已锁定"),
+        Ok(CancelFinalize::SyncFailed) => fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "退选已记录，后台将在操作排空后安全对账",
+        ),
+        Ok(CancelFinalize::Failed) | Err(_) => json_status(
+            StatusCode::OK,
+            json!({ "success": false, "message": "取消报名失败，请重试" }),
+        ),
     }
+}
+
+enum CancelFinalize {
+    Success,
+    NotRegistered,
+    SeatSyncPending,
+    RegistrationLocked,
+    SyncFailed,
+    Failed,
 }
 
 // ===========================================================================
@@ -311,17 +649,41 @@ pub async fn get_clubs(State(state): State<AppState>) -> Response {
     for (i, r) in rows.iter().enumerate() {
         let used = match &live {
             Some(vals) => match vals.get(i).and_then(|v| *v) {
-                Some(left) => r.max_students - left,
+                Some(left) => {
+                    if left < 0 || left > r.max_students {
+                        tracing::error!(
+                            club_id = r.id,
+                            left,
+                            max = r.max_students,
+                            "Redis stock outside valid range"
+                        );
+                    }
+                    r.max_students - left
+                }
                 None => r.current_students, // key absent for this club
             },
             None => r.current_students, // redis unavailable
         };
         let clamped = used.clamp(0, r.max_students);
+        let allowed_grades = serde_json::from_str::<Value>(&r.allowed_grades)
+            .unwrap_or_else(|_| Value::Array(Vec::new()));
+        let allowed_classes = serde_json::from_str::<Value>(&r.allowed_classes)
+            .unwrap_or_else(|_| Value::Array(Vec::new()));
         data.push(json!({
             "id": r.id,
             "name": r.name,
             "max_students": r.max_students,
             "current_students": clamped,
+            "description": r.description,
+            "advisor_name": r.advisor_name,
+            "meeting_time": r.meeting_time,
+            "location": r.location,
+            "image_path": r.image_path,
+            "allowed_grades": allowed_grades,
+            "allowed_classes": allowed_classes,
+            "enabled": r.enabled,
+            "revision": r.revision,
+            "seat_sync_pending": r.seat_sync_pending,
         }));
     }
     json_status(StatusCode::OK, Value::Array(data))
@@ -335,26 +697,33 @@ pub async fn check_registration_time(State(state): State<AppState>) -> Response 
     let seats = Seats::new(state.redis.clone());
     let mut open_at = seats.open_at_get().await;
     let mut start_str: Option<String> = None;
+    let db_locked = state.db.registration_locked().await.unwrap_or(false);
 
-    if open_at.is_none() {
-        // Fall back to SQLite settings string.
-        if let Ok(Some(s)) = state.db.registration_start_time().await {
-            start_str = Some(s.clone());
-            open_at = auth::parse_local_datetime(&s);
-        }
-    } else {
+    if let Some(epoch) = open_at {
         // Render the epoch back to a human string for the client.
-        start_str = auth::format_local_datetime(open_at.unwrap());
+        start_str = auth::format_local_datetime(epoch);
+    } else if let Ok(Some(s)) = state.db.registration_start_time().await {
+        // Fall back to SQLite settings string.
+        start_str = Some(s.clone());
+        open_at = auth::parse_local_datetime(&s);
     }
 
-    let now = seats.now_epoch().await;
+    let server_now = seats.now_epoch_ms().await;
+    let locked = db_locked || seats.registration_locked_get().await.unwrap_or(false);
     let can = match open_at {
-        Some(o) => now >= o,
+        Some(o) => server_now >= o.saturating_mul(1000) && !locked,
         None => false,
     };
     json_status(
         StatusCode::OK,
-        json!({ "can_register": can, "start_time": start_str }),
+        json!({
+            "can_register": can,
+            "start_time": start_str,
+            "open_at": open_at.map(|value| value.saturating_mul(1000)),
+            "server_now": server_now,
+            "registration_locked": locked,
+            "end_time": Value::Null,
+        }),
     )
 }
 
@@ -362,12 +731,11 @@ pub async fn check_registration_time(State(state): State<AppState>) -> Response 
 // 6. GET /api/get_student_info
 // ===========================================================================
 
-pub async fn get_student_info(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    let Some(sess) = auth::student_session(&state, &headers).await else {
-        return unauthorized();
+pub async fn get_student_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let sess = match auth::student_session(&state, &headers).await {
+        Ok(Some(sess)) => sess,
+        Ok(None) => return unauthorized(),
+        Err(e) => return e.into_response(),
     };
     let info = match state.db.student_info(StudentId(sess.student_id)).await {
         Ok(r) => r,
@@ -413,26 +781,68 @@ pub async fn healthz(State(state): State<AppState>) -> Response {
 /// `/readyz` — 200 only once stock has been initialized (`seats:initialized`).
 pub async fn readyz(State(state): State<AppState>) -> Response {
     let seats = Seats::new(state.redis.clone());
-    if seats.initialized().await {
-        json_status(StatusCode::OK, json!({ "status": "ready" }))
-    } else {
-        json_status(
+    if state.reconcile_requested.load(Ordering::Acquire) {
+        return json_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "status": "not-ready", "reason": "reconcile-pending" }),
+        );
+    }
+    if !seats.initialized().await {
+        state.reconcile_requested.store(true, Ordering::Release);
+        return json_status(
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "status": "not-ready" }),
-        )
+        );
     }
-}
+    if seats.maintenance_active().await != Some(false) {
+        return json_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "status": "not-ready", "reason": "maintenance" }),
+        );
+    }
 
-// --- helpers ---------------------------------------------------------------
-
-/// Client IP for login throttling. Trust only X-Real-IP (our nginx sets it to the
-/// peer address); client-supplied X-Forwarded-For is spoofable and must not be used.
-fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| "local".to_string())
+    let clubs = match state.db.club_stock_snapshot().await {
+        Ok(clubs) => clubs,
+        Err(_) => {
+            return json_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "status": "not-ready", "reason": "database" }),
+            );
+        }
+    };
+    let ids: Vec<i64> = clubs.iter().map(|c| c.club_id).collect();
+    let Some(live) = seats.stock_left(&ids).await else {
+        return json_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "status": "not-ready", "reason": "redis" }),
+        );
+    };
+    let mut drifted = 0usize;
+    for (club, left) in clubs.iter().zip(live.iter()) {
+        if club.used > club.max_students {
+            drifted += 1;
+            continue;
+        }
+        let expected = (club.max_students - club.used).max(0);
+        match left {
+            Some(value) if *value == expected => {}
+            _ => drifted += 1,
+        }
+    }
+    if drifted > 0 {
+        let active = seats.has_active_operations().await;
+        if active == Some(false) {
+            state.reconcile_requested.store(true, Ordering::Release);
+        }
+        json_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "status": "not-ready",
+                "reason": if active == Some(true) { "operations-active" } else { "stock-drift" },
+                "clubs": drifted
+            }),
+        )
+    } else {
+        json_status(StatusCode::OK, json!({ "status": "ready" }))
+    }
 }
