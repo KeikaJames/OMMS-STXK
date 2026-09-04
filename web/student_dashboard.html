@@ -3,22 +3,27 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#161B24">
+<meta name="theme-color" content="#F5F5F7">
 <title>选课主页 · 鄂尔多斯市实验中学社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css">
+<link rel="preload" href="/img/editorial-grassland.jpg" as="image" fetchpriority="high">
+<link rel="stylesheet" href="/app.css?v=8">
 <link rel="stylesheet" href="/motion.css">
 <script>(function(){if(!matchMedia('(prefers-reduced-motion: reduce)').matches){var h=document.documentElement;h.classList.add('motion');setTimeout(function(){h.classList.remove('motion')},1600)}})();</script>
 <script src="/vendor/gsap.min.js" defer></script>
 <script src="/vendor/confetti.min.js" defer></script>
 <script src="/motion.js" defer></script>
 <script src="/easter-egg.js" defer></script>
+<script src="/student-dashboard.js?v=8" defer></script>
 </head>
-<body>
+<body class="page-student">
 <a class="skip" href="#main">跳到主内容</a>
 
 <header class="topbar">
-  <div class="brand"><img class="mark" src="/favicon.svg" alt=""><span class="t"><b>社团选课</b><small>鄂尔多斯市实验中学</small></span></div>
+  <div class="brand">
+    <img class="mark" src="/img/school-emblem.jpg" alt="鄂尔多斯市实验中学校徽" width="42" height="42">
+    <span class="t"><b>鄂尔多斯市实验中学</b><small>社团选课</small></span>
+  </div>
   <nav class="topnav" aria-label="主导航">
     <a href="/student/dashboard" class="active" aria-current="page">选课</a>
     <a href="/student/profile">个人信息</a>
@@ -26,351 +31,57 @@
   </nav>
 </header>
 
-<main class="wrap wrap-clubs" id="main">
-  <section aria-labelledby="status-h">
-    <h2 id="status-h" class="sr-only" style="position:absolute;left:-999px">选课状态</h2>
-    <div class="status m-in" id="statusbar">
-      <div class="status-top">
-        <span class="lab"><span class="dot"></span><span id="status-text">正在载入</span></span>
-        <span class="clock num" id="clock"></span>
+<main class="student-store" id="main">
+  <section class="store-hero" aria-labelledby="page-title">
+    <div class="hero-copy">
+      <h1 id="page-title">every choice matters</h1>
+      <p>Our choices are the hinges of destiny</p>
+    </div>
+    <div class="state-media" id="state-media" data-state="loading" aria-hidden="true">
+      <img id="state-image" src="/img/editorial-desk.jpg" alt="" width="1400" height="787" fetchpriority="high" decoding="async">
+    </div>
+  </section>
+
+  <section class="status-section" aria-labelledby="status-h">
+    <h2 id="status-h" class="sr-only">选课状态</h2>
+    <div class="status" id="statusbar">
+      <div class="status-lead">
+        <span class="status-kicker">报名状态</span>
+        <span class="lab"><span class="dot" aria-hidden="true"></span><strong id="status-text">正在载入</strong></span>
+        <p id="status-detail">正在读取开放时间与报名信息</p>
       </div>
-      <p class="rule">每人 <b>限选 1 个</b> 社团 · <span id="rule-tail">抢到后可退选改选</span></p>
+      <div class="status-time">
+        <span class="status-kicker" id="clock-label">当前时间</span>
+        <span class="clock num" id="clock" aria-live="off"></span>
+      </div>
+      <div class="status-rule-block">
+        <span class="status-kicker">选课规则</span>
+        <p class="rule">每人 <b>限选 1 个</b> 项目<br>退选后可以重新选择</p>
+      </div>
+    </div>
+    <div class="sync-state" id="sync-state" role="status" aria-live="polite" hidden>
+      <span class="sync-spinner" aria-hidden="true"></span>
+      <span>请求已经提交，正在确认服务端最终结果。请不要重复操作。</span>
     </div>
   </section>
 
-  <section aria-labelledby="clubs-h">
-    <div class="section-h m-in"><span id="clubs-h">社团列表</span><span id="hint" class="num"></span></div>
-    <div class="clubs" id="clubs">
-      <div class="sk sk-club"></div><div class="sk sk-club"></div>
+  <section class="offerings" aria-labelledby="clubs-h">
+    <div class="section-h store-section-h">
+      <div>
+        <h2 id="clubs-h">本学期选修项目</h2>
+        <p id="hint">每人可选择 1 个项目</p>
+      </div>
+      <span id="updated-at" class="updated-at num" aria-live="off"></span>
+    </div>
+    <div class="clubs" id="clubs" aria-busy="true">
+      <div class="sk sk-club"></div>
+      <div class="sk sk-club"></div>
+      <div class="sk sk-club"></div>
     </div>
   </section>
 
-  <div class="toast-wrap" id="toasts" aria-live="polite"></div>
-  <p class="foot">Designed by Gabiri &middot; &copy; Weilesi</p>
+  <div class="toast-wrap" id="toasts" aria-live="polite" aria-atomic="false"></div>
+  <p class="foot">Designed By Gabira</p>
 </main>
-
-<script>
-const $ = s => document.querySelector(s);
-const M = () => window.Motion;   // motion.js 为 defer 加载,调用时再取;缺失时所有分支都有即时退化
-let me = null;            // 学生信息(含 registered_club)
-let canRegister = false;
-let locked = false;       // 管理员已锁定名单:报名与退选均停止
-let openAt = null;        // 开放时刻(服务器毫秒时间戳)
-let clockOffset = 0;      // 服务器时钟 − 本机时钟(毫秒):倒计时与放行判断一律用服务器时间
-let bestRtt = Infinity;   // 只用往返最短的一次采样校准,避免高峰抖动带偏时钟
-let bestRttAt = 0;
-let openFlipped = false;  // 本地已按服务器时间放行,避免重复触发
-let openTimer = null;     // 精确到毫秒的放行定时器(秒级 tick 只作兜底)
-let inflight = false;     // 单飞:同一时刻只允许一个写操作
-let backoffUntil = 0;     // 503 退避截止
-let lastTimeRefresh = 0;  // 时间设置低频刷新;秒级倒计时完全在本地运行
-let lastProfileRefresh = 0;
-let lastClubs = [];
-let reconcileTimer = null;
-let reconcileGeneration = 0;
-const cards = new Map();  // club.id → <article>:按 id 就地更新,不整页重绘
-
-const now = () => Date.now() + clockOffset;
-const OPEN_MARGIN_MS = 50;  // 略晚于服务器时刻放行,宁可迟 50ms,不让早点被拒
-
-function toast(msg, kind){
-  const t = document.createElement('div');
-  t.className = 'toast' + (kind ? ' ' + kind : '');
-  t.textContent = msg;
-  $('#toasts').appendChild(t);
-  if (M()) M().toast(t, 2600); else setTimeout(() => t.remove(), 2600);
-}
-
-async function api(path, opts){
-  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
-  if (r.status === 401){ location.href = '/'; throw new Error('unauth'); }
-  return r;
-}
-
-function splitRoom(name){
-  const m = name.match(/^(.*?)（\s*([0-9A-Za-z]+)\s*）\s*$/);
-  return m ? {name: m[1].trim(), room: m[2] + ' 室'} : {name, room: null};
-}
-
-function setClock(el, text, prefix){
-  if (M()){ M().digits(el, text, prefix); return; }
-  el.textContent = '';
-  if (prefix){ const p = document.createElement('span'); p.className = 'clk-now'; p.textContent = prefix; el.appendChild(p); }
-  el.appendChild(document.createTextNode(text));
-}
-
-function tickClock(){
-  const el = $('#clock');
-  const t = now();
-  if (!canRegister && !locked && openAt !== null && t >= openAt + OPEN_MARGIN_MS) onOpen();
-  const d = new Date(t);
-  const p = n => String(n).padStart(2,'0');
-  const hms = p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
-  if (canRegister || locked || openAt === null){
-    // 开抢中:显示当前时间并加“现在”前缀,避免被误读成倒计时(开抢不自动截止)
-    setClock(el, hms, canRegister ? '现在' : null);
-    el.classList.remove('t10');
-  } else {
-    const remain = openAt - t;
-    let s = Math.max(0, Math.ceil(remain/1000));
-    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60); s = s%60;
-    setClock(el, (h>0 ? p(h)+':' : '') + p(m)+':'+p(s), null);
-    const hot = remain <= 10000;
-    el.classList.toggle('t10', hot);
-    if (hot && M()) M().tick(el);
-  }
-}
-
-function applyTime(t, sentAt){
-  const rtt = Date.now() - sentAt;
-  if (typeof t.server_now === 'number'){
-    const sample = t.server_now - (sentAt + rtt / 2);   // 服务器打戳时刻 ≈ 发出后半个往返
-    const jumped = Math.abs(sample - clockOffset) > Math.max(2000, rtt);  // 偏差大于往返本身:本机或服务器时钟被改过,立即重校
-    if (rtt <= bestRtt || Date.now() - bestRttAt > 300000 || jumped){
-      clockOffset = sample; bestRtt = rtt; bestRttAt = Date.now();
-    }
-  }
-  if (typeof t.open_at === 'number') openAt = t.open_at;
-  else openAt = t.start_time ? new Date(t.start_time.replace(/-/g,'/')).getTime() : null;
-  locked = !!t.registration_locked;
-  canRegister = !!t.can_register && !locked;
-  openFlipped = canRegister;
-  lastTimeRefresh = Date.now();
-  scheduleOpen();
-}
-
-function scheduleOpen(){
-  if (openTimer){ clearTimeout(openTimer); openTimer = null; }
-  if (canRegister || locked || openAt === null) return;
-  const wait = openAt + OPEN_MARGIN_MS - now();
-  if (wait > 86400000) return;                     // 一天以上:等 30s 一次的时间刷新再排
-  openTimer = setTimeout(onOpen, Math.max(0, wait));
-}
-
-function onOpen(){
-  if (openFlipped) return;
-  openFlipped = true; canRegister = true;
-  renderStatus(); renderClubs(lastClubs);          // 立即放行按钮,不等下一轮轮询
-  if (M()) M().ping($('#statusbar'));
-  lastTimeRefresh = 0;                             // 紧接着的刷新顺带向服务器确认
-  setTimeout(() => refresh(), 150 + Math.random()*400);
-}
-
-async function refresh({profile = false} = {}){
-  try{
-    const needTime = openAt === null || Date.now() - lastTimeRefresh >= 30000;
-    const needProfile = profile || me === null || Date.now() - lastProfileRefresh >= 60000;
-    const sentAt = Date.now();
-    const [cRes, tRes, sRes] = await Promise.all([
-      api('/api/get_clubs'),
-      needTime ? api('/api/check_registration_time') : Promise.resolve(null),
-      needProfile ? api('/api/get_student_info') : Promise.resolve(null)
-    ]);
-    const clubs = await cRes.json();
-    if (tRes){
-      applyTime(await tRes.json(), sentAt);
-    } else if (!canRegister && !locked && openAt !== null && now() >= openAt + OPEN_MARGIN_MS){
-      canRegister = true; openFlipped = true;
-    }
-    if (sRes && sRes.ok){
-      const profileData = await sRes.json();
-      if (profileData && typeof profileData.student_id !== 'undefined'){
-        me = profileData; lastProfileRefresh = Date.now();
-      }
-    }
-    lastClubs = clubs;
-    renderStatus(); renderClubs(clubs);
-  }catch(e){ if (e.message !== 'unauth') console.error(e); }
-}
-
-function renderStatus(){
-  const bar = $('#statusbar');
-  if (locked){ bar.className = 'status locked'; $('#status-text').textContent = '报名已锁定'; }
-  else if (canRegister){ bar.className = 'status open'; $('#status-text').textContent = '开抢进行中'; }
-  else if (openAt){ bar.className = 'status'; $('#status-text').textContent = '距开抢'; }
-  else { bar.className = 'status'; $('#status-text').textContent = '尚未设置开放时间'; }
-  $('#rule-tail').textContent = locked ? '名单已锁定,不可报名或退选' : '抢到后可退选改选';
-  tickClock();
-}
-
-function renderClubs(clubs){
-  const box = $('#clubs');
-  const mine = me && me.registered_club;
-  $('#hint').textContent = mine ? '已选 1 / 1' : (locked ? '名单已锁定' : (canRegister ? '可选 1 个' : ''));
-  const first = cards.size === 0;
-  if (first) box.innerHTML = '';                    // 移除骨架屏
-  if (!clubs.length){
-    cards.forEach(el => el.remove()); cards.clear();
-    if (!box.querySelector('.empty')) box.innerHTML = '<div class="empty" style="grid-column:1/-1">暂无社团</div>';
-    return;
-  }
-  const emptyEl = box.querySelector('.empty'); if (emptyEl) emptyEl.remove();
-  const seen = new Set(); const fresh = [];
-  cards.forEach((el, id) => { if (!clubs.some(c => c.id === id)){ cards.delete(id); el.remove(); } });
-  clubs.forEach((c, i) => {
-    seen.add(c.id);
-    let el = cards.get(c.id);
-    if (!el){ el = card(); cards.set(c.id, el); fresh.push(el); }
-    fill(el, c, mine);
-    const at = box.children[i];
-    if (at !== el) box.insertBefore(el, at || null);
-  });
-  if (M() && fresh.length){ if (first) M().stagger(fresh); else fresh.forEach(el => M().enter(el)); }
-}
-
-function card(){
-  const el = document.createElement('article');
-  el.className = 'club';
-  el.innerHTML = '<div class="club-top"><span class="club-name"></span></div>'
-    + '<div class="seats"><span class="n"></span><span class="u"></span></div>'
-    + '<div class="bar"><i></i></div><div class="act"></div>';
-  el._act = el.lastElementChild;   // 固定引用:确认态会把 class 换成 confirm
-  el._left = null; el._sig = null; el._name = null;
-  return el;
-}
-
-function fill(el, c, mine){
-  const isMine = !!mine && me.registered_club === c.name;
-  const full = c.current_students >= c.max_students;
-  const left = Math.max(0, c.max_students - c.current_students);
-  const urgent = !full && left <= 3;
-  const leftPct = c.max_students ? Math.round(left / c.max_students * 100) : 0;  // 剩余占比:名额越少,条越短(与大数字同向)
-  el.className = 'club' + (isMine ? ' mine' : '') + (full ? ' full' : '');
-
-  if (el._name !== c.name){
-    const info = splitRoom(c.name);
-    const nm = el.querySelector('.club-name'); nm.textContent = info.name;
-    if (info.room){ const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = info.room; nm.appendChild(rm); }
-    el._name = c.name;
-  }
-
-  const n = el.querySelector('.n');
-  n.className = 'n' + (full ? ' gone' : (urgent ? ' urgent' : ''));
-  const shown = full ? 0 : left;
-  if (M()) M().count(n, el._left, shown); else n.textContent = String(shown);
-  el._left = shown;
-  el.querySelector('.u').textContent = full ? ('已满 · 共 ' + c.max_students) : ('个名额 · 共 ' + c.max_students);
-
-  const blvl = full ? '' : (urgent ? 'urgent' : (left <= 6 ? 'warm' : ''));
-  const bar = el.querySelector('.bar'); bar.className = 'bar' + (blvl ? ' ' + blvl : '');
-  bar.firstChild.style.width = (full ? 0 : leftPct) + '%';
-
-  el._club = c; el._isMine = isMine; el._mine = !!mine; el._full = full;
-  const sig = [isMine, !!mine, full, canRegister, locked].join('|');
-  if (sig !== el._sig){ el._sig = sig; renderAct(el); }   // 仅状态变化时重建按钮区,不打断进行中的确认/加载态
-}
-
-function renderAct(el){
-  const act = el._act; act.innerHTML = ''; act.className = 'act';
-  const c = el._club;
-  if (el._isMine){
-    const badge = document.createElement('span'); badge.className = 'badge-ok grow'; badge.textContent = '你已选这个社团';
-    act.appendChild(badge);
-    if (locked){ act.appendChild(state('名单已锁定')); }
-    else {
-      const btn = document.createElement('button'); btn.className = 'btn btn-secondary btn-sm'; btn.type='button'; btn.textContent = '退选';
-      btn.onclick = () => askCancel(el);
-      act.appendChild(btn);
-    }
-  } else if (locked){ act.appendChild(state('已锁定'));
-  } else if (el._mine){ act.appendChild(state('已选其他社团'));
-  } else if (el._full){ act.appendChild(state('已满员'));
-  } else if (!canRegister){ act.appendChild(state('未开始'));
-  } else {
-    const btn = document.createElement('button'); btn.className = 'btn btn-primary btn-sm'; btn.type='button'; btn.textContent = '报名';
-    btn.onclick = () => doRegister(btn, c.id, el);
-    act.appendChild(btn);
-  }
-}
-
-function state(label){ const s = document.createElement('span'); s.className = 'state'; s.textContent = label; return s; }
-
-function askCancel(el){
-  const act = el._act;
-  act.innerHTML = '';
-  act.className = 'confirm';
-  const yes = document.createElement('button'); yes.className='btn btn-secondary btn-sm'; yes.style.color='var(--brand)'; yes.type='button'; yes.textContent='确认退选';
-  const no = document.createElement('button'); no.className='btn btn-primary btn-sm'; no.type='button'; no.textContent='再想想';
-  yes.onclick = () => doCancel(yes);
-  no.onclick = () => renderAct(el);
-  act.append(yes, no);
-}
-
-function busy(btn, on){
-  if (on){ btn.dataset.txt = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spin" aria-hidden="true"></span>'; }
-  else { btn.disabled = false; btn.textContent = btn.dataset.txt || btn.textContent; }
-}
-
-function reconcileFinalState(){
-  const generation = ++reconcileGeneration;
-  if (reconcileTimer) clearTimeout(reconcileTimer);
-  const delays = [1000, 2000, 4000, 8000];
-  let round = 0;
-  backoffUntil = Math.max(backoffUntil, Date.now() + delays.reduce((a,b) => a+b, 0));
-  const step = () => {
-    lastProfileRefresh = 0;
-    refresh({profile:true}).finally(() => {
-      if (generation !== reconcileGeneration) return;
-      reconcileTimer = round < delays.length ? setTimeout(step, delays[round++]) : null;
-    });
-  };
-  reconcileTimer = setTimeout(step, delays[round++]);
-}
-
-async function guardedWrite(btn, fn){
-  if (inflight) return;
-  if (Date.now() < backoffUntil){ toast('系统繁忙,请稍候重试', 'err'); return; }
-  inflight = true; busy(btn, true);
-  try { await fn(); }
-  finally { inflight = false; busy(btn, false); }
-}
-
-function retryLater(r, msg){
-  const ra = parseInt(r.headers.get('Retry-After') || '2', 10);
-  const delay = isNaN(ra) ? 2 : ra;
-  backoffUntil = Math.max(backoffUntil, Date.now() + delay*1000);
-  toast(msg, 'err');
-  lastProfileRefresh = 0;
-  reconcileFinalState();
-}
-
-function doRegister(btn, clubId, el){
-  guardedWrite(btn, async () => {
-    const r = await fetch('/api/register_club', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({club_id: clubId})});
-    if (r.status === 401){ location.href='/'; return; }
-    if (r.status === 503 || r.status === 429){ retryLater(r, '请求超时,正在确认最终报名状态'); return; }
-    const d = await r.json();
-    toast(d.message || (d.success ? '报名成功' : '报名失败'), d.success ? 'ok' : 'err');
-    if (d.success && M()){ M().confetti(btn); M().ping(el); }
-    await refresh({profile:true});
-  });
-}
-
-function doCancel(btn){
-  guardedWrite(btn, async () => {
-    const r = await api('/api/cancel_registration', {method:'POST', body:'{}'});
-    if (r.status === 503 || r.status === 429){
-      let d = null; try { d = await r.json(); } catch(e) {}
-      retryLater(r, (d && d.message) || '退选状态待确认,正在重新读取'); return;
-    }
-    const d = await r.json();
-    toast(d.message || (d.success ? '已退选' : '退选失败'), d.success ? 'ok' : 'err');
-    await refresh({profile:true});
-  });
-}
-
-$('#logout').onclick = async () => {
-  try { await fetch('/api/logout', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); } catch(e){}
-  location.href = '/';
-};
-
-function boot(){
-  if (M()) M().enterPage('.m-in');
-  setInterval(tickClock, 1000);
-  window.addEventListener('focus', () => refresh({profile:true}));
-  (function loop(){ refresh().finally(() => setTimeout(loop, 4000 + Math.floor(Math.random()*2500))); })();
-}
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
-</script>
 </body>
 </html>
