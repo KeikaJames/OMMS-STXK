@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -400,6 +401,66 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         self.assertIsInstance(json.loads(second_response[2]), list)
         self.assertNotIn(b"Unsupported method", second_response[2])
 
+    def test_club_images_are_safely_proxied_through_nginx(self) -> None:
+        self._reset_state()
+        admin_token = self._login(self.edge_port, "admin", "admin-password", admin=True)
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow unavailable")
+        image = Image.new("RGB", (8, 8), "navy")
+        out = io.BytesIO()
+        image.save(out, format="PNG")
+        raw = out.getvalue()
+        upload = (
+            f"POST /api/upload_club_image?club_id=1&expected_revision=0&request_id=edge-image-0001&reason=upload "
+            f"HTTP/1.1\r\nHost: 127.0.0.1:{self.edge_port}\r\nContent-Type: image/png\r\n"
+            f"Content-Length: {len(raw)}\r\nCookie: session={admin_token}\r\nConnection: close\r\n\r\n"
+        ).encode("ascii") + raw
+        status, _headers, body = self._raw_edge_request(upload)
+        self.assertEqual(200, status)
+        uploaded = json.loads(body)
+        image_path = uploaded["club"]["image_path"]
+        status, headers, content = self._request_raw(self.edge_port, "GET", image_path)
+        self.assertEqual(200, status)
+        self.assertEqual("image/png", headers.get("content-type"))
+        self.assertGreater(len(content), 0)
+        status, _headers, clubs_body = self._request_raw(self.edge_port, "GET", "/api/get_clubs")
+        self.assertEqual(200, status)
+        edge_club = json.loads(clubs_body)[0]
+        self.assertEqual(image_path, edge_club["image_path"])
+        self.assertEqual(uploaded["club"]["revision"], edge_club["revision"])
+
+    def test_python_and_rust_hold_only_a_pending_club_before_final_seat_mutation(self) -> None:
+        """A targeted admin sync hold must work through either hot backend."""
+        self._reset_state()
+        operation_id = "pending-sync-registration"
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE clubs SET seat_sync_pending=1, current_students=1 WHERE id=1")
+            conn.execute(
+                "INSERT INTO registrations (student_id, club_id, registration_time, operation_id) VALUES (1,1,?,?)",
+                ("2000-01-01 00:00:00", operation_id),
+            )
+            conn.commit()
+        self.redis.set("stock:club:1", 2)
+        self.redis.set("student:reg:1", f"1|{operation_id}")
+        one = self._login(self.python_port, "edge1", "student-password")
+        two = self._login(self.python_port, "edge2", "student-password")
+        for port in (self.python_port, self.rust_port):
+            register_status, _headers, register_body = self._request_raw(
+                port, "POST", "/api/register_club", body={"club_id": 1}, cookie=f"session={two}"
+            )
+            self.assertEqual(503, register_status)
+            self.assertEqual("该社团名额正在同步，请稍后重试", json.loads(register_body)["message"])
+            cancel_status, _headers, cancel_body = self._request_raw(
+                port, "POST", "/api/cancel_registration", body={}, cookie=f"session={one}"
+            )
+            self.assertEqual(503, cancel_status)
+            self.assertEqual("该社团名额正在同步，请稍后重试", json.loads(cancel_body)["message"])
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM registrations WHERE student_id=1").fetchone()[0])
+        self.assertEqual("2", self.redis.get("stock:club:1"))
+
     def test_shared_source_failed_logins_do_not_lock_other_students(self) -> None:
         """A campus NAT must not turn random failed names into a school-wide 429."""
         self._reset_state()
@@ -455,6 +516,24 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             self.assertEqual(200, status)
             self.assertTrue(json.loads(body).get("success"))
         self.assertEqual("1", self.redis.get("stock:club:1"))
+
+    def test_python_and_rust_enforce_same_club_admission_rules(self) -> None:
+        self._reset_state()
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE students SET grade='高一', class='高一(1)班' WHERE id=1")
+            conn.execute("UPDATE students SET grade='高二', class='高二(1)班' WHERE id=2")
+            conn.execute("UPDATE clubs SET allowed_grades='[\"高一\"]', enabled=1 WHERE id=1")
+            conn.commit()
+        # Use the same ineligible student session against both implementations;
+        # independent logins would intentionally revoke the older token.
+        student_token = self._login(self.python_port, "edge2", "student-password")
+        for port in (self.python_port, self.rust_port):
+            status, _headers, body = self._request_raw(
+                port, "POST", "/api/register_club", body={"club_id": 1}, cookie=f"session={student_token}"
+            )
+            self.assertEqual(200, status)
+            self.assertEqual("不符合年级限制", json.loads(body).get("message"))
+        self.assertEqual("3", self.redis.get("stock:club:1"))
 
     def test_edge_rejects_multiple_cookie_header_fields_without_revoking_session(self) -> None:
         self._reset_state()

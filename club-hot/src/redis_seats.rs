@@ -918,6 +918,11 @@ pub async fn rebuild_stock(seats: &Seats, db: &Db, maintenance_token: &str) -> A
     pipe.del(K_CACHE_CLUBS).ignore();
     let committed: Option<()> = redis_deadline(pipe.query_async(&mut conn)).await?;
     require_watch_commit(committed)?;
+    // SQLite marks a club locally unavailable when a low-frequency admin
+    // mutation commits but its targeted Redis publication is interrupted.  A
+    // completed full snapshot above is authoritative for every club, so it is
+    // now safe to release those durable per-club holds.
+    db.clear_all_seat_sync_pending().await?;
 
     tracing::info!(clubs = clubs.len(), "Redis stock rebuilt");
     Ok(())

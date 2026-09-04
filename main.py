@@ -30,6 +30,9 @@ import threading
 import logging
 import time
 import ipaddress
+import re
+import hashlib
+import warnings
 from datetime import datetime
 
 # ---- 可选重依赖(有 fallback 不致命) -------------------------------------
@@ -50,6 +53,17 @@ try:
     HAS_PYPINYIN = True
 except ImportError:
     HAS_PYPINYIN = False
+
+try:
+    from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
+    HAS_PILLOW = True
+except ImportError:  # pragma: no cover - endpoint returns a clear error
+    Image = ImageOps = ImageSequence = None
+
+    class UnidentifiedImageError(OSError):
+        pass
+
+    HAS_PILLOW = False
 
 # ---- 配置(环境变量可覆盖) ------------------------------------------------
 DB_PATH = os.environ.get("DB_PATH", "club_system.db")
@@ -74,13 +88,35 @@ MAX_IMPORT_STUDENTS = max(1, int(os.environ.get("MAX_IMPORT_STUDENTS", "5000")))
 # A school club cannot meaningfully hold more than this; keeping the bound
 # below SQLite's integer range also makes import failure per-row and predictable.
 MAX_CLUB_CAPACITY = 10_000
+CLUB_IMAGE_DIR = os.path.abspath(os.environ.get(
+    "CLUB_IMAGE_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "club-images"),
+))
+MAX_CLUB_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_CLUB_IMAGE_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_CLUB_IMAGE_WIDTH = 1920
+MAX_CLUB_IMAGE_HEIGHT = 1080
+MAX_CLUB_GIF_FRAMES = 120
+MAX_CLUB_GIF_DURATION_MS = 30_000
+# Frames are materialized as RGBA during GIF normalization.  Keep the total
+# decoded budget bounded in bytes as well as compressed input/output sizes.
+MAX_CLUB_GIF_DECODED_PIXELS = 12_000_000
+IMAGE_PROCESS_SLOTS = threading.BoundedSemaphore(1)
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0").strip().lower() in {"1", "true", "yes", "on"}
+NGINX_ACCESS_LOG = os.environ.get("NGINX_ACCESS_LOG", "/tmp/club_nginx_access.log")
+METRICS_WINDOW_SECONDS = 60
+METRICS_CACHE_SECONDS = 1.0
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("club")
+
+_ACCESS_LOG_RE = re.compile(
+    r"^ts=(?P<ts>\d+(?:\.\d+)?)\s+status=(?P<status>\d{3})\s+"
+    r"upstream=\"(?P<upstream>[^\"]*)\"\s+request_time=(?P<request_time>\S+)\s+"
+    r"limit_req=(?P<limit_req>\S+)\s+limit_conn=(?P<limit_conn>\S+)$"
+)
 
 # Redis 键契约(与 Rust 热服务一致)
 K_STOCK = "stock:club:{}"        # 剩余名额(热准入计数;SQLite trigger 是最终容量底线)
@@ -225,6 +261,24 @@ if n == 1 then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
 return n
 """
 
+LUA_CAPACITY_ADJUST = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
+local stock = redis.call('GET', KEYS[2])
+if not stock or not tonumber(stock) then return -2 end
+local expected = tonumber(ARGV[2])
+local delta = tonumber(ARGV[3])
+local target = tonumber(ARGV[4])
+if not expected or not delta or not target then return -3 end
+if tonumber(stock) == expected then
+  redis.call('INCRBY', KEYS[2], delta)
+  redis.call('DEL', KEYS[3])
+  return 1
+end
+redis.call('SET', KEYS[2], target)
+redis.call('DEL', KEYS[3])
+return 2
+"""
+
 
 def _session_identity(payload):
     """Return the stable Redis principal tuple for a session payload.
@@ -309,6 +363,7 @@ class RedisGate:
         self._student_op_begin = None
         self._session_create = None
         self._login_fail_script = None
+        self._capacity_adjust = None
         if _redis is not None:
             try:
                 self._r = _redis.Redis.from_url(
@@ -324,6 +379,7 @@ class RedisGate:
                 self._student_op_begin = self._r.register_script(LUA_STUDENT_OP_BEGIN)
                 self._session_create = self._r.register_script(LUA_SESSION_CREATE)
                 self._login_fail_script = self._r.register_script(LUA_LOGIN_FAIL)
+                self._capacity_adjust = self._r.register_script(LUA_CAPACITY_ADJUST)
                 log.info("Redis 已连接: %s", url)
             except Exception as e:  # noqa: BLE001
                 log.warning("Redis 连接失败(将降级): %s", e)
@@ -494,6 +550,50 @@ class RedisGate:
             return {c: (int(v) if v is not None else None) for c, v in zip(club_ids, vals)}
         except Exception:  # noqa: BLE001
             return None
+
+    def adjust_club_capacity(self, maintenance_token, club_id, old_remaining,
+                             delta, new_remaining):
+        if self._capacity_adjust is None:
+            raise RuntimeError("redis unavailable")
+        last_error = None
+        for _ in range(2):
+            try:
+                result = int(self._capacity_adjust(
+                    keys=[K_MAINT, K_STOCK.format(club_id), K_CACHE_CLUBS],
+                    args=[maintenance_token, old_remaining, delta, new_remaining],
+                ))
+                if result > 0:
+                    return result
+                raise RuntimeError("maintenance or stock changed")
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+        raise RuntimeError("redis unavailable") from last_error
+
+    def publish_admin_seat_state(self, maintenance_token, stocks, registrations):
+        if self._r is None:
+            raise RuntimeError("redis unavailable")
+        try:
+            pipe = self._r.pipeline()
+            pipe.watch(K_MAINT)
+            if pipe.get(K_MAINT) != maintenance_token:
+                pipe.reset()
+                raise RuntimeError("maintenance changed")
+            pipe.multi()
+            for club_id, remaining in stocks.items():
+                pipe.set(K_STOCK.format(club_id), int(remaining))
+            for student_id, value in registrations.items():
+                key = K_STUREG.format(student_id)
+                if value is None:
+                    pipe.delete(key)
+                else:
+                    pipe.set(key, value)
+                pipe.delete(K_RESV.format(student_id))
+                pipe.delete(K_OP.format(student_id))
+            pipe.delete(K_CACHE_CLUBS)
+            pipe.execute()
+            return True
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("redis unavailable") from e
 
     def has_active_operations(self):
         if self._r is None:
@@ -716,19 +816,26 @@ AUTH_SLOTS = threading.BoundedSemaphore(AUTH_CONCURRENCY)
 REGISTRATION_SLOTS = threading.BoundedSemaphore(REGISTER_CONCURRENCY)
 RECONCILE_REQUESTED = threading.Event()
 RECONCILE_STOP = threading.Event()
+METRICS_CACHE_LOCK = threading.Lock()
+METRICS_CACHE = {"created": 0.0, "payload": None}
 
 
 # ==========================================================================
 # 口令哈希(argon2;兼容存量明文,登录时就地升级)
 # ==========================================================================
 def hash_password(plain):
-    if _PH is None:  # 极端 fallback:不应发生(argon2-cffi 已装)
-        return "plain$" + plain
+    if _PH is None:
+        raise RuntimeError("argon2-cffi 不可用，拒绝写入口令")
     return _PH.hash(plain)
 
 
 def verify_password(stored, plain):
     """返回 (ok: bool, needs_upgrade: bool)。"""
+    if _PH is None:
+        # init_db refuses startup without Argon2; keep this guard for direct
+        # callers so no code path silently authenticates into a plaintext
+        # fallback if an operator changes dependencies at runtime.
+        return False, False
     if stored is None:
         return False, False
     if stored.startswith("$argon2"):
@@ -745,10 +852,10 @@ def verify_password(stored, plain):
     return secrets.compare_digest(stored, plain), True
 
 
-def gen_password():
+def gen_password(length=8):
     """随机每人口令(避免易混字符);明文仅用于一次性下发,入库存哈希。"""
     alphabet = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
-    return "".join(secrets.choice(alphabet) for _ in range(8))
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 # ==========================================================================
@@ -770,6 +877,402 @@ def clean_text(s, maxlen=50):
     if any(ord(c) < 32 for c in s):  # 控制字符
         return None
     return s
+
+
+def derive_grade(klass):
+    """Best-effort compatibility bridge for legacy free-form class labels."""
+    if not isinstance(klass, str):
+        return ""
+    match = re.search(r"(?:高|初)[一二三123]", klass.strip())
+    if not match:
+        return ""
+    value = match.group(0)
+    return {"高1": "高一", "高2": "高二", "高3": "高三",
+            "初1": "初一", "初2": "初二", "初3": "初三"}.get(value, value)
+
+
+def clean_text_list(value, *, max_items=50, item_maxlen=80):
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > max_items:
+        return None
+    result, seen = [], set()
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        cleaned = clean_text(item, maxlen=item_maxlen)
+        if not cleaned:
+            return None
+        if cleaned not in seen:
+            seen.add(cleaned)
+            result.append(cleaned)
+    return result
+
+
+def stored_text_list(value):
+    """Best-effort decoder used only for read/display compatibility."""
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        return []
+    return parsed
+
+
+def strict_text_list(value):
+    """Decode a persisted eligibility list without turning corruption into allow-all.
+
+    Admin writes always serialize a bounded list, but an older hand-edited
+    database can contain malformed JSON.  The hot Python path must then agree
+    with Rust and reject admission until an administrator repairs the club,
+    rather than silently treating the restriction as empty.
+    """
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        return None
+    return parsed
+
+
+def student_matches_restrictions(grade, klass, allowed_grades, allowed_classes):
+    grades = strict_text_list(allowed_grades)
+    classes = strict_text_list(allowed_classes)
+    if grades is None or classes is None:
+        return False, "社团限制配置异常"
+    if grades and grade not in grades:
+        return False, "不符合年级限制"
+    if classes and klass not in classes:
+        return False, "不符合班级限制"
+    return True, None
+
+
+def _audit_json(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")) if value is not None else None
+
+
+def append_audit_event(cur, *, event_id, actor_role, actor_id, action,
+                       target_type, target_id=None, request_id=None, reason=None,
+                       before=None, after=None, metadata=None):
+    """Append an immutable, non-secret event in the caller's SQL transaction."""
+    cur.execute(
+        "INSERT INTO audit_events "
+        "(event_id, occurred_at, actor_role, actor_id, action, target_type, target_id, "
+        "request_id, reason, before_json, after_json, metadata_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (event_id, int(time.time() * 1000), actor_role, str(actor_id), action,
+         target_type, str(target_id) if target_id is not None else None, request_id,
+         reason, _audit_json(before), _audit_json(after), _audit_json(metadata)),
+    )
+
+
+def admin_request_id(data):
+    """Validate the caller-supplied idempotency key for an admin mutation."""
+    value = data.get("request_id")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", value):
+        return None
+    return value
+
+
+class ClubImageError(ValueError):
+    """An uploaded club image failed bounded decode or normalization."""
+
+
+class ClubImageFeatureUnavailable(RuntimeError):
+    """The server is intentionally refusing unvalidated image persistence."""
+
+
+_CLUB_IMAGE_NAME = re.compile(
+    r"^(?P<club_id>[1-9][0-9]*)-(?P<object_id>[0-9a-f]{32})\.(?P<ext>gif|jpg|png|webp)$"
+)
+_CLUB_IMAGE_MIME = {
+    "GIF": ("gif", "image/gif"),
+    "JPEG": ("jpg", "image/jpeg"),
+    "PNG": ("png", "image/png"),
+    "WEBP": ("webp", "image/webp"),
+}
+
+
+def _sanitize_club_image(raw, declared_type):
+    """Decode, bound, and re-encode JPEG/PNG/WebP/GIF before persistence."""
+    if not HAS_PILLOW:
+        raise ClubImageFeatureUnavailable("服务器暂未启用图片处理，请联系管理员")
+    if not raw or len(raw) > MAX_CLUB_IMAGE_BYTES:
+        raise ClubImageError("图片内容为空或超过 2MB")
+    declared_type = (declared_type or "").split(";", 1)[0].strip().lower()
+    if declared_type not in {mime for _ext, mime in _CLUB_IMAGE_MIME.values()}:
+        raise ClubImageError("仅支持 JPEG、PNG、WebP 和 GIF")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as source:
+                image_format = (source.format or "").upper()
+                if image_format not in _CLUB_IMAGE_MIME:
+                    raise ClubImageError("无法识别图片格式")
+                extension, actual_type = _CLUB_IMAGE_MIME[image_format]
+                if declared_type != actual_type:
+                    raise ClubImageError("图片内容与 Content-Type 不一致")
+                width, height = source.size
+                if not (1 <= width <= MAX_CLUB_IMAGE_WIDTH and 1 <= height <= MAX_CLUB_IMAGE_HEIGHT):
+                    raise ClubImageError("图片尺寸不能超过 1920×1080")
+                output = io.BytesIO()
+                frames, duration_ms = 1, 0
+                if image_format == "GIF":
+                    rendered, durations = [], []
+                    decoded_pixels = 0
+                    for frames, frame in enumerate(ImageSequence.Iterator(source), start=1):
+                        if frames > MAX_CLUB_GIF_FRAMES:
+                            raise ClubImageError("GIF 不能超过 120 帧")
+                        frame.load()
+                        decoded_pixels += width * height
+                        if decoded_pixels > MAX_CLUB_GIF_DECODED_PIXELS:
+                            raise ClubImageError("GIF 解码规模过大")
+                        duration = frame.info.get("duration", source.info.get("duration", 100))
+                        duration = max(80, min(int(duration) if isinstance(duration, (int, float)) else 100, 2000))
+                        duration_ms += duration
+                        if duration_ms > MAX_CLUB_GIF_DURATION_MS:
+                            raise ClubImageError("GIF 总时长不能超过 30 秒")
+                        rendered.append(frame.convert("RGBA"))
+                        durations.append(duration)
+                    rendered[0].save(output, format="GIF", save_all=True, append_images=rendered[1:],
+                                     duration=durations, loop=int(source.info.get("loop", 0) or 0),
+                                     disposal=2, optimize=True)
+                else:
+                    source.load()
+                    image = ImageOps.exif_transpose(source)
+                    if image_format == "JPEG":
+                        if image.mode not in ("RGB", "L"):
+                            canvas = Image.new("RGB", image.size, "white")
+                            if "A" in image.getbands():
+                                canvas.paste(image, mask=image.getchannel("A"))
+                            else:
+                                canvas.paste(image)
+                            image = canvas
+                        image.convert("RGB").save(output, format="JPEG", quality=85, optimize=True,
+                                                  progressive=True, subsampling="4:2:0")
+                    elif image_format == "PNG":
+                        image.convert("RGBA" if "A" in image.getbands() else "RGB").save(output, format="PNG", optimize=True)
+                    else:
+                        image.convert("RGBA" if "A" in image.getbands() else "RGB").save(output, format="WEBP", quality=84, method=6)
+    except ClubImageError:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ClubImageError("图片损坏或无法完整解码") from exc
+    normalized = output.getvalue()
+    if not normalized or len(normalized) > MAX_CLUB_IMAGE_OUTPUT_BYTES:
+        raise ClubImageError("处理后的图片过大")
+    return normalized, extension, actual_type, width, height, frames, duration_ms
+
+
+def _club_image_disk_path(image_path):
+    if not isinstance(image_path, str) or not image_path.startswith("/club-images/"):
+        return None
+    name = image_path[len("/club-images/"):]
+    if not _CLUB_IMAGE_NAME.fullmatch(name):
+        return None
+    root = os.path.realpath(CLUB_IMAGE_DIR)
+    target = os.path.realpath(os.path.join(root, name))
+    try:
+        return target if os.path.commonpath((root, target)) == root else None
+    except ValueError:
+        return None
+
+
+def _remove_managed_club_image(image_path):
+    target = _club_image_disk_path(image_path)
+    if not target:
+        return
+    # Immutable object names are unique per upload, but keep a DB reference
+    # check as a second line of defense for legacy files or operator repairs.
+    # If the database is unavailable, retaining an orphan is safer than
+    # deleting a currently referenced public asset.
+    try:
+        with DB_POOL.connection() as conn:
+            if conn.execute("SELECT 1 FROM clubs WHERE image_path=? LIMIT 1", (image_path,)).fetchone():
+                return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("跳过社团图片回收 path=%s error=%s", image_path, exc)
+        return
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("清理旧社团图片失败 path=%s error=%s", image_path, exc)
+
+
+def _percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * fraction)))
+    return round(ordered[index], 2)
+
+
+def operations_snapshot():
+    """Fixed-window admin metrics without exposing raw logs or paths."""
+    now = time.time()
+    with METRICS_CACHE_LOCK:
+        if METRICS_CACHE["payload"] is not None and now - METRICS_CACHE["created"] < METRICS_CACHE_SECONDS:
+            return METRICS_CACHE["payload"]
+
+    response_counts = {"2xx": 0, "4xx": 0, "429": 0, "5xx": 0, "503": 0}
+    limited = {"rate": 0, "connections": 0}
+    upstream = {"rust": 0, "python_backup": 0, "unavailable": 0}
+    request_times, requests = [], 0
+    try:
+        with open(NGINX_ACCESS_LOG, "rb") as log_file:
+            log_file.seek(0, os.SEEK_END)
+            log_file.seek(max(0, log_file.tell() - 1_048_576))
+            lines = log_file.read().decode("utf-8", "replace").splitlines()
+        for line in lines:
+            match = _ACCESS_LOG_RE.match(line)
+            if not match:
+                continue
+            try:
+                timestamp, status = float(match.group("ts")), int(match.group("status"))
+            except ValueError:
+                continue
+            if timestamp < now - METRICS_WINDOW_SECONDS:
+                continue
+            requests += 1
+            if 200 <= status < 300:
+                response_counts["2xx"] += 1
+            elif status == 429:
+                response_counts["429"] += 1
+                response_counts["4xx"] += 1
+            elif 400 <= status < 500:
+                response_counts["4xx"] += 1
+            elif status == 503:
+                response_counts["503"] += 1
+                response_counts["5xx"] += 1
+            elif status >= 500:
+                response_counts["5xx"] += 1
+            if match.group("limit_req") not in ("-", "", "PASSED"):
+                limited["rate"] += 1
+            if match.group("limit_conn") not in ("-", "", "PASSED"):
+                limited["connections"] += 1
+            address = match.group("upstream")
+            # nginx emits all attempted upstreams separated by ", ".  The
+            # final address is the backend that served the response, so a
+            # Rust timeout followed by Python backup is counted correctly.
+            addresses = re.findall(r"(?:\[[^\]]+\]|[^,\s]+):\d+", address)
+            final_address = addresses[-1] if addresses else ""
+            if final_address.endswith(":2002"):
+                upstream["rust"] += 1
+            elif final_address.endswith(":2001"):
+                upstream["python_backup"] += 1
+            elif address in ("-", ""):
+                upstream["unavailable"] += 1
+            try:
+                request_times.append(float(match.group("request_time")) * 1000)
+            except ValueError:
+                pass
+    except OSError:
+        pass
+
+    try:
+        with DB_POOL.connection() as conn:
+            conn.execute("SELECT 1").fetchone()
+            pending_clubs = int(conn.execute(
+                "SELECT COUNT(*) FROM clubs WHERE seat_sync_pending=1"
+            ).fetchone()[0])
+        db_ok = True
+    except Exception:  # noqa: BLE001
+        db_ok = False
+        pending_clubs = None
+    try:
+        maintenance = bool(RG.r and RG.r.exists(K_MAINT))
+    except Exception:  # noqa: BLE001
+        maintenance = None
+    payload = {
+        "sampled_at_ms": int(now * 1000),
+        "window_seconds": METRICS_WINDOW_SECONDS,
+        "edge": {
+            "requests": requests,
+            "rps": round(requests / METRICS_WINDOW_SECONDS, 2),
+            "responses": response_counts,
+            "limited": limited,
+            "upstream": upstream,
+            "request_time_ms": {"p50": _percentile(request_times, 0.50),
+                                "p95": _percentile(request_times, 0.95)},
+        },
+        "seat_state": {
+            "redis": RG.alive(), "sqlite": db_ok,
+            "reconcile_pending": RECONCILE_REQUESTED.is_set(),
+            "maintenance": maintenance, "active_operations": RG.has_active_operations(),
+            "clubs_sync_pending": pending_clubs,
+        },
+    }
+    with METRICS_CACHE_LOCK:
+        METRICS_CACHE["created"] = now
+        METRICS_CACHE["payload"] = payload
+    return payload
+
+
+def clear_targeted_seat_pending(club_ids):
+    """Clear durable per-club repair holds while the caller owns maintenance."""
+    club_ids = tuple(sorted({int(cid) for cid in club_ids if int(cid) > 0}))
+    if not club_ids:
+        return
+    placeholders = ",".join("?" for _ in club_ids)
+    with DB_POOL.connection() as conn:
+        cur = conn.cursor()
+        conn.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE clubs SET current_students=(SELECT COUNT(*) FROM registrations r "
+            "WHERE r.club_id=clubs.id), seat_sync_pending=0 "
+            "WHERE id IN ({})".format(placeholders),
+            club_ids,
+        )
+        conn.commit()
+
+
+def repair_targeted_seat_state(maintenance_token, club_ids, student_ids=()):
+    """Publish SQLite truth for a small admin-mutated seat set.
+
+    An admin mutation first marks the affected club rows ``seat_sync_pending``
+    in the same transaction as the business change.  A transient Redis error
+    therefore blocks only that club's normal registration/cancellation path;
+    it never turns one capacity edit into a global reconcile flag.  This
+    function is called while the existing maintenance fence is held, derives
+    the precise stock and selected student mirrors from SQLite, publishes them
+    in one watched Redis transaction, then clears the durable marker.
+    """
+    club_ids = tuple(sorted({int(cid) for cid in club_ids if int(cid) > 0}))
+    student_ids = tuple(sorted({int(sid) for sid in student_ids if int(sid) > 0}))
+    if not club_ids:
+        return {}
+    placeholders = ",".join("?" for _ in club_ids)
+    with DB_POOL.connection() as conn:
+        cur = conn.cursor()
+        rows = cur.execute(
+            "SELECT c.id, c.max_students, "
+            "(SELECT COUNT(*) FROM registrations r WHERE r.club_id=c.id) "
+            "FROM clubs c WHERE c.id IN ({})".format(placeholders),
+            club_ids,
+        ).fetchall()
+        if len(rows) != len(club_ids):
+            raise RuntimeError("club disappeared during targeted seat repair")
+        stocks = {int(cid): max(0, int(maximum) - int(used))
+                  for cid, maximum, used in rows}
+        registrations = {}
+        for student_id in student_ids:
+            row = cur.execute(
+                "SELECT club_id, operation_id FROM registrations WHERE student_id=?",
+                (student_id,),
+            ).fetchone()
+            registrations[student_id] = (
+                RG.reservation_value(row[0], row[1]) if row and row[1] else
+                (str(row[0]) if row else None)
+            )
+    RG.publish_admin_seat_state(maintenance_token, stocks, registrations)
+    clear_targeted_seat_pending(club_ids)
+    return stocks
 
 
 def _csv_safe(v):
@@ -872,6 +1375,8 @@ def gen_username(name, cursor, seen):
 # ==========================================================================
 def init_db():
     global DB_POOL
+    if _PH is None:
+        raise RuntimeError("缺少 argon2-cffi；为避免明文口令回退，服务拒绝启动")
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
@@ -882,12 +1387,24 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL, class TEXT NOT NULL,
                 student_id TEXT NOT NULL UNIQUE, username TEXT NOT NULL UNIQUE,
-                password TEXT NOT NULL);
+                password TEXT NOT NULL,
+                grade TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS clubs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 max_students INTEGER NOT NULL CHECK(max_students > 0),
-                current_students INTEGER DEFAULT 0);
+                current_students INTEGER DEFAULT 0,
+                description TEXT NOT NULL DEFAULT '',
+                advisor_name TEXT NOT NULL DEFAULT '',
+                meeting_time TEXT NOT NULL DEFAULT '',
+                location TEXT NOT NULL DEFAULT '',
+                image_path TEXT,
+                allowed_grades TEXT NOT NULL DEFAULT '[]',
+                allowed_classes TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 0,
+                seat_revision INTEGER NOT NULL DEFAULT 0,
+                seat_sync_pending INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS registrations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 student_id INTEGER NOT NULL, club_id INTEGER NOT NULL,
@@ -902,9 +1419,50 @@ def init_db():
                 registration_start_time TEXT,
                 admin_username TEXT DEFAULT 'admin',
                 admin_password TEXT DEFAULT NULL);
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                occurred_at INTEGER NOT NULL,
+                actor_role TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT,
+                request_id TEXT,
+                reason TEXT,
+                before_json TEXT,
+                after_json TEXT,
+                metadata_json TEXT);
+            CREATE INDEX IF NOT EXISTS idx_audit_events_time
+                ON audit_events(occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_events_target
+                ON audit_events(target_type, target_id, occurred_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_request
+                ON audit_events(actor_role, actor_id, action, request_id)
+                WHERE request_id IS NOT NULL;
             """
         )
         conn.execute("BEGIN IMMEDIATE")
+        def ensure_column(table, name, definition):
+            cur.execute("PRAGMA table_info({})".format(table))
+            if name not in {row[1] for row in cur.fetchall()}:
+                cur.execute("ALTER TABLE {} ADD COLUMN {}".format(table, definition))
+
+        ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")
+        for name, definition in (
+            ("description", "description TEXT NOT NULL DEFAULT ''"),
+            ("advisor_name", "advisor_name TEXT NOT NULL DEFAULT ''"),
+            ("meeting_time", "meeting_time TEXT NOT NULL DEFAULT ''"),
+            ("location", "location TEXT NOT NULL DEFAULT ''"),
+            ("image_path", "image_path TEXT"),
+            ("allowed_grades", "allowed_grades TEXT NOT NULL DEFAULT '[]'"),
+            ("allowed_classes", "allowed_classes TEXT NOT NULL DEFAULT '[]'"),
+            ("enabled", "enabled INTEGER NOT NULL DEFAULT 1"),
+            ("revision", "revision INTEGER NOT NULL DEFAULT 0"),
+            ("seat_revision", "seat_revision INTEGER NOT NULL DEFAULT 0"),
+            ("seat_sync_pending", "seat_sync_pending INTEGER NOT NULL DEFAULT 0"),
+        ):
+            ensure_column("clubs", name, definition)
         # 旧库在线迁移:operation_id 用来让 Redis confirm/cancel 精确匹配同一代操作。
         cur.execute("PRAGMA table_info(registrations)")
         if "operation_id" not in {r[1] for r in cur.fetchall()}:
@@ -967,6 +1525,50 @@ def init_db():
             BEGIN
               SELECT RAISE(ABORT, 'invalid club capacity');
             END
+            """
+        )
+        cur.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS clubs_capacity_registration_guard
+            BEFORE UPDATE OF max_students ON clubs
+            FOR EACH ROW WHEN NEW.max_students <
+                (SELECT COUNT(*) FROM registrations WHERE club_id = OLD.id)
+            BEGIN
+              SELECT RAISE(ABORT, 'club capacity below registrations');
+            END
+            """
+        )
+        cur.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS audit_events_append_only_update
+            BEFORE UPDATE ON audit_events
+            BEGIN
+              SELECT RAISE(ABORT, 'audit events are append-only');
+            END
+            """
+        )
+        cur.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS audit_events_append_only_delete
+            BEFORE DELETE ON audit_events
+            BEGIN
+              SELECT RAISE(ABORT, 'audit events are append-only');
+            END
+            """
+        )
+        cur.execute(
+            """
+            UPDATE students
+            SET grade = CASE
+                WHEN class LIKE '高一%' THEN '高一'
+                WHEN class LIKE '高二%' THEN '高二'
+                WHEN class LIKE '高三%' THEN '高三'
+                WHEN class LIKE '初一%' THEN '初一'
+                WHEN class LIKE '初二%' THEN '初二'
+                WHEN class LIKE '初三%' THEN '初三'
+                ELSE grade
+            END
+            WHERE grade = ''
             """
         )
         # 初始化 settings
@@ -1070,6 +1672,12 @@ def rebuild_stock(maintenance_token=None):
             pipe.set(K_OPENAT, open_at_epoch)
         pipe.set(K_INIT, "1")
         pipe.execute()
+        # A full maintenance-fenced rebuild is authoritative for every club,
+        # including a club that was deliberately held out after an interrupted
+        # targeted admin sync.  Clear those durable per-club holds only after
+        # the Redis EXEC has actually committed.
+        with DB_POOL.connection() as conn:
+            conn.execute("UPDATE clubs SET seat_sync_pending=0 WHERE seat_sync_pending=1")
         RG.cache_del(K_CACHE_CLUBS)
         log.info("Redis 名额已重建: %d 个社团", len(rows))
         return True
@@ -1128,6 +1736,9 @@ GET_ROUTES = {
     "/api/export_students_csv": ("_h_export_students_csv", ROLE_ADMIN),
     "/api/export_all_data": ("_h_export_all_data", ROLE_ADMIN),
     "/api/export_unregistered": ("_h_export_unregistered", ROLE_ADMIN),
+    "/api/admin/audit_events": ("_h_audit_events", ROLE_ADMIN),
+    "/api/admin/operations_snapshot": ("_h_operations_snapshot", ROLE_ADMIN),
+    "/api/admin/preflight_plan": ("_h_preflight_plan", ROLE_ADMIN),
 }
 POST_ROUTES = {
     "/api/login": ("_h_login", ROLE_PUBLIC),
@@ -1144,6 +1755,15 @@ POST_ROUTES = {
     "/api/delete_all_students": ("_h_delete_all_students", ROLE_ADMIN),
     "/api/delete_club": ("_h_delete_club", ROLE_ADMIN),
     "/api/delete_all_clubs": ("_h_delete_all_clubs", ROLE_ADMIN),
+    "/api/admin/reset_student_password": ("_h_reset_student_password", ROLE_ADMIN),
+    "/api/update_club": ("_h_update_club", ROLE_ADMIN),
+    "/api/admin/assign_registration": ("_h_admin_assign_registration", ROLE_ADMIN),
+    "/api/admin/remove_registration": ("_h_admin_remove_registration", ROLE_ADMIN),
+    "/api/admin/transfer_registration": ("_h_admin_transfer_registration", ROLE_ADMIN),
+    "/api/remove_club_image": ("_h_remove_club_image", ROLE_ADMIN),
+}
+RAW_POST_ROUTES = {
+    "/api/upload_club_image": ("_h_upload_club_image", ROLE_ADMIN),
 }
 WEB_DIR = os.environ.get("WEB_DIR", "web")  # 前端资源目录
 PAGES = {
@@ -1257,7 +1877,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return False
         return sess
 
-    def _read_raw_body(self):
+    def _read_raw_body(self, max_bytes=None):
         """Consume one complete POST body before any route/auth early return.
 
         `BaseHTTPRequestHandler` keeps the TCP connection alive by default.
@@ -1279,7 +1899,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             raise RequestBodyError("非法 Content-Length")
         n = int(length)
-        if n > MAX_BODY:
+        limit = MAX_BODY if max_bytes is None else min(MAX_BODY, int(max_bytes))
+        if n > limit:
             self.close_connection = True
             raise RequestBodyError("请求体过大", status=413)
         try:
@@ -1325,6 +1946,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                   "webp": "image/webp", "svg": "image/svg+xml"}.get(ext)
             if mt:
                 return self._serve_static((path[1:], mt))
+        if path.startswith("/club-images/"):
+            return self._serve_club_image(path)
         route = GET_ROUTES.get(path)
         if route is None and path.startswith("/api/export_club_data"):
             route = ("_h_export_club_data", ROLE_ADMIN)
@@ -1341,12 +1964,25 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             self._json(500, {"success": False, "message": "服务器错误"})
 
     def do_POST(self):
-        try:
-            raw = self._read_raw_body()
-        except RequestBodyError as e:
-            return self._json(e.status, {"success": False, "message": "请求格式错误: {}".format(e)})
         path = self.path.split("?")[0]
         route = POST_ROUTES.get(path)
+        raw_route = RAW_POST_ROUTES.get(path)
+        try:
+            raw = self._read_raw_body(
+                MAX_CLUB_IMAGE_BYTES if raw_route is not None else None
+            )
+        except RequestBodyError as e:
+            return self._json(e.status, {"success": False, "message": "请求格式错误: {}".format(e)})
+        if raw_route is not None:
+            name, role = raw_route
+            sess = self._require(role)
+            if sess is False:
+                return
+            try:
+                return getattr(self, name)(sess, raw)
+            except Exception as e:  # noqa: BLE001
+                log.exception("raw POST %s 处理异常: %s", path, e)
+                return self._json(500, {"success": False, "message": "服务器错误"})
         if route is None:
             return self._json(404, {"success": False, "message": "未找到"})
         name, role = route
@@ -1406,6 +2042,38 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         except OSError:
             return self._json(404, {"success": False, "message": "资源不存在"})
         self._send(200, body, ctype=ctype, extra=[("Cache-Control", "public, max-age=300")])
+
+    def _serve_club_image(self, path):
+        target = _club_image_disk_path(path)
+        match = _CLUB_IMAGE_NAME.fullmatch(os.path.basename(target or ""))
+        content_type = {
+            "gif": "image/gif", "jpg": "image/jpeg", "png": "image/png", "webp": "image/webp",
+        }.get(match.group("ext") if match else "")
+        if not target or not content_type:
+            return self._json(404, {"success": False, "message": "资源不存在"})
+        # A managed object is public only while a current club row references
+        # it.  This makes a removed/deleted club image immediately unavailable
+        # even if disk cleanup is delayed by a transient filesystem error.
+        try:
+            with DB_POOL.connection() as conn:
+                referenced = conn.execute(
+                    "SELECT 1 FROM clubs WHERE image_path=? LIMIT 1", (path,)
+                ).fetchone() is not None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("社团图片引用检查失败 path=%s error=%s", path, exc)
+            referenced = False
+        if not referenced:
+            return self._json(404, {"success": False, "message": "资源不存在"})
+        try:
+            descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as source:
+                body = source.read(MAX_CLUB_IMAGE_OUTPUT_BYTES + 1)
+        except OSError:
+            return self._json(404, {"success": False, "message": "资源不存在"})
+        if len(body) > MAX_CLUB_IMAGE_OUTPUT_BYTES:
+            return self._json(404, {"success": False, "message": "资源不存在"})
+        self._send(200, body, ctype=content_type,
+                   extra=[("Cache-Control", "public, max-age=31536000, immutable")])
 
     # ======================================================================
     # 公共端点
@@ -1484,7 +2152,12 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         try:
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT id, name, max_students, current_students FROM clubs ORDER BY id")
+                cur.execute(
+                    "SELECT id, name, max_students, current_students, description, advisor_name, "
+                "meeting_time, location, image_path, allowed_grades, allowed_classes, enabled, revision, "
+                "seat_sync_pending "
+                "FROM clubs ORDER BY id"
+                )
                 rows = cur.fetchall()
         except Exception as e:  # noqa: BLE001
             log.error("get_clubs 失败: %s", e)
@@ -1492,13 +2165,25 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         ids = [r[0] for r in rows]
         live = RG.stock_left(ids)  # 实时名额(Redis 实时);None 则回落 current_students
         data = []
-        for cid, name, maxs, cur_s in rows:
+        for (cid, name, maxs, cur_s, description, advisor_name, meeting_time,
+             location, image_path, allowed_grades, allowed_classes, enabled, revision,
+             seat_sync_pending) in rows:
             if live is not None and live.get(cid) is not None:
                 used = maxs - live[cid]
             else:
                 used = cur_s
-            data.append({"id": cid, "name": name, "max_students": maxs,
-                         "current_students": max(0, min(maxs, used))})
+            data.append({
+                "id": cid, "name": name, "max_students": maxs,
+                "current_students": max(0, min(maxs, used)),
+                "description": description, "advisor_name": advisor_name,
+                "meeting_time": meeting_time, "location": location,
+                "image_path": image_path,
+                "allowed_grades": stored_text_list(allowed_grades),
+                "allowed_classes": stored_text_list(allowed_classes),
+                "enabled": bool(enabled),
+                "revision": revision,
+                "seat_sync_pending": bool(seat_sync_pending),
+            })
         self._json(200, data)
 
     def _h_login(self, sess, data):
@@ -1673,17 +2358,30 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
 
         # `stock:club:{id}` is intentionally absent for a nonexistent club.
         # Distinguish that normal business rejection from a missing Redis key
-        # for a real club before entering the acquire/reconcile protocol.
+        # for a real club before entering the acquire/reconcile protocol and
+        # apply the same admission restrictions exposed by the admin API.
         try:
             with DB_POOL.connection() as conn:
-                club_exists = conn.execute(
-                    "SELECT EXISTS(SELECT 1 FROM clubs WHERE id = ?)", (club_id,)
-                ).fetchone()[0]
+                club = conn.execute(
+                    "SELECT c.enabled, c.allowed_grades, c.allowed_classes, c.seat_sync_pending, s.grade, s.class "
+                    "FROM clubs c JOIN students s ON s.id=? WHERE c.id=?",
+                    (sid, club_id),
+                ).fetchone()
         except Exception as e:  # noqa: BLE001
             log.error("报名社团存在性检查失败 sid=%s club=%s: %s", sid, club_id, e)
             return self._json(503, {"success": False, "message": "系统繁忙,请稍后重试"})
-        if not club_exists:
+        if not club:
             return self._json(200, {"success": False, "message": "社团不存在"})
+        enabled, allowed_grades, allowed_classes, seat_sync_pending, grade, klass = club
+        if not enabled:
+            return self._json(200, {"success": False, "message": "该社团当前未开放报名"})
+        if seat_sync_pending:
+            return self._json(503, {"success": False,
+                                    "message": "该社团名额正在同步，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        eligible, reason = student_matches_restrictions(grade, klass, allowed_grades, allowed_classes)
+        if not eligible:
+            return self._json(200, {"success": False, "message": reason})
 
         operation_id = secrets.token_urlsafe(18)
         reservation_value = RG.reservation_value(club_id, operation_id)
@@ -1720,6 +2418,46 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()
                 conn.execute("BEGIN IMMEDIATE")
+                # The precheck above keeps bad requests out of Redis, but an
+                # administrator can change eligibility/enablement after it and
+                # before this writer transaction.  Re-check in the final
+                # SQLite transaction just as Rust does; otherwise Python
+                # fallback could admit one stale request after a policy edit.
+                admission = cur.execute(
+                    "SELECT c.enabled, c.seat_sync_pending, c.allowed_grades, c.allowed_classes, "
+                    "s.grade, s.class FROM clubs c JOIN students s ON s.id=? WHERE c.id=?",
+                    (sid, club_id),
+                ).fetchone()
+                admission_message = None
+                admission_status = 200
+                if not admission:
+                    admission_message = "社团不存在"
+                elif not admission[0]:
+                    admission_message = "该社团当前未开放报名"
+                elif admission[1]:
+                    admission_message = "该社团名额正在同步，请稍后重试"
+                    admission_status = 503
+                else:
+                    eligible, restriction_message = student_matches_restrictions(
+                        admission[4], admission[5], admission[2], admission[3]
+                    )
+                    if not eligible:
+                        admission_message = restriction_message
+                if admission_message:
+                    conn.rollback()
+                    try:
+                        RG.rollback_reservation(sid, club_id, reservation_value)
+                    except RuntimeError as rollback_error:
+                        log.error("报名策略变更后回滚失败 sid=%s op=%s: %s",
+                                  sid, operation_id, rollback_error)
+                        RECONCILE_REQUESTED.set()
+                        return self._json(503, {"success": False,
+                                                "message": "名额状态暂不可用，请稍后重试"})
+                    return self._json(
+                        admission_status,
+                        {"success": False, "message": admission_message},
+                        extra=[("Retry-After", "2")] if admission_status == 503 else None,
+                    )
                 cur.execute(
                     "INSERT INTO registrations "
                     "(student_id, club_id, registration_time, operation_id) VALUES (?,?,?,?)",
@@ -1727,6 +2465,14 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 registration_id = cur.lastrowid
                 cur.execute("UPDATE clubs SET current_students = current_students + 1 WHERE id = ?",
                             (club_id,))
+                append_audit_event(
+                    cur, event_id="registration-" + operation_id,
+                    actor_role="student", actor_id=sid, action="registration.created",
+                    target_type="registration", target_id=registration_id,
+                    before={"registered_club_id": None},
+                    after={"registration_id": registration_id, "club_id": club_id},
+                    metadata={"operation_id": operation_id},
+                )
                 conn.commit()
             try:
                 confirmed = RG.confirm_seat(sid, reservation_value)
@@ -1787,6 +2533,23 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
 
     def _h_cancel_registration(self, sess, data):
         sid = sess["student_id"]
+        # Per-club targeted repair is deliberately narrower than a global
+        # reconcile.  Read before taking the student operation lease: if an
+        # admin update starts after this read, its maintenance marker wins;
+        # if our lease wins, the admin maintenance acquisition observes it.
+        try:
+            with DB_POOL.connection() as conn:
+                pending = conn.execute(
+                    "SELECT c.seat_sync_pending FROM registrations r "
+                    "JOIN clubs c ON c.id=r.club_id WHERE r.student_id=?", (sid,)
+                ).fetchone()
+        except Exception as e:  # noqa: BLE001
+            log.error("退选同步状态检查失败 sid=%s: %s", sid, e)
+            return self._json(503, {"success": False, "message": "系统繁忙，请稍后重试"})
+        if pending and pending[0]:
+            return self._json(503, {"success": False,
+                                    "message": "该社团名额正在同步，请稍后重试"},
+                              extra=[("Retry-After", "2")])
         operation_lock = RG.begin_student_op(sid)
         if not operation_lock:
             return self._json(503, {"success": False,
@@ -1810,6 +2573,21 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     conn.rollback()
                     return self._json(200, {"success": False, "message": "您还未报名任何社团"})
                 registration_id, club_id, operation_id = reg
+                # Repeat the club-local hold check inside the same writer
+                # transaction as DELETE.  The outer read prevents needless
+                # work, while this one closes the race with a just-committed
+                # admin capacity/adjustment whose Redis repair is pending.
+                pending = cur.execute(
+                    "SELECT seat_sync_pending FROM clubs WHERE id=?", (club_id,)
+                ).fetchone()
+                if not pending:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "社团不存在"})
+                if pending[0]:
+                    conn.rollback()
+                    return self._json(503, {"success": False,
+                                            "message": "该社团名额正在同步，请稍后重试"},
+                                      extra=[("Retry-After", "2")])
                 cur.execute("DELETE FROM registrations WHERE student_id = ?", (sid,))
                 if cur.rowcount != 1:
                     conn.rollback()
@@ -1817,6 +2595,15 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 cur.execute(
                     "UPDATE clubs SET current_students = MAX(0, current_students - 1) WHERE id = ?",
                     (club_id,))
+                event_suffix = operation_id or "legacy-{}".format(registration_id)
+                append_audit_event(
+                    cur, event_id="registration-cancel-" + event_suffix,
+                    actor_role="student", actor_id=sid, action="registration.cancelled",
+                    target_type="registration", target_id=registration_id,
+                    before={"registration_id": registration_id, "club_id": club_id},
+                    after={"registered_club_id": None},
+                    metadata={"operation_id": operation_id} if operation_id else {},
+                )
                 conn.commit()
             except sqlite3.Error as e:
                 conn.rollback()
@@ -1870,7 +2657,16 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             # token between revoke and UPDATE.
             RG.session_revoke_identity("student", str(sid))
             with DB_POOL.connection() as conn:
-                conn.execute("UPDATE students SET password = ? WHERE id = ?", (new_hash, sid))
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                cur.execute("UPDATE students SET password = ? WHERE id = ?", (new_hash, sid))
+                append_audit_event(
+                    cur, event_id="student-password-change-" + secrets.token_urlsafe(18),
+                    actor_role="student", actor_id=sid, action="student.password_changed",
+                    target_type="student", target_id=sid,
+                    before=None, after={"password_changed": True},
+                )
+                conn.commit()
             self._json(200, {"success": True, "message": "密码已修改,请重新登录"},
                        extra=[self._clear_cookie()])
         except RuntimeError:
@@ -1911,14 +2707,855 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         try:
             RG.session_revoke_identity("admin", uname)
             with DB_POOL.connection() as conn:
-                conn.execute("UPDATE settings SET admin_password = ? WHERE id = ?",
-                             (new_hash, row[0]))
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                cur.execute("UPDATE settings SET admin_password = ? WHERE id = ?", (new_hash, row[0]))
+                append_audit_event(
+                    cur, event_id="admin-password-change-" + secrets.token_urlsafe(18),
+                    actor_role="admin", actor_id=uname, action="admin.password_changed",
+                    target_type="settings", target_id=row[0],
+                    before=None, after={"password_changed": True},
+                )
+                conn.commit()
             self._json(200, {"success": True, "message": "管理员密码已修改,请重新登录"},
                        extra=[self._clear_cookie()])
         except RuntimeError:
             self._json(503, {"success": False, "message": "会话服务不可用,请稍后重试"})
         finally:
             RG.session_end_mutation(mutation_lock)
+
+    def _h_reset_student_password(self, sess, data):
+        student_id = data.get("student_id")
+        try:
+            student_id = int(student_id)
+        except (TypeError, ValueError):
+            return self._json(400, {"success": False, "message": "缺少或非法的学生ID"})
+        request_id = admin_request_id(data)
+        if request_id is None:
+            return self._json(400, {"success": False, "message": "request_id 格式错误"})
+        reason = clean_text(data.get("reason"), maxlen=400)
+        if not reason:
+            return self._json(400, {"success": False, "message": "重置原因格式错误"})
+        actor = sess.get("username", "admin")
+        with DB_POOL.connection() as conn:
+            replay = conn.execute(
+                "SELECT event_id, target_id FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                "AND action='student.password_reset' AND request_id=?",
+                (actor, request_id),
+            ).fetchone()
+            student = conn.execute("SELECT id, username, name FROM students WHERE id=?", (student_id,)).fetchone()
+        if replay:
+            if str(replay[1]) != str(student_id):
+                return self._json(409, {"success": False,
+                                        "message": "request_id 已用于其他学生的密码重置"})
+            return self._json(200, {"success": True, "replayed": True, "event_id": replay[0],
+                                    "request_id": request_id,
+                                    "message": "该重置请求已执行；临时密码不会再次显示"})
+        if not student:
+            return self._json(404, {"success": False, "message": "学生不存在"})
+        if not AUTH_SLOTS.acquire(timeout=1.0):
+            return self._json(503, {"success": False, "message": "密码服务繁忙，请稍后重试"})
+        try:
+            temporary_password = gen_password(length=12)
+            password_hash = hash_password(temporary_password)
+        finally:
+            AUTH_SLOTS.release()
+        try:
+            mutation_lock = RG.session_begin_mutation("student", str(student_id))
+        except RuntimeError:
+            return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+        if not mutation_lock:
+            return self._json(503, {"success": False, "message": "账号状态正在更新，请稍后重试"})
+        event_id = "password-reset-" + secrets.token_urlsafe(18)
+        try:
+            RG.session_revoke_identity("student", str(student_id))
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                row = cur.execute("SELECT username, name FROM students WHERE id=?", (student_id,)).fetchone()
+                if not row:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "学生不存在"})
+                cur.execute("UPDATE students SET password=? WHERE id=?", (password_hash, student_id))
+                append_audit_event(
+                    cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                    action="student.password_reset", target_type="student", target_id=student_id,
+                    request_id=request_id, reason=reason,
+                    before={"username": row[0], "name": row[1]}, after={"password_reset": True},
+                )
+                conn.commit()
+            self._json(200, {
+                "success": True, "event_id": event_id, "request_id": request_id,
+                "student_id": student_id, "username": student[1],
+                "temporary_password": temporary_password,
+                "message": "临时密码仅显示一次，请立即安全交付给学生",
+            }, extra=[("Cache-Control", "no-store")])
+        except sqlite3.IntegrityError:
+            return self._json(409, {"success": False, "message": "重复的重置请求"})
+        except RuntimeError:
+            return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+        finally:
+            RG.session_end_mutation(mutation_lock)
+
+    def _h_update_club(self, sess, data):
+        club_id = data.get("club_id")
+        try:
+            club_id = int(club_id)
+        except (TypeError, ValueError):
+            return self._json(400, {"success": False, "message": "缺少或非法的社团ID"})
+        request_id = admin_request_id(data)
+        reason = clean_text(data.get("reason"), maxlen=400)
+        if request_id is None or not reason:
+            return self._json(400, {"success": False, "message": "更新参数格式错误"})
+        actor = sess.get("username", "admin")
+        with DB_POOL.connection() as conn:
+            existing = conn.execute(
+                "SELECT id, name, max_students, description, advisor_name, meeting_time, location, "
+                "image_path, allowed_grades, allowed_classes, enabled, revision, seat_sync_pending "
+                "FROM clubs WHERE id=?",
+                (club_id,),
+            ).fetchone()
+            replay = conn.execute(
+                "SELECT target_id, after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                "AND action='club.updated' AND request_id=?", (actor, request_id)
+            ).fetchone()
+        if replay:
+            if str(replay[0]) != str(club_id):
+                return self._json(409, {"success": False,
+                                        "message": "request_id 已用于其他社团更新"})
+            after = json.loads(replay[1]) if replay[1] else None
+            # The original SQLite mutation may have committed just before a
+            # transient Redis failure.  Retrying the same idempotency key is a
+            # safe, targeted repair rather than another capacity change.
+            if existing and existing[12]:
+                maintenance = RG.begin_maintenance()
+                if not maintenance:
+                    return self._json(503, {"success": False,
+                                            "message": "社团更新已保存，名额仍在同步，请稍后重试"},
+                                      extra=[("Retry-After", "2")])
+                try:
+                    repair_targeted_seat_state(maintenance, (club_id,))
+                    if isinstance(after, dict):
+                        after["seat_sync_pending"] = False
+                    return self._json(200, {"success": True, "replayed": True,
+                                            "request_id": request_id, "club": after,
+                                            "seat_sync": "repaired"})
+                except RuntimeError:
+                    return self._json(503, {"success": False,
+                                            "message": "社团更新已保存，名额仍在同步，请稍后重试"},
+                                      extra=[("Retry-After", "2")])
+                finally:
+                    RG.end_maintenance(maintenance)
+            return self._json(200, {"success": True, "replayed": True, "request_id": request_id,
+                                    "club": after, "seat_sync": "not_needed"})
+        if not existing:
+            return self._json(404, {"success": False, "message": "社团不存在"})
+        (_id, old_name, old_max, old_description, old_advisor, old_meeting,
+         old_location, _old_image_path, old_grades, old_classes, old_enabled,
+         _old_revision, _old_sync_pending) = existing
+
+        def choose_text(key, old, maxlen):
+            if key not in data:
+                return old
+            value = data[key]
+            if not isinstance(value, str):
+                return None
+            return clean_text(value, maxlen=maxlen) if value.strip() else ""
+
+        name = choose_text("name", old_name, 80)
+        description = choose_text("description", old_description, 1000)
+        advisor_name = choose_text("advisor_name", old_advisor, 80)
+        meeting_time = choose_text("meeting_time", old_meeting, 120)
+        location = choose_text("location", old_location, 120)
+        if (not name or not all(value is not None
+                            for value in (description, advisor_name, meeting_time, location))):
+            return self._json(400, {"success": False, "message": "社团信息格式错误"})
+        allowed_grades = (clean_text_list(data["allowed_grades"], item_maxlen=20)
+                          if "allowed_grades" in data else strict_text_list(old_grades))
+        allowed_classes = (clean_text_list(data["allowed_classes"], item_maxlen=80)
+                           if "allowed_classes" in data else strict_text_list(old_classes))
+        if allowed_grades is None or allowed_classes is None:
+            return self._json(400, {"success": False, "message": "年级或班级限制格式错误"})
+        if "enabled" in data and type(data["enabled"]) is not bool:
+            return self._json(400, {"success": False, "message": "enabled 必须为布尔值"})
+        enabled = data.get("enabled", bool(old_enabled))
+        max_students = data.get("max_students", old_max)
+        if type(max_students) is not int or not 1 <= max_students <= MAX_CLUB_CAPACITY:
+            return self._json(400, {"success": False, "message": "社团容量格式错误"})
+        expected_revision = data.get("expected_revision")
+        if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
+            return self._json(400, {"success": False, "message": "expected_revision 格式错误"})
+
+        maintenance = RG.begin_maintenance()
+        if not maintenance:
+            return self._json(503, {"success": False, "message": "有报名请求处理中，请稍后再更新社团"})
+        db_committed = False
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                current = cur.execute(
+                    "SELECT name, max_students, description, advisor_name, meeting_time, location, "
+                    "image_path, allowed_grades, allowed_classes, enabled, revision, seat_sync_pending "
+                    "FROM clubs WHERE id=?", (club_id,)
+                ).fetchone()
+                if not current:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "社团不存在"})
+                if expected_revision is not None and current[10] != expected_revision:
+                    conn.rollback()
+                    return self._json(409, {"success": False, "message": "社团已被其他管理员修改", "revision": current[10]})
+                if current[11]:
+                    conn.rollback()
+                    return self._json(503, {"success": False,
+                                            "message": "该社团名额正在同步，请稍后重试"},
+                                      extra=[("Retry-After", "2")])
+                used = cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id=?", (club_id,)).fetchone()[0]
+                if max_students < used:
+                    conn.rollback()
+                    return self._json(400, {"success": False, "message": "新容量不能小于当前已报名人数"})
+                previous_max = int(current[1])
+                capacity_changed = max_students != previous_max
+                new_revision = int(current[10]) + 1
+                cur.execute(
+                    "UPDATE clubs SET name=?, max_students=?, description=?, advisor_name=?, meeting_time=?, "
+                    "location=?, allowed_grades=?, allowed_classes=?, enabled=?, revision=?, "
+                    "seat_revision=seat_revision + ?, seat_sync_pending=? WHERE id=?",
+                    (name, max_students, description, advisor_name, meeting_time, location,
+                     _audit_json(allowed_grades), _audit_json(allowed_classes), int(enabled),
+                     new_revision, int(capacity_changed), int(capacity_changed), club_id),
+                )
+                after = {
+                    "id": club_id, "name": name, "max_students": max_students,
+                    "current_students": used, "description": description,
+                    "advisor_name": advisor_name, "meeting_time": meeting_time,
+                    "location": location, "image_path": current[6],
+                    "allowed_grades": allowed_grades, "allowed_classes": allowed_classes,
+                    "enabled": enabled, "revision": new_revision,
+                    "seat_sync_pending": bool(capacity_changed),
+                }
+                before = {
+                    "id": club_id, "name": current[0], "max_students": current[1],
+                    "description": current[2], "advisor_name": current[3], "meeting_time": current[4],
+                    "location": current[5], "image_path": current[6],
+                    "allowed_grades": stored_text_list(current[7]),
+                    "allowed_classes": stored_text_list(current[8]), "enabled": bool(current[9]),
+                    "revision": current[10], "seat_sync_pending": bool(current[11]),
+                }
+                event_id = "club-update-" + secrets.token_urlsafe(18)
+                append_audit_event(
+                    cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                    action="club.updated", target_type="club", target_id=club_id,
+                    request_id=request_id, reason=reason, before=before, after=after,
+                    metadata={"capacity_delta": max_students - previous_max,
+                              "seat_sync_pending": bool(capacity_changed)},
+                )
+                conn.commit()
+                db_committed = True
+            seat_sync = "not_needed"
+            if capacity_changed:
+                result = RG.adjust_club_capacity(
+                    maintenance, club_id, previous_max - int(used),
+                    int(max_students) - previous_max, int(max_students) - int(used),
+                )
+                seat_sync = "incrby" if result == 1 else "targeted_repair"
+                clear_targeted_seat_pending((club_id,))
+                after["seat_sync_pending"] = False
+            else:
+                RG.cache_del(K_CACHE_CLUBS)
+            self._json(200, {"success": True, "event_id": event_id, "request_id": request_id,
+                             "club": after, "seat_sync": seat_sync})
+        except sqlite3.IntegrityError:
+            return self._json(409, {"success": False, "message": "重复的更新请求或社团名称冲突"})
+        except RuntimeError:
+            if db_committed:
+                return self._json(503, {"success": False, "event_id": event_id,
+                                        "request_id": request_id, "retriable": True,
+                                        "message": "社团信息已保存，名额同步暂不可用；请使用同一请求 ID 重试"},
+                                  extra=[("Retry-After", "2")])
+            return self._json(503, {"success": False, "request_id": request_id,
+                                    "message": "社团更新暂不可用，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        finally:
+            RG.end_maintenance(maintenance)
+
+    def _h_upload_club_image(self, sess, raw):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            club_id = int((qs.get("club_id") or [None])[0])
+            expected_revision = int((qs.get("expected_revision") or [None])[0])
+        except (TypeError, ValueError):
+            return self._json(400, {"success": False, "message": "club_id 或 expected_revision 格式错误"})
+        request_id = (qs.get("request_id") or [None])[0]
+        reason = clean_text((qs.get("reason") or [None])[0], maxlen=400)
+        if (not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", request_id)
+                or not reason or club_id <= 0 or expected_revision < 0):
+            return self._json(400, {"success": False, "message": "上传参数格式错误"})
+        actor = sess.get("username", "admin")
+        # A network retry must not spend another Pillow decode/write slot or
+        # create a second immutable object.  Bind the idempotency key to this
+        # club so a client bug cannot replay a prior image into another card.
+        with DB_POOL.connection() as conn:
+            replay = conn.execute(
+                "SELECT target_id, after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                "AND action='club.image_uploaded' AND request_id=?",
+                (actor, request_id),
+            ).fetchone()
+        if replay:
+            if str(replay[0]) != str(club_id):
+                return self._json(409, {"success": False,
+                                        "message": "request_id 已用于其他社团图片操作"})
+            return self._json(200, {"success": True, "replayed": True, "request_id": request_id,
+                                    "club": json.loads(replay[1]) if replay[1] else None})
+        if not IMAGE_PROCESS_SLOTS.acquire(timeout=1.0):
+            return self._json(503, {"success": False, "message": "图片处理繁忙，请稍后重试"})
+        try:
+            normalized, extension, content_type, width, height, frames, duration_ms = _sanitize_club_image(
+                raw, self.headers.get("Content-Type")
+            )
+        except ClubImageFeatureUnavailable as e:
+            return self._json(503, {"success": False, "message": str(e)},
+                              extra=[("Retry-After", "60")])
+        except ClubImageError as e:
+            return self._json(400, {"success": False, "message": str(e)})
+        finally:
+            IMAGE_PROCESS_SLOTS.release()
+
+        digest = hashlib.sha256(normalized).hexdigest()
+        # Never share a final object path across mutations.  Content-addressed
+        # names plus "delete on failed transaction" can otherwise let one
+        # version-conflicted upload unlink a file another request just
+        # committed.  The digest remains audit metadata, not an ownership key.
+        image_name = "{}-{}.{}".format(club_id, secrets.token_hex(16), extension)
+        image_path = "/club-images/" + image_name
+        os.makedirs(CLUB_IMAGE_DIR, mode=0o700, exist_ok=True)
+        target = _club_image_disk_path(image_path)
+        if target is None:
+            return self._json(500, {"success": False, "message": "图片存储路径异常"})
+        created_file = False
+        if not os.path.exists(target):
+            temp_path = target + "." + secrets.token_urlsafe(8) + ".tmp"
+            try:
+                with open(temp_path, "xb") as output:
+                    output.write(normalized)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temp_path, target)
+                created_file = True
+            except OSError:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                return self._json(503, {"success": False, "message": "图片保存失败，请稍后重试"})
+
+        event_id = "club-image-" + secrets.token_urlsafe(18)
+        old_image_path = None
+        db_committed = False
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                club = cur.execute(
+                    "SELECT name, max_students, description, advisor_name, meeting_time, location, "
+                    "allowed_grades, allowed_classes, enabled, image_path, revision, seat_sync_pending "
+                    "FROM clubs WHERE id=?", (club_id,)
+                ).fetchone()
+                if not club:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "社团不存在"})
+                old_image_path, revision = club[9], club[10]
+                if revision != expected_revision:
+                    conn.rollback()
+                    return self._json(409, {"success": False, "message": "社团已被其他管理员修改", "revision": revision})
+                new_revision = revision + 1
+                cur.execute("UPDATE clubs SET image_path=?, revision=? WHERE id=?", (image_path, new_revision, club_id))
+                used = cur.execute(
+                    "SELECT COUNT(*) FROM registrations WHERE club_id=?", (club_id,)
+                ).fetchone()[0]
+                after = {
+                    "id": club_id, "name": club[0], "max_students": club[1],
+                    "current_students": used, "description": club[2], "advisor_name": club[3],
+                    "meeting_time": club[4], "location": club[5], "image_path": image_path,
+                    "allowed_grades": stored_text_list(club[6]),
+                    "allowed_classes": stored_text_list(club[7]), "enabled": bool(club[8]),
+                    "revision": new_revision, "seat_sync_pending": bool(club[11]),
+                }
+                append_audit_event(
+                    cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                    action="club.image_uploaded", target_type="club", target_id=club_id,
+                    request_id=request_id, reason=reason,
+                    before={"image_path": old_image_path, "revision": revision}, after=after,
+                    metadata={"content_type": content_type, "width": width, "height": height,
+                              "frames": frames, "duration_ms": duration_ms,
+                              "sha256": digest},
+                )
+                conn.commit()
+                db_committed = True
+            if old_image_path and old_image_path != image_path:
+                _remove_managed_club_image(old_image_path)
+            self._json(200, {"success": True, "event_id": event_id, "request_id": request_id,
+                             "club": after})
+        except sqlite3.IntegrityError:
+            # Concurrent delivery of the same idempotency key can race past
+            # the cheap precheck.  Read the committed immutable result before
+            # declaring a conflict; the losing request owns a unique orphan
+            # object and its finally block will safely remove it.
+            with DB_POOL.connection() as conn:
+                replay = conn.execute(
+                    "SELECT target_id, after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                    "AND action='club.image_uploaded' AND request_id=?", (actor, request_id)
+                ).fetchone()
+            if replay and str(replay[0]) == str(club_id):
+                return self._json(200, {"success": True, "replayed": True,
+                                        "request_id": request_id,
+                                        "club": json.loads(replay[1]) if replay[1] else None})
+            return self._json(409, {"success": False, "message": "重复的图片上传请求"})
+        finally:
+            if created_file and not db_committed:
+                _remove_managed_club_image(image_path)
+
+    def _h_remove_club_image(self, sess, data):
+        try:
+            club_id = int(data.get("club_id"))
+            expected_revision = int(data.get("expected_revision"))
+        except (TypeError, ValueError):
+            return self._json(400, {"success": False, "message": "club_id 或 expected_revision 格式错误"})
+        request_id = admin_request_id(data)
+        reason = clean_text(data.get("reason"), maxlen=400)
+        if request_id is None or not reason:
+            return self._json(400, {"success": False, "message": "移除参数格式错误"})
+        actor = sess.get("username", "admin")
+        with DB_POOL.connection() as conn:
+            cur = conn.cursor()
+            conn.execute("BEGIN IMMEDIATE")
+            replay = cur.execute(
+                "SELECT target_id, after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                "AND action='club.image_removed' AND request_id=?", (actor, request_id)
+            ).fetchone()
+            if replay:
+                conn.rollback()
+                if str(replay[0]) != str(club_id):
+                    return self._json(409, {"success": False,
+                                            "message": "request_id 已用于其他社团图片操作"})
+                return self._json(200, {"success": True, "replayed": True, "request_id": request_id,
+                                        "club": json.loads(replay[1]) if replay[1] else None})
+            club = cur.execute(
+                "SELECT name, max_students, description, advisor_name, meeting_time, location, "
+                "allowed_grades, allowed_classes, enabled, image_path, revision, seat_sync_pending "
+                "FROM clubs WHERE id=?", (club_id,)
+            ).fetchone()
+            if not club:
+                conn.rollback()
+                return self._json(404, {"success": False, "message": "社团不存在"})
+            old_image_path, revision = club[9], club[10]
+            if revision != expected_revision:
+                conn.rollback()
+                return self._json(409, {"success": False, "message": "社团已被其他管理员修改", "revision": revision})
+            new_revision = revision + 1
+            cur.execute("UPDATE clubs SET image_path=NULL, revision=? WHERE id=?", (new_revision, club_id))
+            event_id = "club-image-remove-" + secrets.token_urlsafe(18)
+            used = cur.execute(
+                "SELECT COUNT(*) FROM registrations WHERE club_id=?", (club_id,)
+            ).fetchone()[0]
+            after = {
+                "id": club_id, "name": club[0], "max_students": club[1],
+                "current_students": used, "description": club[2], "advisor_name": club[3],
+                "meeting_time": club[4], "location": club[5], "image_path": None,
+                "allowed_grades": stored_text_list(club[6]),
+                "allowed_classes": stored_text_list(club[7]), "enabled": bool(club[8]),
+                "revision": new_revision, "seat_sync_pending": bool(club[11]),
+            }
+            append_audit_event(
+                cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                action="club.image_removed", target_type="club", target_id=club_id,
+                request_id=request_id, reason=reason,
+                before={"image_path": old_image_path, "revision": revision}, after=after,
+            )
+            conn.commit()
+        _remove_managed_club_image(old_image_path)
+        self._json(200, {"success": True, "event_id": event_id, "request_id": request_id,
+                         "club": after})
+
+    def _admin_registration_input(self, data, *, needs_club=True):
+        student_id = data.get("student_id")
+        club_id = data.get("club_id") if needs_club else None
+        try:
+            student_id = int(student_id)
+            if needs_club:
+                club_id = int(club_id)
+        except (TypeError, ValueError):
+            return None
+        if student_id <= 0 or (needs_club and club_id <= 0):
+            return None
+        request_id = admin_request_id(data)
+        reason = clean_text(data.get("reason"), maxlen=400)
+        if request_id is None or not reason:
+            return None
+        if "override_eligibility" in data and type(data["override_eligibility"]) is not bool:
+            return None
+        return student_id, club_id, request_id, reason, bool(data.get("override_eligibility", False))
+
+    def _h_admin_assign_registration(self, sess, data):
+        parsed = self._admin_registration_input(data)
+        if not parsed:
+            return self._json(400, {"success": False, "message": "调剂参数格式错误"})
+        student_id, club_id, request_id, reason, override_eligibility = parsed
+        actor = sess.get("username", "admin")
+        maintenance = RG.begin_maintenance()
+        if not maintenance:
+            return self._json(503, {"success": False, "message": "有报名请求处理中，请稍后调剂"})
+        db_committed = False
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                replay = cur.execute(
+                    "SELECT event_id, target_id, after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                    "AND action='registration.admin_assigned' AND request_id=?", (actor, request_id)
+                ).fetchone()
+                if replay:
+                    conn.rollback()
+                    try:
+                        recorded = json.loads(replay[2]) if replay[2] else {}
+                        if str(replay[1]) != str(student_id) or int(recorded.get("club_id")) != club_id:
+                            return self._json(409, {"success": False,
+                                                    "message": "request_id 已用于其他调剂操作"})
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        return self._json(409, {"success": False,
+                                                "message": "request_id 对应的审计记录异常"})
+                    try:
+                        repair_targeted_seat_state(maintenance, (club_id,), (student_id,))
+                    except RuntimeError:
+                        return self._json(503, {"success": False,
+                                                "message": "调剂已保存，名额仍在同步，请稍后重试"},
+                                          extra=[("Retry-After", "2")])
+                    return self._json(200, {"success": True, "replayed": True,
+                                            "event_id": replay[0], "request_id": request_id,
+                                            "seat_sync": "repaired"})
+                student = cur.execute("SELECT name, class, grade FROM students WHERE id=?", (student_id,)).fetchone()
+                club = cur.execute(
+                    "SELECT name, max_students, enabled, allowed_grades, allowed_classes, seat_sync_pending "
+                    "FROM clubs WHERE id=?",
+                    (club_id,),
+                ).fetchone()
+                if not student:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "学生不存在"})
+                if not club:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "社团不存在"})
+                if club[5]:
+                    conn.rollback()
+                    return self._json(503, {"success": False,
+                                            "message": "该社团名额正在同步，请先重试原调剂请求"},
+                                      extra=[("Retry-After", "2")])
+                if cur.execute("SELECT 1 FROM registrations WHERE student_id=?", (student_id,)).fetchone():
+                    conn.rollback()
+                    return self._json(409, {"success": False, "message": "该学生已报名其他社团"})
+                eligible, ineligible_reason = student_matches_restrictions(student[2], student[1], club[3], club[4])
+                if (not club[2] or not eligible) and not override_eligibility:
+                    conn.rollback()
+                    return self._json(400, {"success": False,
+                                            "message": ineligible_reason or "该社团当前未开放报名"})
+                used = cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id=?", (club_id,)).fetchone()[0]
+                if used >= club[1]:
+                    conn.rollback()
+                    return self._json(400, {"success": False, "message": "该社团已满员"})
+                operation_id = "admin-" + secrets.token_urlsafe(18)
+                cur.execute(
+                    "INSERT INTO registrations (student_id, club_id, registration_time, operation_id) VALUES (?,?,?,?)",
+                    (student_id, club_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), operation_id),
+                )
+                registration_id = cur.lastrowid
+                cur.execute("UPDATE clubs SET current_students=current_students+1 WHERE id=?", (club_id,))
+                cur.execute("UPDATE clubs SET seat_sync_pending=1 WHERE id=?", (club_id,))
+                event_id = "admin-assign-" + secrets.token_urlsafe(18)
+                append_audit_event(
+                    cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                    action="registration.admin_assigned", target_type="student", target_id=student_id,
+                    request_id=request_id, reason=reason, before={"registered_club_id": None},
+                    after={"registration_id": registration_id, "club_id": club_id,
+                           "operation_id": operation_id},
+                    metadata={"override_eligibility": override_eligibility},
+                )
+                conn.commit()
+                db_committed = True
+            repair_targeted_seat_state(maintenance, (club_id,), (student_id,))
+            self._json(200, {"success": True, "event_id": event_id, "request_id": request_id,
+                             "registration_id": registration_id, "club_id": club_id,
+                             "seat_sync": "applied"})
+        except RuntimeError:
+            if db_committed:
+                return self._json(503, {"success": False, "event_id": event_id,
+                                        "request_id": request_id, "retriable": True,
+                                        "message": "调剂已保存，名额仍在同步；请使用同一请求 ID 重试"},
+                                  extra=[("Retry-After", "2")])
+            return self._json(503, {"success": False,
+                                    "request_id": request_id,
+                                    "message": "调剂暂不可用，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        except sqlite3.IntegrityError:
+            return self._json(409, {"success": False, "message": "调剂请求冲突"})
+        finally:
+            RG.end_maintenance(maintenance)
+
+    def _h_admin_remove_registration(self, sess, data):
+        parsed = self._admin_registration_input(data, needs_club=False)
+        if not parsed:
+            return self._json(400, {"success": False, "message": "调剂参数格式错误"})
+        student_id, _club_id, request_id, reason, _override = parsed
+        actor = sess.get("username", "admin")
+        maintenance = RG.begin_maintenance()
+        if not maintenance:
+            return self._json(503, {"success": False, "message": "有报名请求处理中，请稍后调剂"})
+        db_committed = False
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                replay = cur.execute(
+                    "SELECT event_id, target_id FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                    "AND action='registration.admin_removed' AND request_id=?", (actor, request_id)
+                ).fetchone()
+                if replay:
+                    conn.rollback()
+                    if str(replay[1]) != str(student_id):
+                        return self._json(409, {"success": False,
+                                                "message": "request_id 已用于其他调剂操作"})
+                    # A successful remove leaves no registration; the audit
+                    # event carries the source club, so fetch it from its
+                    # immutable before snapshot for targeted replay repair.
+                    event = cur.execute(
+                        "SELECT before_json FROM audit_events WHERE event_id=?", (replay[0],)
+                    ).fetchone()
+                    try:
+                        before = json.loads(event[0]) if event and event[0] else {}
+                        source_club_id = int(before.get("club_id"))
+                        repair_targeted_seat_state(
+                            maintenance, (source_club_id,), (student_id,)
+                        )
+                    except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+                        return self._json(503, {"success": False,
+                                                "message": "调剂已保存，名额仍在同步，请稍后重试"},
+                                          extra=[("Retry-After", "2")])
+                    return self._json(200, {"success": True, "replayed": True,
+                                            "event_id": replay[0], "request_id": request_id,
+                                            "seat_sync": "repaired"})
+                registration = cur.execute(
+                    "SELECT id, club_id, operation_id FROM registrations WHERE student_id=?", (student_id,)
+                ).fetchone()
+                if not registration:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "该学生未报名任何社团"})
+                registration_id, club_id, operation_id = registration
+                sync_pending = cur.execute(
+                    "SELECT seat_sync_pending FROM clubs WHERE id=?", (club_id,)
+                ).fetchone()
+                if not sync_pending:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "原社团不存在"})
+                if sync_pending[0]:
+                    conn.rollback()
+                    return self._json(503, {"success": False,
+                                            "message": "该社团名额正在同步，请先重试原调剂请求"},
+                                      extra=[("Retry-After", "2")])
+                cur.execute("DELETE FROM registrations WHERE id=? AND student_id=?", (registration_id, student_id))
+                cur.execute("UPDATE clubs SET current_students=MAX(0,current_students-1) WHERE id=?", (club_id,))
+                cur.execute("UPDATE clubs SET seat_sync_pending=1 WHERE id=?", (club_id,))
+                event_id = "admin-remove-" + secrets.token_urlsafe(18)
+                append_audit_event(
+                    cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                    action="registration.admin_removed", target_type="student", target_id=student_id,
+                    request_id=request_id, reason=reason,
+                    before={"registration_id": registration_id, "club_id": club_id,
+                            "operation_id": operation_id}, after={"registered_club_id": None},
+                )
+                conn.commit()
+                db_committed = True
+            repair_targeted_seat_state(maintenance, (club_id,), (student_id,))
+            self._json(200, {"success": True, "event_id": event_id, "request_id": request_id,
+                             "registration_id": registration_id, "club_id": club_id,
+                             "seat_sync": "applied"})
+        except RuntimeError:
+            if db_committed:
+                return self._json(503, {"success": False, "event_id": event_id,
+                                        "request_id": request_id, "retriable": True,
+                                        "message": "调剂已保存，名额仍在同步；请使用同一请求 ID 重试"},
+                                  extra=[("Retry-After", "2")])
+            return self._json(503, {"success": False,
+                                    "request_id": request_id,
+                                    "message": "调剂暂不可用，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        finally:
+            RG.end_maintenance(maintenance)
+
+    def _h_admin_transfer_registration(self, sess, data):
+        parsed = self._admin_registration_input(data)
+        if not parsed:
+            return self._json(400, {"success": False, "message": "调剂参数格式错误"})
+        student_id, target_club_id, request_id, reason, override_eligibility = parsed
+        actor = sess.get("username", "admin")
+        maintenance = RG.begin_maintenance()
+        if not maintenance:
+            return self._json(503, {"success": False, "message": "有报名请求处理中，请稍后调剂"})
+        db_committed = False
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                replay = cur.execute(
+                    "SELECT event_id, target_id, after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                    "AND action='registration.admin_transferred' AND request_id=?", (actor, request_id)
+                ).fetchone()
+                if replay:
+                    conn.rollback()
+                    event = cur.execute(
+                        "SELECT before_json, after_json FROM audit_events WHERE event_id=?", (replay[0],)
+                    ).fetchone()
+                    try:
+                        before = json.loads(event[0]) if event and event[0] else {}
+                        after = json.loads(event[1]) if event and event[1] else {}
+                        if str(replay[1]) != str(student_id) or int(after.get("club_id")) != target_club_id:
+                            return self._json(409, {"success": False,
+                                                    "message": "request_id 已用于其他调剂操作"})
+                        repair_targeted_seat_state(
+                            maintenance, (int(before.get("club_id")), int(after.get("club_id"))),
+                            (student_id,),
+                        )
+                    except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+                        return self._json(503, {"success": False,
+                                                "message": "调剂已保存，名额仍在同步，请稍后重试"},
+                                          extra=[("Retry-After", "2")])
+                    return self._json(200, {"success": True, "replayed": True,
+                                            "event_id": replay[0], "request_id": request_id,
+                                            "seat_sync": "repaired"})
+                student = cur.execute("SELECT class, grade FROM students WHERE id=?", (student_id,)).fetchone()
+                registration = cur.execute(
+                    "SELECT id, club_id, operation_id FROM registrations WHERE student_id=?", (student_id,)
+                ).fetchone()
+                target = cur.execute(
+                    "SELECT max_students, enabled, allowed_grades, allowed_classes, seat_sync_pending "
+                    "FROM clubs WHERE id=?",
+                    (target_club_id,),
+                ).fetchone()
+                if not student:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "学生不存在"})
+                if not registration:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "该学生未报名任何社团"})
+                if not target:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "目标社团不存在"})
+                registration_id, source_club_id, old_operation_id = registration
+                if source_club_id == target_club_id:
+                    conn.rollback()
+                    return self._json(400, {"success": False, "message": "学生已在目标社团"})
+                source_pending = cur.execute(
+                    "SELECT seat_sync_pending FROM clubs WHERE id=?", (source_club_id,)
+                ).fetchone()
+                if not source_pending:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "原社团不存在"})
+                if source_pending[0] or target[4]:
+                    conn.rollback()
+                    return self._json(503, {"success": False,
+                                            "message": "相关社团名额正在同步，请先重试原调剂请求"},
+                                      extra=[("Retry-After", "2")])
+                eligible, ineligible_reason = student_matches_restrictions(student[1], student[0], target[2], target[3])
+                if (not target[1] or not eligible) and not override_eligibility:
+                    conn.rollback()
+                    return self._json(400, {"success": False,
+                                            "message": ineligible_reason or "目标社团当前未开放报名"})
+                target_used = cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id=?", (target_club_id,)).fetchone()[0]
+                if target_used >= target[0]:
+                    conn.rollback()
+                    return self._json(400, {"success": False, "message": "目标社团已满员"})
+                new_operation_id = "admin-" + secrets.token_urlsafe(18)
+                cur.execute(
+                    "UPDATE registrations SET club_id=?, registration_time=?, operation_id=? WHERE id=?",
+                    (target_club_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                     new_operation_id, registration_id),
+                )
+                cur.execute("UPDATE clubs SET current_students=current_students-1 WHERE id=?", (source_club_id,))
+                cur.execute("UPDATE clubs SET current_students=current_students+1 WHERE id=?", (target_club_id,))
+                cur.execute(
+                    "UPDATE clubs SET seat_sync_pending=1 WHERE id IN (?,?)",
+                    (source_club_id, target_club_id),
+                )
+                event_id = "admin-transfer-" + secrets.token_urlsafe(18)
+                append_audit_event(
+                    cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                    action="registration.admin_transferred", target_type="student", target_id=student_id,
+                    request_id=request_id, reason=reason,
+                    before={"registration_id": registration_id, "club_id": source_club_id,
+                            "operation_id": old_operation_id},
+                    after={"registration_id": registration_id, "club_id": target_club_id,
+                           "operation_id": new_operation_id},
+                    metadata={"override_eligibility": override_eligibility},
+                )
+                conn.commit()
+                db_committed = True
+            repair_targeted_seat_state(
+                maintenance, (source_club_id, target_club_id), (student_id,)
+            )
+            self._json(200, {"success": True, "event_id": event_id, "request_id": request_id,
+                             "registration_id": registration_id, "from_club_id": source_club_id,
+                             "to_club_id": target_club_id, "seat_sync": "applied"})
+        except RuntimeError:
+            if db_committed:
+                return self._json(503, {"success": False, "event_id": event_id,
+                                        "request_id": request_id, "retriable": True,
+                                        "message": "调剂已保存，名额仍在同步；请使用同一请求 ID 重试"},
+                                  extra=[("Retry-After", "2")])
+            return self._json(503, {"success": False,
+                                    "request_id": request_id,
+                                    "message": "调剂暂不可用，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        finally:
+            RG.end_maintenance(maintenance)
+
+    def _h_audit_events(self, sess):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            cursor = int((qs.get("cursor") or ["0"])[0])
+            limit = int((qs.get("limit") or ["50"])[0])
+        except ValueError:
+            return self._json(400, {"success": False, "message": "cursor 或 limit 格式错误"})
+        if cursor < 0 or not 1 <= limit <= 100:
+            return self._json(400, {"success": False, "message": "cursor 或 limit 超出范围"})
+        with DB_POOL.connection() as conn:
+            rows = conn.execute(
+                "SELECT id,event_id,occurred_at,actor_role,actor_id,action,target_type,target_id,"
+                "request_id,reason,before_json,after_json,metadata_json FROM audit_events "
+                "WHERE (?=0 OR id<?) ORDER BY id DESC LIMIT ?",
+                (cursor, cursor, limit),
+            ).fetchall()
+        events = [{
+            "id": row[0], "event_id": row[1], "occurred_at": row[2],
+            "actor_role": row[3], "actor_id": row[4], "action": row[5],
+            "target_type": row[6], "target_id": row[7], "request_id": row[8],
+            "reason": row[9], "before": json.loads(row[10]) if row[10] else None,
+            "after": json.loads(row[11]) if row[11] else None,
+            "metadata": json.loads(row[12]) if row[12] else None,
+        } for row in rows]
+        self._json(200, {"events": events, "next_cursor": events[-1]["id"] if events else None},
+                   extra=[("Cache-Control", "no-store")])
+
+    def _h_operations_snapshot(self, sess):
+        self._json(200, operations_snapshot(), extra=[("Cache-Control", "no-store")])
+
+    def _h_preflight_plan(self, sess):
+        self._json(200, {
+            "mode": "isolated-cli-only",
+            "command": "python3 tests/stress_registration.py --seats 100 --users 1000 --concurrency 300",
+            "requirements": [
+                "使用临时 SQLite、随机 loopback Redis 与独立 Rust 端口",
+                "不得使用运行中的数据库、Redis :6379、服务入口 :8080 或真实会话",
+                "在部署机 CLI 或 CI 中执行，不从管理网页启动",
+            ],
+        }, extra=[("Cache-Control", "no-store")])
 
     def _h_get_registrations(self, sess):
         with DB_POOL.connection() as conn:
@@ -1935,9 +3572,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_get_all_students(self, sess):
         with DB_POOL.connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT id, name, class, student_id, username FROM students ORDER BY class, name")
+            cur.execute("SELECT id, name, class, grade, student_id, username FROM students ORDER BY class, name")
             rows = cur.fetchall()
-        data = [{"id": r[0], "name": r[1], "class": r[2], "student_id": r[3], "username": r[4]}
+        data = [{"id": r[0], "name": r[1], "class": r[2], "grade": r[3],
+                 "student_id": r[4], "username": r[5]}
                 for r in rows]
         self._json(200, data, extra=[("Cache-Control", "no-store")])
 
@@ -2015,24 +3653,31 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             plain = gen_password()
             with AUTH_SLOTS:
                 password_hash = hash_password(plain)
-            prepared.append((name, klass, student_no, plain, password_hash))
+            prepared.append((name, klass, derive_grade(klass), student_no, plain, password_hash))
         try:
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()
                 conn.execute("BEGIN IMMEDIATE")
                 seen = set()
-                for name, klass, student_no, plain, password_hash in prepared:
+                for name, klass, grade, student_no, plain, password_hash in prepared:
                     username = gen_username(name, cur, seen)
                     try:
                         cur.execute(
-                            "INSERT INTO students (name, class, student_id, username, password) "
-                            "VALUES (?,?,?,?,?)",
-                            (name, klass, student_no, username, password_hash))
+                            "INSERT INTO students (name, class, grade, student_id, username, password) "
+                            "VALUES (?,?,?,?,?,?)",
+                            (name, klass, grade, student_no, username, password_hash))
                         results["success"] += 1
                         credentials.append({"name": name, "class": klass, "username": username, "password": plain})
                     except sqlite3.IntegrityError:
                         results["failed"] += 1  # 学号/用户名重复
                         seen.discard(username)
+                append_audit_event(
+                    cur, event_id="students-import-" + secrets.token_urlsafe(18),
+                    actor_role="admin", actor_id=sess.get("username", "admin"),
+                    action="students.imported", target_type="students",
+                    before=None, after={"success": results["success"], "failed": results["failed"]},
+                    metadata={"requested": len(students)},
+                )
                 conn.commit()
         except Exception as e:  # noqa: BLE001
             log.error("导入学生失败: %s", e)
@@ -2046,11 +3691,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(503, {"success": False,
                                     "message": "有报名请求处理中,请稍后再导入社团"})
         try:
-            return self._import_clubs_inner(data)
+            return self._import_clubs_inner(data, sess.get("username", "admin"))
         finally:
             RG.end_maintenance(maintenance)
 
-    def _import_clubs_inner(self, data):
+    def _import_clubs_inner(self, data, actor):
         clubs = data.get("clubs", [])
         if not isinstance(clubs, list) or not clubs:
             return self._json(400, {"success": False, "message": "没有社团数据"})
@@ -2080,6 +3725,12 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         results["success"] += 1
                     except (sqlite3.IntegrityError, OverflowError, TypeError):
                         results["failed"] += 1
+                append_audit_event(
+                    cur, event_id="clubs-import-" + secrets.token_urlsafe(18),
+                    actor_role="admin", actor_id=actor, action="clubs.imported", target_type="clubs",
+                    before=None, after={"success": results["success"], "failed": results["failed"]},
+                    metadata={"requested": len(clubs)},
+                )
                 conn.commit()
         except Exception as e:  # noqa: BLE001
             log.error("导入社团失败: %s", e)
@@ -2106,11 +3757,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(503, {"success": False,
                                     "message": "有报名请求处理中,请稍后更新时间"})
         try:
-            return self._update_time_inner(data)
+            return self._update_time_inner(data, sess.get("username", "admin"))
         finally:
             RG.end_maintenance(maintenance)
 
-    def _update_time_inner(self, data):
+    def _update_time_inner(self, data, actor):
         start_time = data.get("start_time") or ""
         if not isinstance(start_time, str):
             return self._json(400, {"success": False, "message": "时间格式错误"})
@@ -2122,7 +3773,17 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         try:
             with DB_POOL.connection() as conn:
                 conn.execute("BEGIN")
+                cur = conn.cursor()
+                previous = cur.execute(
+                    "SELECT registration_start_time FROM settings ORDER BY id DESC LIMIT 1"
+                ).fetchone()
                 conn.execute("UPDATE settings SET registration_start_time = ?", (start_time,))
+                append_audit_event(
+                    cur, event_id="registration-time-" + secrets.token_urlsafe(18),
+                    actor_role="admin", actor_id=actor, action="registration.start_time_updated",
+                    target_type="settings", before={"start_time": previous[0] if previous else None},
+                    after={"start_time": start_time},
+                )
                 conn.commit()
             RG.open_at_set(int(dt.timestamp()))
             self._json(200, {"success": True})
@@ -2164,6 +3825,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 cur = conn.cursor()
                 try:
                     conn.execute("BEGIN IMMEDIATE")
+                    student = cur.execute("SELECT username, name, class, student_id FROM students WHERE id=?", (sid,)).fetchone()
                     cur.execute(
                         "SELECT id, club_id, operation_id FROM registrations WHERE student_id = ?",
                         (sid,))
@@ -2177,6 +3839,14 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         cur.execute(
                             "UPDATE clubs SET current_students = MAX(0, current_students - 1) WHERE id = ?",
                             (reg[1],))
+                    append_audit_event(
+                        cur, event_id="student-delete-" + secrets.token_urlsafe(18),
+                        actor_role="admin", actor_id=sess.get("username", "admin"),
+                        action="student.deleted", target_type="student", target_id=sid,
+                        before={"username": student[0], "name": student[1], "class": student[2],
+                                "student_id": student[3], "registration": reg},
+                        after={"deleted": True},
+                    )
                     conn.commit()
                 except sqlite3.Error as e:
                     conn.rollback()
@@ -2220,9 +3890,19 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             with DB_POOL.connection() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
+                    cur = conn.cursor()
+                    student_count = cur.execute("SELECT COUNT(*) FROM students").fetchone()[0]
+                    registration_count = cur.execute("SELECT COUNT(*) FROM registrations").fetchone()[0]
                     conn.execute("DELETE FROM registrations")
                     conn.execute("DELETE FROM students")
                     conn.execute("UPDATE clubs SET current_students = 0")
+                    append_audit_event(
+                        cur, event_id="students-delete-all-" + secrets.token_urlsafe(18),
+                        actor_role="admin", actor_id=sess.get("username", "admin"),
+                        action="students.deleted_all", target_type="students",
+                        before={"students": student_count, "registrations": registration_count},
+                        after={"students": 0, "registrations": 0},
+                    )
                     conn.commit()
                 except sqlite3.Error as e:
                     conn.rollback()
@@ -2251,6 +3931,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 cur = conn.cursor()
                 try:
                     conn.execute("BEGIN IMMEDIATE")
+                    name_row = cur.execute("SELECT name, image_path FROM clubs WHERE id=?", (club_id,)).fetchone()
                     cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id = ?", (club_id,))
                     if cur.fetchone()[0] > 0:
                         conn.rollback()
@@ -2259,11 +3940,21 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     if cur.rowcount == 0:
                         conn.rollback()
                         return self._json(404, {"success": False, "message": "社团不存在"})
+                    append_audit_event(
+                        cur, event_id="club-delete-" + secrets.token_urlsafe(18),
+                        actor_role="admin", actor_id=sess.get("username", "admin"),
+                        action="club.deleted", target_type="club", target_id=club_id,
+                        before={"name": name_row[0] if name_row else None,
+                                "image_path": name_row[1] if name_row else None},
+                        after={"deleted": True},
+                    )
                     conn.commit()
                 except sqlite3.Error as e:
                     conn.rollback()
                     log.error("删除社团失败: %s", e)
                     return self._json(500, {"success": False, "message": "删除失败"})
+            if name_row and name_row[1]:
+                _remove_managed_club_image(name_row[1])
             try:
                 RG.r.delete(K_STOCK.format(club_id))
                 RG.cache_del(K_CACHE_CLUBS)
@@ -2284,13 +3975,28 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             with DB_POOL.connection() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
+                    cur = conn.cursor()
+                    club_count = cur.execute("SELECT COUNT(*) FROM clubs").fetchone()[0]
+                    registration_count = cur.execute("SELECT COUNT(*) FROM registrations").fetchone()[0]
+                    image_paths = [row[0] for row in cur.execute(
+                        "SELECT image_path FROM clubs WHERE image_path IS NOT NULL"
+                    ).fetchall()]
                     conn.execute("DELETE FROM registrations")
                     conn.execute("DELETE FROM clubs")
+                    append_audit_event(
+                        cur, event_id="clubs-delete-all-" + secrets.token_urlsafe(18),
+                        actor_role="admin", actor_id=sess.get("username", "admin"),
+                        action="clubs.deleted_all", target_type="clubs",
+                        before={"clubs": club_count, "registrations": registration_count},
+                        after={"clubs": 0, "registrations": 0},
+                    )
                     conn.commit()
                 except sqlite3.Error as e:
                     conn.rollback()
                     log.error("清空社团失败: %s", e)
                     return self._json(500, {"success": False, "message": "删除失败"})
+            for image_path in image_paths:
+                _remove_managed_club_image(image_path)
             if not rebuild_stock(maintenance_token=maintenance):
                 RECONCILE_REQUESTED.set()
                 return self._json(503, {"success": False,

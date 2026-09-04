@@ -13,6 +13,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -481,6 +482,16 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertEqual("OK", replies[3])
         return sessions
 
+    def _admin_token(self) -> str:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE settings SET admin_password='admin-password' WHERE id=1")
+            conn.commit()
+        status, payload, headers = self._request_json_with_headers(
+            "POST", "/api/admin_login", body={"username": "admin", "password": "admin-password"}
+        )
+        self.assertEqual(200, status, payload)
+        return self._session_token_from_set_cookie(headers)
+
     def _parallel_post(
         self,
         *,
@@ -808,6 +819,177 @@ class PythonRaceRegressionTests(unittest.TestCase):
                 )
             }
         self.assertEqual({"valid-before", "valid-after"}, names)
+
+    def test_admin_password_reset_revokes_sessions_and_audits_without_secret(self) -> None:
+        self._seed_scenario(users=1, capacity=2, redis_stock=2)
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE students SET password='old-password' WHERE id=1")
+            conn.commit()
+        _, _, student_headers = self._request_json_with_headers(
+            "POST", "/api/login", body={"username": "race1", "password": "old-password"}
+        )
+        old_token = self._session_token_from_set_cookie(student_headers)
+        admin_token = self._admin_token()
+        request_id = "reset-student-0001"
+        status, payload = self._request_json(
+            "POST", "/api/admin/reset_student_password", token=admin_token,
+            body={"student_id": 1, "request_id": request_id, "reason": "忘记密码"},
+        )
+        self.assertEqual(200, status, payload)
+        temporary_password = payload.get("temporary_password")
+        self.assertIsInstance(temporary_password, str)
+        self.assertEqual(12, len(temporary_password))
+        self.assertEqual(401, self._request_json("GET", "/api/get_student_info", token=old_token)[0])
+        login_status, login_payload, _headers = self._request_json_with_headers(
+            "POST", "/api/login", body={"username": "race1", "password": temporary_password}
+        )
+        self.assertEqual(200, login_status, login_payload)
+        replay_status, replay_payload = self._request_json(
+            "POST", "/api/admin/reset_student_password", token=admin_token,
+            body={"student_id": 1, "request_id": request_id, "reason": "忘记密码"},
+        )
+        self.assertEqual(200, replay_status, replay_payload)
+        self.assertTrue(replay_payload.get("replayed"))
+        self.assertNotIn("temporary_password", replay_payload)
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            event = conn.execute(
+                "SELECT before_json, after_json, metadata_json FROM audit_events "
+                "WHERE action='student.password_reset'"
+            ).fetchone()
+        self.assertIsNotNone(event)
+        self.assertNotIn(temporary_password, "".join(value or "" for value in event))
+
+    def test_update_club_capacity_metadata_and_restrictions_are_targeted_and_audited(self) -> None:
+        sessions = self._seed_scenario(users=2, capacity=1, redis_stock=1)
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE students SET grade='高一', class='高一(1)班' WHERE id=1")
+            conn.execute("UPDATE students SET grade='高二', class='高二(1)班' WHERE id=2")
+            conn.commit()
+        admin_token = self._admin_token()
+        request_id = "club-update-0001"
+        status, payload = self._request_json(
+            "POST", "/api/update_club", token=admin_token,
+            body={
+                "club_id": 1, "request_id": request_id, "reason": "增加名额和补充说明",
+                "max_students": 3, "description": "动手搭建机器人", "advisor_name": "张老师",
+                "meeting_time": "周三 16:30", "location": "科技楼 302",
+                "allowed_grades": ["高一"], "allowed_classes": [], "enabled": True,
+            },
+        )
+        self.assertEqual(200, status, payload)
+        self.assertEqual("incrby", payload.get("seat_sync"))
+        self.assertEqual("3", redis_command(self.redis_port, "GET", "stock:club:1"))
+        status, clubs = self._request_json("GET", "/api/get_clubs")
+        self.assertEqual(200, status)
+        self.assertEqual("动手搭建机器人", clubs[0]["description"])
+        self.assertEqual(["高一"], clubs[0]["allowed_grades"])
+        rejected_status, rejected = self._request_json(
+            "POST", "/api/register_club", token=sessions[2], body={"club_id": 1}
+        )
+        self.assertEqual(200, rejected_status)
+        self.assertEqual("不符合年级限制", rejected.get("message"))
+        accepted_status, accepted = self._request_json(
+            "POST", "/api/register_club", token=sessions[1], body={"club_id": 1}
+        )
+        self.assertEqual(200, accepted_status)
+        self.assertTrue(accepted.get("success"))
+        replay_status, replay = self._request_json(
+            "POST", "/api/update_club", token=admin_token,
+            body={"club_id": 1, "request_id": request_id, "reason": "增加名额和补充说明"},
+        )
+        self.assertEqual(200, replay_status)
+        self.assertTrue(replay.get("replayed"))
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO registrations (student_id,club_id,registration_time,operation_id) VALUES (2,1,?,?)",
+                ("2000-01-01 00:00:00", "capacity-guard-test"),
+            )
+            self.assertRaises(
+                sqlite3.IntegrityError,
+                conn.execute,
+                "UPDATE clubs SET max_students=1 WHERE id=1",
+            )
+            self.assertRaises(sqlite3.IntegrityError, conn.execute, "DELETE FROM audit_events")
+
+    def test_admin_assign_remove_transfer_and_operations_snapshot(self) -> None:
+        self._seed_scenario(users=2, capacity=2, redis_stock=2)
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("INSERT INTO clubs (id,name,max_students,current_students) VALUES (2,'second-club',2,0)")
+            conn.commit()
+        redis_command(self.redis_port, "SET", "stock:club:2", "2")
+        admin_token = self._admin_token()
+        assign_status, assigned = self._request_json(
+            "POST", "/api/admin/assign_registration", token=admin_token,
+            body={"student_id": 1, "club_id": 1, "request_id": "assign-0001", "reason": "线下确认"},
+        )
+        self.assertEqual(200, assign_status, assigned)
+        self.assertEqual("1", redis_command(self.redis_port, "GET", "stock:club:1"))
+        transfer_status, transferred = self._request_json(
+            "POST", "/api/admin/transfer_registration", token=admin_token,
+            body={"student_id": 1, "club_id": 2, "request_id": "transfer-0001", "reason": "调剂到第二社团"},
+        )
+        self.assertEqual(200, transfer_status, transferred)
+        self.assertEqual("2", redis_command(self.redis_port, "GET", "stock:club:1"))
+        self.assertEqual("1", redis_command(self.redis_port, "GET", "stock:club:2"))
+        remove_status, removed = self._request_json(
+            "POST", "/api/admin/remove_registration", token=admin_token,
+            body={"student_id": 1, "request_id": "remove-0001", "reason": "学生退出"},
+        )
+        self.assertEqual(200, remove_status, removed)
+        self.assertEqual("2", redis_command(self.redis_port, "GET", "stock:club:2"))
+        audit_status, audit = self._request_json("GET", "/api/admin/audit_events", token=admin_token)
+        self.assertEqual(200, audit_status)
+        actions = {event["action"] for event in audit["events"]}
+        self.assertTrue({"registration.admin_assigned", "registration.admin_transferred", "registration.admin_removed"} <= actions)
+        metrics_status, metrics = self._request_json("GET", "/api/admin/operations_snapshot", token=admin_token)
+        self.assertEqual(200, metrics_status)
+        self.assertEqual(60, metrics["window_seconds"])
+        plan_status, plan = self._request_json("GET", "/api/admin/preflight_plan", token=admin_token)
+        self.assertEqual(200, plan_status)
+        self.assertEqual("isolated-cli-only", plan["mode"])
+
+    def test_admin_upload_and_remove_club_image_are_revisioned_and_allowlisted(self) -> None:
+        self._seed_scenario(users=1, capacity=2, redis_stock=2)
+        admin_token = self._admin_token()
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow unavailable")
+        image = Image.new("RGB", (8, 8), "navy")
+        out = io.BytesIO()
+        image.save(out, format="PNG")
+        raw = out.getvalue()
+        request = (
+            f"POST /api/upload_club_image?club_id=1&expected_revision=0&request_id=image-upload-0001&reason=upload "
+            f"HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\n"
+            "Content-Type: image/png\r\n"
+            f"Content-Length: {len(raw)}\r\nCookie: session={admin_token}\r\nConnection: close\r\n\r\n"
+        ).encode("ascii") + raw
+        status, headers, body = self._one_raw_request(request)
+        self.assertEqual(200, status)
+        self.assertEqual("application/json; charset=utf-8", headers.get("content-type"))
+        uploaded = json.loads(body)
+        image_path = uploaded["club"]["image_path"]
+        self.assertRegex(image_path, r"^/club-images/1-[0-9a-f]{32}\.png$")
+        image_get = (
+            f"GET {image_path} HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\nConnection: close\r\n\r\n"
+        ).encode("ascii")
+        image_status, image_headers, image_body = self._one_raw_request(image_get)
+        self.assertEqual(200, image_status)
+        self.assertEqual("image/png", image_headers.get("content-type"))
+        self.assertGreater(len(image_body), 0)
+        clubs_status, clubs = self._request_json("GET", "/api/get_clubs")
+        self.assertEqual(200, clubs_status)
+        self.assertEqual(image_path, clubs[0]["image_path"])
+        self.assertEqual(uploaded["club"]["revision"], clubs[0]["revision"])
+        remove_status, removed = self._request_json(
+            "POST", "/api/remove_club_image", token=admin_token,
+            body={"club_id": 1, "expected_revision": uploaded["club"]["revision"],
+                  "request_id": "image-remove-0001", "reason": "remove"},
+        )
+        self.assertEqual(200, remove_status, removed)
+        self.assertIsNone(removed["club"]["image_path"])
+        self.assertEqual(404, self._one_raw_request(image_get)[0])
 
 
 if __name__ == "__main__":
