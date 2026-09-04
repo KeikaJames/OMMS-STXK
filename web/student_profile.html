@@ -7,6 +7,10 @@
 <title>个人信息 · 鄂尔多斯市实验中学社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/motion.css">
+<script>(function(){if(!matchMedia('(prefers-reduced-motion: reduce)').matches){var h=document.documentElement;h.classList.add('motion');setTimeout(function(){h.classList.remove('motion')},1600)}})();</script>
+<script src="/vendor/gsap.min.js" defer></script>
+<script src="/motion.js" defer></script>
 <script src="/easter-egg.js" defer></script>
 </head>
 <body>
@@ -21,8 +25,8 @@
 </header>
 
 <main class="wrap" id="main">
-  <div class="section-h"><span>基本信息</span></div>
-  <div class="card" style="margin-bottom:16px">
+  <div class="section-h m-in"><span>基本信息</span></div>
+  <div class="card m-in" style="margin-bottom:16px">
     <dl style="display:grid;grid-template-columns:auto 1fr;gap:14px 18px;margin:0">
       <dt style="color:var(--muted);font-size:14px">姓名</dt><dd id="f-name" style="margin:0;text-align:right">—</dd>
       <dt style="color:var(--muted);font-size:14px">班级</dt><dd id="f-class" style="margin:0;text-align:right">—</dd>
@@ -31,13 +35,13 @@
     </dl>
   </div>
 
-  <div class="section-h"><span>我的社团</span></div>
-  <div class="card" id="reg-card" style="margin-bottom:16px">
+  <div class="section-h m-in"><span>我的社团</span></div>
+  <div class="card m-in" id="reg-card" style="margin-bottom:16px">
     <p id="reg-empty" class="empty" style="padding:18px 0">还未报名任何社团</p>
   </div>
 
-  <div class="section-h"><span>修改密码</span></div>
-  <div class="card">
+  <div class="section-h m-in"><span>修改密码</span></div>
+  <div class="card m-in">
     <div class="field"><label for="cp">当前密码</label><input class="input" id="cp" type="password" autocomplete="current-password"></div>
     <div class="field"><label for="np">新密码（至少 6 位）</label><input class="input" id="np" type="password" autocomplete="new-password"></div>
     <div class="field"><label for="np2">确认新密码</label><input class="input" id="np2" type="password" autocomplete="new-password"></div>
@@ -50,10 +54,12 @@
 
 <script>
 const $ = s => document.querySelector(s);
+const M = () => window.Motion;
 function splitRoom(n){ const m = n.match(/^(.*?)（\s*([0-9A-Za-z]+)\s*）\s*$/); return m ? {name:m[1].trim(), room:m[2]} : {name:n, room:null}; }
 function toast(msg, kind){
   const t = document.createElement('div'); t.className = 'toast' + (kind ? ' '+kind : ''); t.textContent = msg;
-  $('#toasts').appendChild(t); setTimeout(() => t.remove(), 2600);
+  $('#toasts').appendChild(t);
+  if (M()) M().toast(t, 2600); else setTimeout(() => t.remove(), 2600);
 }
 async function load(){
   const r = await fetch('/api/get_student_info', {headers:{'Content-Type':'application/json'}});
@@ -96,7 +102,8 @@ $('#logout').onclick = async () => {
   try{ await fetch('/api/logout', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); }catch(e){}
   location.href = '/';
 };
-load();
+function boot(){ if (M()) M().enterPage('.m-in'); load(); }
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 </script>
 </body>
 </html>
