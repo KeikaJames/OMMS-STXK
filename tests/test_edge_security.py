@@ -34,6 +34,11 @@ RUST_BINARY = REPO_ROOT / "club-hot" / "target" / "release" / "club-hot"
 NGINX_TEMPLATE = REPO_ROOT / "nginx.conf"
 FORBIDDEN_REDIS_PORT = 6379
 PASSWORD_HASHER = PasswordHasher()
+PREFIX = "omms:"
+
+
+def key(*parts: object) -> str:
+    return PREFIX + ":".join(str(part) for part in parts)
 
 
 def loopback_port(*, forbidden: set[int] | None = None) -> int:
@@ -170,8 +175,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
                 "upstream club_admin { server 127.0.0.1:2001; }",
                 f"upstream club_admin {{ server 127.0.0.1:{cls.python_port}; }}",
             )
-            .replace("error_log /tmp/club_nginx_error.log warn;", f"error_log {cls.temp_path / 'nginx-error.log'} warn;")
-            .replace("pid /tmp/club_nginx.pid;", f"pid {cls.temp_path / 'nginx.pid'};")
+            .replace("__RUN_DIR__", str(cls.temp_path))
             .replace("zone=hotip:10m rate=250r/s", "zone=hotip:10m rate=1r/s")
             .replace("limit_req zone=hotip burst=1000 nodelay;", "limit_req zone=hotip burst=20 nodelay;")
         )
@@ -278,7 +282,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
                 ],
             )
             conn.commit()
-        cls.redis.mset({"seats:initialized": "1", "open_at": "0", "stock:club:1": "3"})
+        cls.redis.mset({key("init"): "1", key("open_at"): "0", key("stock", 1): "3"})
 
     @staticmethod
     def _request_raw(
@@ -431,19 +435,20 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         self.assertEqual(image_path, edge_club["image_path"])
         self.assertEqual(uploaded["club"]["revision"], edge_club["revision"])
 
-    def test_python_and_rust_hold_only_a_pending_club_before_final_seat_mutation(self) -> None:
-        """A targeted admin sync hold must work through either hot backend."""
+    def test_python_and_rust_pause_only_a_fenced_club(self) -> None:
+        """单社团栅栏期间，两个后端都只暂停这一个社团的报名与退选。"""
         self._reset_state()
-        operation_id = "pending-sync-registration"
+        operation_id = "fenced-club-registration"
         with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
-            conn.execute("UPDATE clubs SET seat_sync_pending=1, current_students=1 WHERE id=1")
+            conn.execute("UPDATE clubs SET current_students=1 WHERE id=1")
             conn.execute(
                 "INSERT INTO registrations (student_id, club_id, registration_time, operation_id) VALUES (1,1,?,?)",
                 ("2000-01-01 00:00:00", operation_id),
             )
             conn.commit()
-        self.redis.set("stock:club:1", 2)
-        self.redis.set("student:reg:1", f"1|{operation_id}")
+        self.redis.set(key("stock", 1), 2)
+        self.redis.set(key("reg", 1), f"1|{operation_id}")
+        self.redis.set(key("fence", 1), "held-by-test", ex=30)
         one = self._login(self.python_port, "edge1", "student-password")
         two = self._login(self.python_port, "edge2", "student-password")
         for port in (self.python_port, self.rust_port):
@@ -451,15 +456,34 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
                 port, "POST", "/api/register_club", body={"club_id": 1}, cookie=f"session={two}"
             )
             self.assertEqual(503, register_status)
-            self.assertEqual("该社团名额正在同步，请稍后重试", json.loads(register_body)["message"])
+            self.assertEqual("syncing", json.loads(register_body)["code"])
             cancel_status, _headers, cancel_body = self._request_raw(
                 port, "POST", "/api/cancel_registration", body={}, cookie=f"session={one}"
             )
             self.assertEqual(503, cancel_status)
-            self.assertEqual("该社团名额正在同步，请稍后重试", json.loads(cancel_body)["message"])
+            self.assertEqual("syncing", json.loads(cancel_body)["code"])
         with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM registrations WHERE student_id=1").fetchone()[0])
-        self.assertEqual("2", self.redis.get("stock:club:1"))
+        self.assertEqual("2", self.redis.get(key("stock", 1)))
+        self.redis.delete(key("fence", 1))
+
+    def test_pending_admin_sync_is_repaired_in_the_background(self) -> None:
+        """管理端同步中断留下的标记由后台修复，库存回到数据库真值。"""
+        self._reset_state()
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE clubs SET seat_sync_pending=1, max_students=5 WHERE id=1")
+            conn.commit()
+        self.redis.set(key("stock", 1), 1)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+                pending = conn.execute("SELECT seat_sync_pending FROM clubs WHERE id=1").fetchone()[0]
+            if not pending and self.redis.get(key("stock", 1)) == "5":
+                break
+            time.sleep(0.1)
+        self.assertEqual("5", self.redis.get(key("stock", 1)))
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(0, conn.execute("SELECT seat_sync_pending FROM clubs WHERE id=1").fetchone()[0])
 
     def test_shared_source_failed_logins_do_not_lock_other_students(self) -> None:
         """A campus NAT must not turn random failed names into a school-wide 429."""
@@ -492,13 +516,11 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
                     cookie=f"session={token}",
                 )
                 self.assertEqual(200, status)
-                self.assertEqual(
-                    {"success": False, "message": "社团不存在"},
-                    json.loads(body),
-                )
-        self.assertEqual("3", self.redis.get("stock:club:1"))
-        self.assertEqual([], self.redis.keys("resv:*"))
-        self.assertEqual([], self.redis.keys("seat:op:*"))
+                payload = json.loads(body)
+                self.assertFalse(payload["success"])
+                self.assertEqual("club_missing", payload["code"])
+        self.assertEqual("3", self.redis.get(key("stock", 1)))
+        self.assertEqual([], self.redis.keys(key("op", "*")))
 
         for port in (self.python_port, self.rust_port):
             status, _headers, body = self._request_raw(port, "GET", "/readyz")
@@ -515,7 +537,20 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             )
             self.assertEqual(200, status)
             self.assertTrue(json.loads(body).get("success"))
-        self.assertEqual("1", self.redis.get("stock:club:1"))
+        self.assertEqual("1", self.redis.get(key("stock", 1)))
+
+    def test_rust_request_id_retry_is_idempotent(self) -> None:
+        self._reset_state()
+        token = self._login(self.rust_port, "edge1", "student-password")
+        body = {"club_id": 1, "request_id": "edge-retry-0001"}
+        for _ in range(2):
+            status, _headers, raw = self._request_raw(
+                self.rust_port, "POST", "/api/register_club", body=body, cookie=f"session={token}")
+            payload = json.loads(raw)
+            self.assertEqual((200, True, "registered"), (status, payload["success"], payload["code"]))
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM registrations").fetchone()[0])
+        self.assertEqual("2", self.redis.get(key("stock", 1)))
 
     def test_python_and_rust_enforce_same_club_admission_rules(self) -> None:
         self._reset_state()
@@ -532,8 +567,8 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
                 port, "POST", "/api/register_club", body={"club_id": 1}, cookie=f"session={student_token}"
             )
             self.assertEqual(200, status)
-            self.assertEqual("不符合年级限制", json.loads(body).get("message"))
-        self.assertEqual("3", self.redis.get("stock:club:1"))
+            self.assertEqual("ineligible_grade", json.loads(body).get("code"))
+        self.assertEqual("3", self.redis.get(key("stock", 1)))
 
     def test_edge_rejects_multiple_cookie_header_fields_without_revoking_session(self) -> None:
         self._reset_state()
@@ -565,7 +600,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         # A mutation lock is the critical fence between a generation revoke and
         # its SQLite commit. Neither backend may sign a new session while it is
         # held, even though the old DB password/row is still readable.
-        self.redis.set("sess:mutation:student:1", "test-lock", ex=60)
+        self.redis.set(key("sessmut", "student", 1), "test-lock", ex=60)
         for port in (self.python_port, self.rust_port):
             locked, _headers, _body = self._request_raw(
                 port,
@@ -574,7 +609,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
                 body={"username": "edge1", "password": "student-password"},
             )
             self.assertEqual(503, locked)
-        self.redis.delete("sess:mutation:student:1")
+        self.redis.delete(key("sessmut", "student", 1))
 
         rust_token = self._login(self.rust_port, "edge1", "student-password")
         status, _headers, _body = self._request_raw(
@@ -610,7 +645,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             cookie=f"session={rust_token}",
         )
         self.assertEqual(401, rejected)
-        self.assertEqual("3", self.redis.get("stock:club:1"))
+        self.assertEqual("3", self.redis.get(key("stock", 1)))
 
 
 if __name__ == "__main__":

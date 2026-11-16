@@ -1,70 +1,82 @@
-//! Password hashing, cookie/session plumbing, and the local-time parser used by
-//! the registration time gate.
-//!
-//! argon2 is PHC-format (`$argon2id$v=19$...`), interoperable with Python's
-//! `argon2-cffi`: verification reads the cost params out of the stored hash, so
-//! a hash minted by either side verifies on the other. Legacy plaintext rows
-//! are matched directly and rehashed on first successful login (parity with
-//! `verify_password` in `main.py`).
+//! 口令哈希、Cookie、会话读取与学校时区下的时间换算。
 
 use std::sync::OnceLock;
 
-use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::{Algorithm, Argon2, Params, Version};
 use axum::http::{HeaderMap, header};
 
 use crate::error::AppResult;
-use crate::state::AppState;
+use crate::state::{AppState, Config};
 
-/// Process-wide local UTC offset, captured once on the main thread *before* the
-/// async runtime spawns worker threads. `time::UtcOffset::current_local_offset`
-/// refuses to run in a multithreaded process (soundness around `getenv`), so we
-/// snapshot it early; all local-time formatting/parsing reads this. Falls back
-/// to UTC if never initialized or if the platform can't determine it.
-static LOCAL_OFFSET: OnceLock<time::UtcOffset> = OnceLock::new();
+static OFFSET: OnceLock<time::UtcOffset> = OnceLock::new();
+static ARGON2_PARAMS: OnceLock<(u32, u32, u32)> = OnceLock::new();
 
-/// Capture the host local offset. Call exactly once, from `main`, before any
-/// Tokio worker threads exist. Idempotent (later calls are ignored).
-pub fn init_local_offset() {
-    let off = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-    let _ = LOCAL_OFFSET.set(off);
+/// 启动时调用一次：记录学校所在时区与 Argon2 参数。
+pub fn init(cfg: &Config) {
+    let _ = OFFSET.set(parse_offset(&cfg.utc_offset));
+    let _ = ARGON2_PARAMS.set((
+        cfg.argon2_memory_kib,
+        cfg.argon2_time_cost,
+        cfg.argon2_parallelism,
+    ));
 }
 
-/// The captured local offset (UTC if `init_local_offset` was never called).
-fn local_offset() -> time::UtcOffset {
-    LOCAL_OFFSET.get().copied().unwrap_or(time::UtcOffset::UTC)
+fn parse_offset(text: &str) -> time::UtcOffset {
+    let text = text.trim();
+    let (sign, rest) = match text.as_bytes().first() {
+        Some(b'+') => (1, &text[1..]),
+        Some(b'-') => (-1, &text[1..]),
+        _ => return time::UtcOffset::from_hms(8, 0, 0).expect("valid offset"),
+    };
+    let digits: String = rest.chars().filter(|c| *c != ':').collect();
+    let hours = digits.get(0..2).and_then(|h| h.parse::<i8>().ok());
+    let minutes = digits.get(2..4).and_then(|m| m.parse::<i8>().ok());
+    match (hours, minutes) {
+        (Some(h), Some(m)) => time::UtcOffset::from_hms(sign * h, sign * m, 0)
+            .unwrap_or_else(|_| time::UtcOffset::from_hms(8, 0, 0).expect("valid offset")),
+        _ => time::UtcOffset::from_hms(8, 0, 0).expect("valid offset"),
+    }
 }
 
-/// Result of verifying a stored secret against a supplied password.
+fn offset() -> time::UtcOffset {
+    OFFSET
+        .get()
+        .copied()
+        .unwrap_or_else(|| time::UtcOffset::from_hms(8, 0, 0).expect("valid offset"))
+}
+
+fn hasher() -> Argon2<'static> {
+    let (m, t, p) = ARGON2_PARAMS.get().copied().unwrap_or((19_456, 2, 1));
+    let params = Params::new(m, t, p, None).unwrap_or_default();
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifyResult {
-    /// Password matched.
     pub ok: bool,
-    /// Stored form is legacy/plaintext (or rehash recommended) -> upgrade.
     pub needs_upgrade: bool,
 }
 
-/// Verify `plain` against the `stored` secret.
-/// - `$argon2*`  -> argon2 verify; `needs_upgrade=false` on match.
-/// - `plain$xxx` -> compare suffix; always `needs_upgrade=true` on match.
-/// - anything else (legacy plaintext like "123456") -> direct compare;
-///   `needs_upgrade=true` on match.
+/// 校验口令。参数与当前配置不同的 argon2 哈希、存量明文在登录成功后升级。
 pub fn verify_password(stored: &str, plain: &str) -> VerifyResult {
     if stored.starts_with("$argon2") {
-        match PasswordHash::new(stored) {
-            Ok(parsed) => {
-                let ok = Argon2::default()
-                    .verify_password(plain.as_bytes(), &parsed)
-                    .is_ok();
-                VerifyResult {
-                    ok,
-                    needs_upgrade: false,
-                }
-            }
-            Err(_) => VerifyResult {
+        let Ok(parsed) = PasswordHash::new(stored) else {
+            return VerifyResult {
                 ok: false,
                 needs_upgrade: false,
-            },
+            };
+        };
+        let ok = Argon2::default()
+            .verify_password(plain.as_bytes(), &parsed)
+            .is_ok();
+        let (m, t, p) = ARGON2_PARAMS.get().copied().unwrap_or((19_456, 2, 1));
+        let current = Params::try_from(&parsed).ok();
+        let needs_upgrade = parsed.algorithm.as_str() != "argon2id"
+            || current.is_none_or(|c| c.m_cost() != m || c.t_cost() != t || c.p_cost() != p);
+        VerifyResult {
+            ok,
+            needs_upgrade: ok && needs_upgrade,
         }
     } else if let Some(rest) = stored.strip_prefix("plain$") {
         VerifyResult {
@@ -79,93 +91,158 @@ pub fn verify_password(stored: &str, plain: &str) -> VerifyResult {
     }
 }
 
-/// Hash a password to a PHC argon2id string compatible with argon2-cffi.
 pub fn hash_password(plain: &str) -> Result<String, argon2::password_hash::Error> {
-    // 16 random salt bytes -> base64 SaltString (avoids cross-crate rand_core
-    // version coupling that `SaltString::generate` would impose).
     let mut salt_bytes = [0u8; 16];
     {
         use rand::RngExt;
         rand::rng().fill(&mut salt_bytes[..]);
     }
     let salt = SaltString::encode_b64(&salt_bytes)?;
-    let hash = Argon2::default().hash_password(plain.as_bytes(), &salt)?;
-    Ok(hash.to_string())
+    Ok(hasher().hash_password(plain.as_bytes(), &salt)?.to_string())
 }
 
-/// Constant-time-ish string equality (length-independent compare to avoid
-/// trivial timing leaks; `secrets.compare_digest` analogue).
 fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut diff = a.len() ^ b.len();
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let x = *a.get(i).unwrap_or(&0);
-        let y = *b.get(i).unwrap_or(&0);
-        diff |= (x ^ y) as usize;
+    for i in 0..a.len().max(b.len()) {
+        diff |= (*a.get(i).unwrap_or(&0) ^ *b.get(i).unwrap_or(&0)) as usize;
     }
     diff == 0
 }
 
-// --- cookies ---------------------------------------------------------------
+// ---- Cookie ----------------------------------------------------------------
 
-/// Extract exactly one unambiguous `session` cookie from a raw `Cookie:` header.
-///
-/// Python formerly used `SimpleCookie` (last duplicate wins) while Rust used
-/// the first duplicate.  Rejecting duplicate names makes auth, logout, and
-/// rate-limit behaviour deterministic even if an upstream/client emits an
-/// ambiguous Cookie header.
-pub fn session_token_from_cookie(cookie_header: &str) -> Option<String> {
-    let mut token: Option<String> = None;
+/// 只接受唯一的同名 Cookie，与 Python 判定一致。
+pub fn cookie_value(cookie_header: &str, name: &str) -> Option<String> {
+    let mut found: Option<String> = None;
     for part in cookie_header.split(';') {
-        let Some((name, value)) = part.split_once('=') else {
+        let Some((key, value)) = part.split_once('=') else {
             continue;
         };
-        if name.trim() == "session" {
+        if key.trim() == name {
             let value = value.trim();
-            if token.is_some() || value.is_empty() {
+            if found.is_some() || value.is_empty() {
                 return None;
             }
-            token = Some(value.to_string());
+            found = Some(value.to_string());
         }
     }
-    token
+    found
 }
 
-/// Apply the single-Cookie-field invariant before parsing its contents.
-/// `HeaderMap::get` returns only the first line, so it must not be used for
-/// authentication when a peer supplied multiple Cookie header fields.
-pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+/// 请求只能带一行 Cookie 头。
+fn single_cookie_header(headers: &HeaderMap) -> Option<&str> {
     let mut values = headers.get_all(header::COOKIE).iter();
     let raw = values.next()?.to_str().ok()?;
     if values.next().is_some() {
         return None;
     }
-    session_token_from_cookie(raw)
+    Some(raw)
 }
 
-/// Build the `Set-Cookie` value for a freshly minted session.
-/// Mirrors Python exactly. `Secure` is enabled only in the TLS deployment;
-/// the isolated HTTP assessment stack deliberately keeps it false.
-pub fn set_session_cookie(token: &str, ttl: i64, secure: bool) -> String {
+pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    cookie_value(single_cookie_header(headers)?, "session")
+}
+
+pub fn device_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let value = cookie_value(single_cookie_header(headers)?, "device")?;
+    let valid = (20..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    valid.then_some(value)
+}
+
+pub fn cookie(name: &str, value: &str, max_age: i64, secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
-    format!("session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl}{secure}")
+    format!("{name}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{secure}")
+}
+
+// ---- 会话 --------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct StudentSession {
+    pub student_id: i64,
+    pub grade: Option<String>,
+    pub class: Option<String>,
+}
+
+pub async fn student_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> AppResult<Option<StudentSession>> {
+    let Some(token) = session_token_from_headers(headers) else {
+        return Ok(None);
+    };
+    let seats = crate::redis_seats::Seats::new(state.redis.clone(), &state.cfg);
+    let Some(payload) = seats.session_get(&token).await? else {
+        return Ok(None);
+    };
+    if payload.get("role").and_then(|v| v.as_str()) != Some("student") {
+        return Ok(None);
+    }
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    Ok(payload
+        .get("student_id")
+        .and_then(|v| v.as_i64())
+        .map(|student_id| StudentSession {
+            student_id,
+            grade: text("grade"),
+            class: text("class"),
+        }))
+}
+
+// ---- 时间 --------------------------------------------------------------------
+
+/// 按学校时区解析 `YYYY-MM-DD HH:MM:SS`。
+pub fn parse_local_datetime(s: &str) -> Option<i64> {
+    use time::macros::format_description;
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    let naive = time::PrimitiveDateTime::parse(s.trim(), &fmt).ok()?;
+    Some(naive.assume_offset(offset()).unix_timestamp())
+}
+
+pub fn format_local_datetime(epoch: i64) -> Option<String> {
+    use time::macros::format_description;
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    time::OffsetDateTime::from_unix_timestamp(epoch)
+        .ok()?
+        .to_offset(offset())
+        .format(&fmt)
+        .ok()
+}
+
+pub fn now_local_string() -> String {
+    use time::macros::format_description;
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    time::OffsetDateTime::now_utc()
+        .to_offset(offset())
+        .format(&fmt)
+        .unwrap_or_else(|_| "1970-01-01 00:00:00".to_string())
 }
 
 #[cfg(test)]
-mod cookie_tests {
-    use super::{session_token_from_cookie, session_token_from_headers, verify_password};
+mod tests {
+    use super::{
+        cookie_value, parse_local_datetime, parse_offset, session_token_from_headers,
+        verify_password,
+    };
     use axum::http::{HeaderMap, header::COOKIE};
 
     #[test]
     fn cookie_parser_rejects_duplicates_and_ignores_malformed_other_pairs() {
         assert_eq!(
-            session_token_from_cookie("x; session=one; y=2"),
+            cookie_value("x; session=one; y=2", "session"),
             Some("one".into())
         );
-        assert_eq!(session_token_from_cookie("session=one; session=two"), None);
-        assert_eq!(session_token_from_cookie("session=; session=two"), None);
-        assert_eq!(session_token_from_cookie("Session=one"), None);
+        assert_eq!(cookie_value("session=one; session=two", "session"), None);
+        assert_eq!(cookie_value("session=; session=two", "session"), None);
+        assert_eq!(cookie_value("Session=one", "session"), None);
     }
 
     #[test]
@@ -183,77 +260,21 @@ mod cookie_tests {
     }
 
     #[test]
-    fn python_argon2_cffi_hash_verifies_in_rust() {
+    fn python_argon2_cffi_hash_verifies_in_rust_and_is_marked_for_upgrade() {
         let python_hash = "$argon2id$v=19$m=65536,t=3,p=4$ZwUxbnMzOherbEkDhuvTlg$53zarfOwxfaDdhJ9Slnvd6aqcoV4qFllM8UlLDig+AA";
-        assert!(verify_password(python_hash, "student-password").ok);
+        let result = verify_password(python_hash, "student-password");
+        assert!(result.ok);
+        assert!(result.needs_upgrade);
         assert!(!verify_password(python_hash, "wrong-password").ok);
     }
-}
 
-// --- session payload -------------------------------------------------------
-
-/// A decoded student session. The JSON written to `sess:{token}` matches the
-/// Python shape: `{"role":"student","student_id":i64,"name","class","student_no"}`.
-#[derive(Debug, Clone)]
-pub struct StudentSession {
-    pub student_id: i64,
-}
-
-/// Pull the student session out of state for the given request headers.
-/// Returns `None` when there is no valid student session (missing cookie,
-/// expired, wrong role, or malformed JSON).
-pub async fn student_session(
-    state: &AppState,
-    headers: &axum::http::HeaderMap,
-) -> AppResult<Option<StudentSession>> {
-    let Some(token) = session_token_from_headers(headers) else {
-        return Ok(None);
-    };
-    let seats = crate::redis_seats::Seats::new(state.redis.clone());
-    let Some(payload) = seats.session_get(&token).await? else {
-        return Ok(None);
-    };
-    if payload.get("role").and_then(|v| v.as_str()) != Some("student") {
-        return Ok(None);
+    #[test]
+    fn school_offset_is_independent_of_the_host_timezone() {
+        let _ = super::OFFSET.set(parse_offset("+08:00"));
+        assert_eq!(
+            Some(1_788_235_200),
+            parse_local_datetime("2026-09-01 12:00:00")
+        );
+        assert_eq!(-5 * 3600 - 30 * 60, parse_offset("-05:30").whole_seconds());
     }
-    Ok(payload
-        .get("student_id")
-        .and_then(|v| v.as_i64())
-        .map(|student_id| StudentSession { student_id }))
-}
-
-// --- time ------------------------------------------------------------------
-
-/// Parse a `YYYY-MM-DD HH:MM:SS` string (Python `registration_start_time`
-/// format) into a Unix epoch, interpreting it in the host's local timezone to
-/// match Python's `datetime.strptime(...).timestamp()`. Falls back to treating
-/// it as UTC if the local offset can't be determined.
-pub fn parse_local_datetime(s: &str) -> Option<i64> {
-    use time::macros::format_description;
-    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-    let naive = time::PrimitiveDateTime::parse(s.trim(), &fmt).ok()?;
-    Some(naive.assume_offset(local_offset()).unix_timestamp())
-}
-
-/// Render an epoch back to `YYYY-MM-DD HH:MM:SS` in local time — used so
-/// `/api/check_registration_time` can echo `start_time` when only `open_at`
-/// (epoch) is present in Redis, matching Python's `datetime.fromtimestamp`.
-pub fn format_local_datetime(epoch: i64) -> Option<String> {
-    use time::macros::format_description;
-    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-    let dt = time::OffsetDateTime::from_unix_timestamp(epoch)
-        .ok()?
-        .to_offset(local_offset());
-    dt.format(&fmt).ok()
-}
-
-/// `YYYY-MM-DD HH:MM:SS` for "now" in local time — matches Python's
-/// `datetime.now().strftime(...)` used for `registration_time`.
-pub fn now_local_string() -> String {
-    use time::macros::format_description;
-    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-    time::OffsetDateTime::now_utc()
-        .to_offset(local_offset())
-        .format(&fmt)
-        .unwrap_or_else(|_| "1970-01-01 00:00:00".to_string())
 }

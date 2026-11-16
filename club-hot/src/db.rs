@@ -1,18 +1,13 @@
-//! SQLite access via two deadpool-sqlite pools sharing the same WAL file:
-//! - `write` pool with size 1 (serializes writers -> no `SQLITE_BUSY` storms),
-//! - `read` pool with size N for concurrent readers.
-//!
-//! Every physical connection runs `busy_timeout=10000` + `foreign_keys=ON` on
-//! creation via a deadpool hook. WAL itself is already persisted on the file.
+//! SQLite 访问：写连接池大小为 1（单写者），读连接池大小为 N，共用同一个 WAL 文件。
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime};
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{AppError, AppResult};
 use crate::types::{ClubId, StudentId};
 
-/// A club row as exposed by `/api/get_clubs` (static part).
+/// `/api/catalog` 与准入检查使用的社团行。
 #[derive(Debug, Clone)]
 pub struct ClubRow {
     pub id: i64,
@@ -31,7 +26,6 @@ pub struct ClubRow {
     pub seat_sync_pending: bool,
 }
 
-/// One `(club_id, max_students, used_count)` triple for stock rebuild.
 #[derive(Debug, Clone, Copy)]
 pub struct ClubStock {
     pub club_id: i64,
@@ -48,31 +42,30 @@ pub enum RegistrationInsertOutcome {
     ClubDisabled,
     SeatSyncPending,
     RegistrationLocked,
-    Ineligible,
+    Ineligible(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClubAdmission {
-    Allowed,
-    ClubMissing,
-    ClubDisabled,
-    SeatSyncPending,
-    Ineligible(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct CancelledRegistration {
-    pub registration_id: i64,
-    pub club_id: ClubId,
-    pub operation_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub enum CancelRegistrationOutcome {
-    Cancelled(CancelledRegistration),
+pub enum DeleteOutcome {
+    Deleted,
     NotRegistered,
-    SeatSyncPending,
-    RegistrationLocked,
+    Locked,
+    Syncing,
+}
+
+#[derive(Debug, Clone)]
+pub struct StudentRegistration {
+    pub registration_id: i64,
+    pub club_id: i64,
+    pub operation_id: Option<String>,
+    pub seat_sync_pending: bool,
+}
+
+pub struct Snapshot {
+    pub clubs: Vec<ClubStock>,
+    pub registrations: Vec<(i64, i64, Option<String>)>,
+    pub start_time: Option<String>,
+    pub locked: bool,
 }
 
 #[derive(Clone)]
@@ -81,32 +74,26 @@ pub struct Db {
     pub read: Pool,
 }
 
-enum RestrictionResult {
-    Allowed,
-    Grade,
-    Class,
-    Invalid,
-}
-
-fn restrictions_allow(
+/// 资格不符时返回提示码。
+pub fn restriction_code(
     grade: &str,
     class_name: &str,
     allowed_grades: &str,
     allowed_classes: &str,
-) -> RestrictionResult {
-    let Some(grades) = serde_json::from_str::<Vec<String>>(allowed_grades).ok() else {
-        return RestrictionResult::Invalid;
+) -> Option<&'static str> {
+    let Ok(grades) = serde_json::from_str::<Vec<String>>(allowed_grades) else {
+        return Some("ineligible_config");
     };
-    let Some(classes) = serde_json::from_str::<Vec<String>>(allowed_classes).ok() else {
-        return RestrictionResult::Invalid;
+    let Ok(classes) = serde_json::from_str::<Vec<String>>(allowed_classes) else {
+        return Some("ineligible_config");
     };
     if !grades.is_empty() && !grades.iter().any(|value| value == grade) {
-        return RestrictionResult::Grade;
+        return Some("ineligible_grade");
     }
     if !classes.is_empty() && !classes.iter().any(|value| value == class_name) {
-        return RestrictionResult::Class;
+        return Some("ineligible_class");
     }
-    RestrictionResult::Allowed
+    None
 }
 
 fn now_epoch_ms() -> i64 {
@@ -118,10 +105,8 @@ fn now_epoch_ms() -> i64 {
 
 struct AuditEvent<'a> {
     event_id: &'a str,
-    actor_role: &'a str,
     actor_id: &'a str,
     action: &'a str,
-    target_type: &'a str,
     target_id: &'a str,
     before_json: &'a str,
     after_json: &'a str,
@@ -133,22 +118,22 @@ fn append_audit_event(tx: &Transaction<'_>, event: AuditEvent<'_>) -> rusqlite::
         concat!(
             "INSERT INTO audit_events ",
             "(event_id,occurred_at,actor_role,actor_id,action,target_type,target_id,before_json,after_json,metadata_json) ",
-            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
+            "VALUES (?1,?2,'student',?3,?4,'registration',?5,?6,?7,?8)"
         ),
-        rusqlite::params![event.event_id, now_epoch_ms(), event.actor_role, event.actor_id, event.action,
-            event.target_type, event.target_id, event.before_json, event.after_json, event.metadata_json],
+        rusqlite::params![event.event_id, now_epoch_ms(), event.actor_id, event.action,
+            event.target_id, event.before_json, event.after_json, event.metadata_json],
     )?;
     Ok(())
 }
 
-fn pragma_hook() -> Hook {
-    Hook::async_fn(|obj, _metrics| {
+fn pragma_hook(synchronous: String) -> Hook {
+    Hook::async_fn(move |obj, _metrics| {
+        let synchronous = synchronous.clone();
         Box::pin(async move {
-            obj.interact(|conn: &mut Connection| {
-                // busy_timeout: wait up to 10s for a writer lock instead of
-                // erroring immediately. foreign_keys: enforce FK constraints
-                // (off by default per-connection in SQLite).
-                conn.execute_batch("PRAGMA busy_timeout=10000; PRAGMA foreign_keys=ON;")
+            obj.interact(move |conn: &mut Connection| {
+                conn.execute_batch(&format!(
+                    "PRAGMA busy_timeout=10000; PRAGMA foreign_keys=ON; PRAGMA synchronous={synchronous};"
+                ))
             })
             .await
             .map_err(|e| HookError::message(format!("interact: {e}")))?
@@ -158,19 +143,20 @@ fn pragma_hook() -> Hook {
     })
 }
 
+fn interact_error(e: impl std::fmt::Display) -> AppError {
+    AppError::Db(format!("interact: {e}"))
+}
+
 impl Db {
-    /// Build the two pools for `db_path`. `read_size` is the reader pool size.
-    pub fn new(db_path: &str, read_size: usize) -> AppResult<Self> {
+    pub fn new(db_path: &str, read_size: usize, synchronous: &str) -> AppResult<Self> {
         let make = |size: usize| -> AppResult<Pool> {
-            let cfg = Config::new(db_path);
-            let pool = cfg
+            Config::new(db_path)
                 .builder(Runtime::Tokio1)
                 .map_err(|e| AppError::Internal(format!("sqlite pool build: {e}")))?
                 .max_size(size)
-                .post_create(pragma_hook())
+                .post_create(pragma_hook(synchronous.to_string()))
                 .build()
-                .map_err(|e| AppError::Internal(format!("sqlite pool: {e}")))?;
-            Ok(pool)
+                .map_err(|e| AppError::Internal(format!("sqlite pool: {e}")))
         };
         Ok(Db {
             write: make(1)?,
@@ -178,23 +164,11 @@ impl Db {
         })
     }
 
-    /// Migrate existing databases and install a final SQLite capacity guard.
-    /// Redis remains the fast admission layer, but a stale/incorrect Redis count
-    /// must never be able to persist the `(max + 1)`th registration.
+    /// 迁移旧库并安装与 Python 相同的容量与审计触发器。
     pub async fn ensure_schema_guards(&self) -> AppResult<()> {
         let conn = self.write.get().await?;
         conn.interact(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let has_operation_id = {
-                let mut stmt = tx.prepare("PRAGMA table_info(registrations)")?;
-                let names = stmt
-                    .query_map([], |r| r.get::<_, String>(1))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                names.iter().any(|name| name == "operation_id")
-            };
-            if !has_operation_id {
-                tx.execute("ALTER TABLE registrations ADD COLUMN operation_id TEXT", [])?;
-            }
             let ensure_column = |table: &str, column: &str, definition: &str| -> rusqlite::Result<()> {
                 let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
                 let names = stmt.query_map([], |r| r.get::<_, String>(1))?
@@ -204,6 +178,7 @@ impl Db {
                 }
                 Ok(())
             };
+            ensure_column("registrations", "operation_id", "operation_id TEXT")?;
             ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")?;
             ensure_column("settings", "registration_locked", "registration_locked INTEGER NOT NULL DEFAULT 0")?;
             for (column, definition) in [
@@ -286,12 +261,10 @@ impl Db {
             Ok::<_, rusqlite::Error>(())
         })
         .await
-        .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+        .map_err(interact_error)??;
         Ok(())
     }
 
-    /// Read all clubs (static columns + current_students as stored — callers
-    /// that want live occupancy overlay Redis on top).
     pub async fn list_clubs(&self) -> AppResult<Vec<ClubRow>> {
         let conn = self.read.get().await?;
         let rows = conn
@@ -301,172 +274,166 @@ impl Db {
                     "image_path,allowed_grades,allowed_classes,enabled,revision,seat_sync_pending \
                      FROM clubs ORDER BY id"
                 ))?;
-                let rows = stmt
-                    .query_map([], |r| {
-                        Ok(ClubRow {
-                            id: r.get(0)?,
-                            name: r.get(1)?,
-                            max_students: r.get(2)?,
-                            current_students: r.get(3)?,
-                            description: r.get(4)?,
-                            advisor_name: r.get(5)?,
-                            meeting_time: r.get(6)?,
-                            location: r.get(7)?,
-                            image_path: r.get(8)?,
-                            allowed_grades: r.get(9)?,
-                            allowed_classes: r.get(10)?,
-                            enabled: r.get(11)?,
-                            revision: r.get(12)?,
-                            seat_sync_pending: r.get(13)?,
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, rusqlite::Error>(rows)
+                stmt.query_map([], |r| {
+                    Ok(ClubRow {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        max_students: r.get(2)?,
+                        current_students: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        description: r.get(4)?,
+                        advisor_name: r.get(5)?,
+                        meeting_time: r.get(6)?,
+                        location: r.get(7)?,
+                        image_path: r.get(8)?,
+                        allowed_grades: r.get(9)?,
+                        allowed_classes: r.get(10)?,
+                        enabled: r.get(11)?,
+                        revision: r.get(12)?,
+                        seat_sync_pending: r.get(13)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+            .map_err(interact_error)??;
         Ok(rows)
     }
 
-    pub async fn club_admission(
-        &self,
-        student_id: StudentId,
-        club_id: ClubId,
-    ) -> AppResult<ClubAdmission> {
-        let conn = self.read.get().await?;
-        let (student_id, club_id) = (student_id.get(), club_id.get());
-        let row = conn
-            .interact(move |conn| {
-                let club: Option<(bool, bool, String, String)> = conn
-                    .query_row(
-                        "SELECT enabled,seat_sync_pending,allowed_grades,allowed_classes FROM clubs WHERE id=?1",
-                        [club_id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                    )
-                    .optional()?;
-                let student: Option<(String, String)> = conn
-                    .query_row(
-                        "SELECT grade,class FROM students WHERE id=?1",
-                        [student_id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?;
-                Ok::<_, rusqlite::Error>((club, student))
-            })
-            .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
-        let Some((enabled, seat_sync_pending, grades, classes)) = row.0 else {
-            return Ok(ClubAdmission::ClubMissing);
-        };
-        if !enabled {
-            return Ok(ClubAdmission::ClubDisabled);
-        }
-        if seat_sync_pending {
-            return Ok(ClubAdmission::SeatSyncPending);
-        }
-        let Some((grade, class_name)) = row.1 else {
-            return Ok(ClubAdmission::Ineligible("学生信息已失效".into()));
-        };
-        match restrictions_allow(&grade, &class_name, &grades, &classes) {
-            RestrictionResult::Allowed => Ok(ClubAdmission::Allowed),
-            RestrictionResult::Grade => Ok(ClubAdmission::Ineligible("不符合年级限制".into())),
-            RestrictionResult::Class => Ok(ClubAdmission::Ineligible("不符合班级限制".into())),
-            RestrictionResult::Invalid => Ok(ClubAdmission::Ineligible("社团限制配置异常".into())),
-        }
-    }
-
-    /// Fast read-side existence check used before Redis seat acquisition.
-    /// A random/nonexistent club id must be a normal business rejection, not
-    /// evidence that Redis stock has drifted and needs a global rebuild.
-    pub async fn club_exists(&self, id: ClubId) -> AppResult<bool> {
+    pub async fn student_grade_class(&self, id: StudentId) -> AppResult<Option<(String, String)>> {
         let conn = self.read.get().await?;
         let id = id.get();
-        let exists = conn
+        let row = conn
             .interact(move |conn| {
-                conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM clubs WHERE id = ?1)",
-                    [id],
-                    |row| row.get::<_, bool>(0),
-                )
+                conn.query_row("SELECT grade,class FROM students WHERE id=?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
-        Ok(exists)
+            .map_err(interact_error)??;
+        Ok(row)
     }
 
-    /// For stock rebuild: each club with its max and the live COUNT of
-    /// registrations (authoritative — we never trust `current_students`).
     pub async fn club_stock_snapshot(&self) -> AppResult<Vec<ClubStock>> {
-        let conn = self.read.get().await?;
-        let rows = conn
-            .interact(|conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT c.id, c.max_students, \
-                     (SELECT COUNT(*) FROM registrations r WHERE r.club_id = c.id) \
-                     FROM clubs c",
-                )?;
-                let rows = stmt
-                    .query_map([], |r| {
-                        Ok(ClubStock {
-                            club_id: r.get(0)?,
-                            max_students: r.get(1)?,
-                            used: r.get(2)?,
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, rusqlite::Error>(rows)
-            })
-            .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
-        Ok(rows)
+        Ok(self.snapshot().await?.clubs)
     }
 
-    /// Capacity rows and registration mirrors from one SQLite read transaction,
-    /// used by a maintenance-fenced Redis rebuild.
-    pub async fn seat_snapshot(
-        &self,
-    ) -> AppResult<(Vec<ClubStock>, Vec<(i64, i64, Option<String>)>)> {
+    /// 整体发布用的一致快照：容量、报名、开放时间与锁定状态来自同一个读事务。
+    pub async fn snapshot(&self) -> AppResult<Snapshot> {
         let conn = self.read.get().await?;
         let snapshot = conn
             .interact(|conn| {
                 let tx = conn.transaction()?;
-                let clubs = {
-                    let mut stmt = tx.prepare(
+                let clubs = tx
+                    .prepare(
                         "SELECT c.id, c.max_students, \
-                         (SELECT COUNT(*) FROM registrations r WHERE r.club_id = c.id) \
-                         FROM clubs c",
-                    )?;
-                    stmt.query_map([], |r| {
-                        Ok(ClubStock {
-                            club_id: r.get(0)?,
-                            max_students: r.get(1)?,
-                            used: r.get(2)?,
-                        })
+                         (SELECT COUNT(*) FROM registrations r WHERE r.club_id = c.id) FROM clubs c",
+                    )?
+                    .query_map([], |r| {
+                        Ok(ClubStock { club_id: r.get(0)?, max_students: r.get(1)?, used: r.get(2)? })
                     })?
-                    .collect::<Result<Vec<_>, _>>()?
-                };
-                let registrations = {
-                    let mut stmt =
-                        tx.prepare("SELECT student_id, club_id, operation_id FROM registrations")?;
-                    stmt.query_map([], |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, i64>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-                };
+                    .collect::<Result<Vec<_>, _>>()?;
+                let registrations = tx
+                    .prepare("SELECT student_id, club_id, operation_id FROM registrations")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let settings: Option<(Option<String>, bool)> = tx
+                    .query_row(
+                        "SELECT registration_start_time, COALESCE(registration_locked,0) \
+                         FROM settings ORDER BY id DESC LIMIT 1",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
                 tx.commit()?;
-                Ok::<_, rusqlite::Error>((clubs, registrations))
+                let (start_time, locked) = settings.unwrap_or((None, false));
+                Ok::<_, rusqlite::Error>(Snapshot { clubs, registrations, start_time, locked })
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+            .map_err(interact_error)??;
         Ok(snapshot)
     }
 
-    /// `settings.registration_start_time` (latest row), used as the SQLite
-    /// fallback for the time gate when Redis `open_at` is absent.
+    /// 单个社团的容量与报名（student_id, operation_id）；社团不存在返回 None。
+    pub async fn club_seat_truth(
+        &self,
+        club_id: i64,
+    ) -> AppResult<Option<(i64, Vec<(i64, Option<String>)>)>> {
+        let conn = self.read.get().await?;
+        let truth = conn
+            .interact(move |conn| {
+                let tx = conn.transaction()?;
+                let maximum: Option<i64> = tx
+                    .query_row(
+                        "SELECT max_students FROM clubs WHERE id=?1",
+                        [club_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(maximum) = maximum else {
+                    return Ok::<_, rusqlite::Error>(None);
+                };
+                let registrations = tx
+                    .prepare("SELECT student_id, operation_id FROM registrations WHERE club_id=?1")?
+                    .query_map([club_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                tx.commit()?;
+                Ok(Some((maximum, registrations)))
+            })
+            .await
+            .map_err(interact_error)??;
+        Ok(truth)
+    }
+
+    pub async fn mark_club_synced(&self, club_id: i64, used: i64) -> AppResult<()> {
+        let conn = self.write.get().await?;
+        conn.interact(move |conn| {
+            conn.execute(
+                "UPDATE clubs SET current_students=?1, seat_sync_pending=0 WHERE id=?2",
+                [used, club_id],
+            )
+        })
+        .await
+        .map_err(interact_error)??;
+        Ok(())
+    }
+
+    pub async fn mark_all_synced(&self) -> AppResult<()> {
+        let conn = self.write.get().await?;
+        conn.interact(|conn| {
+            conn.execute(
+                "UPDATE clubs SET current_students=\
+                 (SELECT COUNT(*) FROM registrations r WHERE r.club_id=clubs.id), seat_sync_pending=0",
+                [],
+            )
+        })
+        .await
+        .map_err(interact_error)??;
+        Ok(())
+    }
+
+    pub async fn clubs_pending_sync(&self) -> AppResult<Vec<i64>> {
+        self.ids("SELECT id FROM clubs WHERE seat_sync_pending=1")
+            .await
+    }
+
+    pub async fn club_ids(&self) -> AppResult<Vec<i64>> {
+        self.ids("SELECT id FROM clubs").await
+    }
+
+    async fn ids(&self, sql: &'static str) -> AppResult<Vec<i64>> {
+        let conn = self.read.get().await?;
+        let ids = conn
+            .interact(move |conn| {
+                conn.prepare(sql)?
+                    .query_map([], |r| r.get(0))?
+                    .collect::<Result<Vec<i64>, _>>()
+            })
+            .await
+            .map_err(interact_error)??;
+        Ok(ids)
+    }
+
     pub async fn registration_start_time(&self) -> AppResult<Option<String>> {
         let conn = self.read.get().await?;
         let v = conn
@@ -479,8 +446,7 @@ impl Db {
                 .optional()
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
-        // flatten Option<Option<String>>
+            .map_err(interact_error)??;
         Ok(v.flatten())
     }
 
@@ -496,12 +462,10 @@ impl Db {
                 .optional()
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+            .map_err(interact_error)??;
         Ok(value.unwrap_or(false))
     }
 
-    /// Look up the student row used to build a session after a successful login.
-    /// Returns the identity/profile fields plus password hash or legacy plaintext.
     pub async fn find_student_by_username(
         &self,
         username: String,
@@ -510,29 +474,27 @@ impl Db {
         let row = conn
             .interact(move |conn| {
                 conn.query_row(
-                    "SELECT id, name, class, student_id, password \
-                     FROM students WHERE username = ?1",
+                    "SELECT id, name, class, grade, student_id, password FROM students WHERE username = ?1",
                     [username],
                     |r| {
                         Ok(StudentAuthRow {
                             id: r.get(0)?,
                             name: r.get(1)?,
                             class: r.get(2)?,
-                            student_no: r.get(3)?,
-                            password: r.get(4)?,
+                            grade: r.get(3)?,
+                            student_no: r.get(4)?,
+                            password: r.get(5)?,
                         })
                     },
                 )
                 .optional()
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+            .map_err(interact_error)??;
         Ok(row)
     }
 
-    /// Upgrade a legacy password only if it is still the exact value that was
-    /// authenticated. A concurrent password change must never be overwritten
-    /// by a delayed login's opportunistic rehash.
+    /// 只在口令仍是刚才验证的那一个时升级，避免覆盖并发的改密。
     pub async fn update_password_if_matches(
         &self,
         id: StudentId,
@@ -549,18 +511,17 @@ impl Db {
                 )
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+            .map_err(interact_error)??;
         Ok(changed == 1)
     }
 
-    /// Profile for `/api/get_student_info`. JOINs the (optional) registration.
     pub async fn student_info(&self, id: StudentId) -> AppResult<Option<StudentInfoRow>> {
         let conn = self.read.get().await?;
         let id = id.get();
         let row = conn
             .interact(move |conn| {
                 conn.query_row(
-                    "SELECT s.name, s.class, s.student_id, s.username, \
+                    "SELECT s.name, s.class, s.grade, s.student_id, s.username, \
                             c.name, r.registration_time, r.club_id \
                      FROM students s \
                      LEFT JOIN registrations r ON r.student_id = s.id \
@@ -571,22 +532,50 @@ impl Db {
                         Ok(StudentInfoRow {
                             name: r.get(0)?,
                             class: r.get(1)?,
-                            student_no: r.get(2)?,
-                            username: r.get(3)?,
-                            registered_club: r.get(4)?,
-                            registration_time: r.get(5)?,
-                            registered_club_id: r.get(6)?,
+                            grade: r.get(2)?,
+                            student_no: r.get(3)?,
+                            username: r.get(4)?,
+                            registered_club: r.get(5)?,
+                            registration_time: r.get(6)?,
+                            registered_club_id: r.get(7)?,
                         })
                     },
                 )
                 .optional()
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+            .map_err(interact_error)??;
         Ok(row)
     }
 
-    /// 按操作代际查询报名是否已落库。
+    pub async fn registration_for_student(
+        &self,
+        id: StudentId,
+    ) -> AppResult<Option<StudentRegistration>> {
+        let conn = self.read.get().await?;
+        let id = id.get();
+        let row = conn
+            .interact(move |conn| {
+                conn.query_row(
+                    "SELECT r.id, r.club_id, r.operation_id, c.seat_sync_pending FROM registrations r \
+                     JOIN clubs c ON c.id = r.club_id WHERE r.student_id = ?1",
+                    [id],
+                    |r| {
+                        Ok(StudentRegistration {
+                            registration_id: r.get(0)?,
+                            club_id: r.get(1)?,
+                            operation_id: r.get(2)?,
+                            seat_sync_pending: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .await
+            .map_err(interact_error)??;
+        Ok(row)
+    }
+
     pub async fn registration_by_operation(&self, operation_id: String) -> AppResult<Option<i64>> {
         let conn = self.read.get().await?;
         let id = conn
@@ -599,31 +588,11 @@ impl Db {
                 .optional()
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+            .map_err(interact_error)??;
         Ok(id)
     }
 
-    pub async fn registered_club_id(&self, id: StudentId) -> AppResult<Option<i64>> {
-        let conn = self.read.get().await?;
-        let id = id.get();
-        let club_id = conn
-            .interact(move |conn| {
-                conn.query_row(
-                    "SELECT club_id FROM registrations WHERE student_id = ?1",
-                    [id],
-                    |r| r.get(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
-        Ok(club_id)
-    }
-
-    /// Transactionally persist a registration after Redis acquire succeeded:
-    /// INSERT into registrations + bump current_students. Returns Ok(()) on
-    /// success. The IMMEDIATE transaction and explicit count are a DB-level
-    /// capacity backstop shared with the Python service.
+    /// 抢位成功后落库；容量、锁定、资格在最终写事务内再核对一次。
     pub async fn insert_registration(
         &self,
         sid: StudentId,
@@ -635,39 +604,46 @@ impl Db {
         let (sid, cid) = (sid.get(), cid.get());
         let outcome = conn
             .interact(move |conn| {
+                use RegistrationInsertOutcome as O;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let locked: bool = tx.query_row(
-                    "SELECT COALESCE(registration_locked,0) FROM settings ORDER BY id DESC LIMIT 1",
-                    [], |r| r.get(0),
-                ).optional()?.unwrap_or(false);
+                let locked: bool = tx
+                    .query_row(
+                        "SELECT COALESCE(registration_locked,0) FROM settings ORDER BY id DESC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
                 if locked {
-                    tx.rollback()?;
-                    return Ok::<_, rusqlite::Error>(RegistrationInsertOutcome::RegistrationLocked);
+                    return Ok::<_, rusqlite::Error>(O::RegistrationLocked);
                 }
                 let club: Option<(i64, bool, bool, String, String)> = tx
                     .query_row(
                         "SELECT max_students,enabled,seat_sync_pending,allowed_grades,allowed_classes \
                          FROM clubs WHERE id=?1",
-                        [cid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                        [cid],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                     )
                     .optional()?;
-                let Some((max_students, enabled, seat_sync_pending, allowed_grades, allowed_classes)) = club else {
-                    tx.rollback()?;
-                    return Ok::<_, rusqlite::Error>(RegistrationInsertOutcome::ClubMissing);
+                let Some((max_students, enabled, sync_pending, grades, classes)) = club else {
+                    return Ok(O::ClubMissing);
                 };
-                if !enabled { tx.rollback()?; return Ok(RegistrationInsertOutcome::ClubDisabled); }
-                if seat_sync_pending { tx.rollback()?; return Ok(RegistrationInsertOutcome::SeatSyncPending); }
-                let student: Option<(String, String)> = tx.query_row(
-                    "SELECT grade,class FROM students WHERE id=?1", [sid],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                ).optional()?;
+                if !enabled {
+                    return Ok(O::ClubDisabled);
+                }
+                if sync_pending {
+                    return Ok(O::SeatSyncPending);
+                }
+                let student: Option<(String, String)> = tx
+                    .query_row("SELECT grade,class FROM students WHERE id=?1", [sid], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .optional()?;
                 let Some((grade, class_name)) = student else {
-                    tx.rollback()?;
-                    return Ok(RegistrationInsertOutcome::Ineligible);
+                    return Ok(O::Ineligible("ineligible_config"));
                 };
-                if !matches!(restrictions_allow(&grade, &class_name, &allowed_grades, &allowed_classes), RestrictionResult::Allowed) {
-                    tx.rollback()?;
-                    return Ok(RegistrationInsertOutcome::Ineligible);
+                if let Some(code) = restriction_code(&grade, &class_name, &grades, &classes) {
+                    return Ok(O::Ineligible(code));
                 }
                 let already: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM registrations WHERE student_id = ?1)",
@@ -675,8 +651,7 @@ impl Db {
                     |r| r.get(0),
                 )?;
                 if already {
-                    tx.rollback()?;
-                    return Ok(RegistrationInsertOutcome::AlreadyRegistered);
+                    return Ok(O::AlreadyRegistered);
                 }
                 let used: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM registrations WHERE club_id = ?1",
@@ -684,13 +659,11 @@ impl Db {
                     |r| r.get(0),
                 )?;
                 if used >= max_students {
-                    tx.rollback()?;
-                    return Ok(RegistrationInsertOutcome::ClubFull);
+                    return Ok(O::ClubFull);
                 }
                 tx.execute(
-                    "INSERT INTO registrations \
-                 (student_id, club_id, registration_time, operation_id) \
-                 VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO registrations (student_id, club_id, registration_time, operation_id) \
+                     VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![sid, cid, when, operation_id.clone()],
                 )?;
                 let registration_id = tx.last_insert_rowid();
@@ -702,87 +675,80 @@ impl Db {
                     &tx,
                     AuditEvent {
                         event_id: &format!("registration-{operation_id}"),
-                        actor_role: "student",
                         actor_id: &sid.to_string(),
                         action: "registration.created",
-                        target_type: "registration",
                         target_id: &registration_id.to_string(),
                         before_json: "{\"registered_club_id\":null}",
                         after_json: &format!("{{\"registration_id\":{registration_id},\"club_id\":{cid}}}"),
-                        metadata_json: &format!("{{\"operation_id\":\"{operation_id}\"}}"),
+                        metadata_json: &serde_json::json!({ "operation_id": operation_id }).to_string(),
                     },
                 )?;
                 tx.commit()?;
-                Ok::<_, rusqlite::Error>(RegistrationInsertOutcome::Inserted { registration_id })
+                Ok(O::Inserted { registration_id })
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+            .map_err(interact_error)??;
         Ok(outcome)
     }
 
-    /// Cancel: look up the club, delete the registration, decrement
-    /// current_students (floored at 0). Returns the freed `ClubId` so the caller
-    /// can `INCR` the Redis stock, or None if the student had no registration.
-    pub async fn cancel_registration(
+    /// 退选落库：报名必须仍是读到的那一条，锁定与同步中的社团不处理。
+    pub async fn delete_registration(
         &self,
         sid: StudentId,
-    ) -> AppResult<CancelRegistrationOutcome> {
+        registration_id: i64,
+        club_id: i64,
+        operation_id: Option<String>,
+    ) -> AppResult<DeleteOutcome> {
         let conn = self.write.get().await?;
-        let sid_i = sid.get();
-        let freed = conn
+        let sid = sid.get();
+        let outcome = conn
             .interact(move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let registration: Option<(i64, i64, Option<String>, bool, bool)> = tx
+                let row: Option<(i64, bool, bool)> = tx
                     .query_row(
-                        "SELECT r.id, r.club_id, r.operation_id, c.seat_sync_pending, \
+                        "SELECT r.id, c.seat_sync_pending, \
                          COALESCE((SELECT registration_locked FROM settings ORDER BY id DESC LIMIT 1),0) \
                          FROM registrations r JOIN clubs c ON c.id=r.club_id WHERE r.student_id = ?1",
-                        [sid_i],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                        [sid],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()?;
-                let Some((registration_id, club_id, operation_id, seat_sync_pending, registration_locked)) = registration else {
-                    tx.rollback()?;
-                    return Ok::<CancelRegistrationOutcome, rusqlite::Error>(CancelRegistrationOutcome::NotRegistered);
+                let Some((current_id, sync_pending, locked)) = row else {
+                    return Ok::<_, rusqlite::Error>(DeleteOutcome::NotRegistered);
                 };
-                if seat_sync_pending {
-                    tx.rollback()?;
-                    return Ok(CancelRegistrationOutcome::SeatSyncPending);
+                if current_id != registration_id {
+                    return Ok(DeleteOutcome::NotRegistered);
                 }
-                if registration_locked {
-                    tx.rollback()?;
-                    return Ok(CancelRegistrationOutcome::RegistrationLocked);
+                if locked {
+                    return Ok(DeleteOutcome::Locked);
+                }
+                if sync_pending {
+                    return Ok(DeleteOutcome::Syncing);
                 }
                 let deleted = tx.execute(
                     "DELETE FROM registrations WHERE id = ?1 AND student_id = ?2",
-                    rusqlite::params![registration_id, sid_i],
+                    rusqlite::params![registration_id, sid],
                 )?;
                 if deleted != 1 {
-                    tx.rollback()?;
-                    return Ok(CancelRegistrationOutcome::NotRegistered);
+                    return Ok(DeleteOutcome::NotRegistered);
                 }
-                // floor at 0 so concurrent/admin deletes can't drive it negative.
                 tx.execute(
                     "UPDATE clubs SET current_students = current_students - 1 \
                      WHERE id = ?1 AND current_students > 0",
                     [club_id],
                 )?;
-                let event_suffix = operation_id
-                    .as_deref()
-                    .map(str::to_owned)
+                let suffix = operation_id
+                    .clone()
                     .unwrap_or_else(|| format!("legacy-{registration_id}"));
                 let metadata = operation_id
-                    .as_deref()
-                    .map(|value| format!("{{\"operation_id\":\"{value}\"}}"))
+                    .map(|value| serde_json::json!({ "operation_id": value }).to_string())
                     .unwrap_or_else(|| "{}".to_string());
                 append_audit_event(
                     &tx,
                     AuditEvent {
-                        event_id: &format!("registration-cancel-{event_suffix}"),
-                        actor_role: "student",
-                        actor_id: &sid_i.to_string(),
+                        event_id: &format!("registration-cancel-{suffix}"),
+                        actor_id: &sid.to_string(),
                         action: "registration.cancelled",
-                        target_type: "registration",
                         target_id: &registration_id.to_string(),
                         before_json: &format!(
                             "{{\"registration_id\":{registration_id},\"club_id\":{club_id}}}"
@@ -792,40 +758,18 @@ impl Db {
                     },
                 )?;
                 tx.commit()?;
-                Ok(CancelRegistrationOutcome::Cancelled(CancelledRegistration {
-                    registration_id,
-                    club_id: ClubId(club_id),
-                    operation_id,
-                }))
+                Ok(DeleteOutcome::Deleted)
             })
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
-        Ok(freed)
+            .map_err(interact_error)??;
+        Ok(outcome)
     }
 
-    /// A completed maintenance-fenced Redis rebuild is authoritative for all
-    /// stock/mirror keys, so it can release any durable per-club sync holds.
-    /// If this write fails the holds stay in place, which is conservative.
-    pub async fn clear_all_seat_sync_pending(&self) -> AppResult<()> {
-        let conn = self.write.get().await?;
-        conn.interact(|conn| {
-            conn.execute(
-                "UPDATE clubs SET seat_sync_pending=0 WHERE seat_sync_pending=1",
-                [],
-            )?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(|e| AppError::Db(format!("interact: {e}")))??;
-        Ok(())
-    }
-
-    /// Cheap liveness probe for `/healthz`: grab a reader and run `SELECT 1`.
     pub async fn ping(&self) -> AppResult<()> {
         let conn = self.read.get().await?;
         conn.interact(|conn| conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)))
             .await
-            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+            .map_err(interact_error)??;
         Ok(())
     }
 }
@@ -835,6 +779,7 @@ pub struct StudentAuthRow {
     pub id: i64,
     pub name: String,
     pub class: String,
+    pub grade: String,
     pub student_no: String,
     pub password: String,
 }
@@ -843,12 +788,10 @@ pub struct StudentAuthRow {
 pub struct StudentInfoRow {
     pub name: String,
     pub class: String,
+    pub grade: String,
     pub student_no: String,
     pub username: String,
     pub registered_club: Option<String>,
     pub registration_time: Option<String>,
     pub registered_club_id: Option<i64>,
 }
-
-// bring `.optional()` into scope for query_row.
-use rusqlite::OptionalExtension;

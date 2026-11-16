@@ -1,0 +1,17 @@
+[Unit]
+Description=OMMS 选课系统（Rust 热路径）
+After=network.target omms-python.service
+Wants=omms-python.service
+
+[Service]
+Type=simple
+User=omms
+WorkingDirectory=/opt/omms
+EnvironmentFile=/opt/omms/deploy/omms.env
+ExecStart=/opt/omms/club-hot/target/release/club-hot
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

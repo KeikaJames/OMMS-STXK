@@ -18,3 +18,6 @@ target/
 # 杂项
 .DS_Store
 *.log
+
+# 运行目录
+run/

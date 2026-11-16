@@ -1,0 +1,16 @@
+[Unit]
+Description=OMMS 选课系统（Python 服务）
+After=network.target redis.service redis-server.service
+Wants=redis.service redis-server.service
+
+[Service]
+Type=simple
+User=omms
+WorkingDirectory=/opt/omms
+EnvironmentFile=/opt/omms/deploy/omms.env
+ExecStart=/usr/bin/python3 /opt/omms/main.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

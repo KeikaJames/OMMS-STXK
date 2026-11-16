@@ -1,632 +1,641 @@
-//! Redis seat/session gate — the authoritative concurrency layer.
+//! Redis 名额与会话：与 main.py 共用键名、Lua 脚本（shared/lua）和会话格式。
 //!
-//! Mirrors `RedisGate` in `main.py` exactly so the Rust hot service and the
-//! Python admin service share one Redis with an identical key contract:
-//!   * `stock:club:{id}`   — remaining seats (source of truth for oversell)
-//!   * `student:reg:{id}`  — confirmed registration -> club_id|operation_id
-//!   * `resv:{id}`         — in-flight club_id|operation_id (TTL'd)
-//!   * `sess:{token}`      — session JSON
-//!   * `open_at`           — registration-open epoch seconds
-//!   * `cache:clubs`       — clubs cache key (invalidated on mutation)
-//!   * `seats:initialized` — set to "1" after `rebuild_stock`
-//!   * `loginfail:{key}`   — per-minute failed-login counter
-//!
-//! Degradation contract: write paths that cannot reach Redis surface
-//! [`AppError::RedisDown`] (-> 503) and MUST NOT fall back to an unlocked
-//! SQLite path. Read paths may fall back to SQLite by treating a Redis miss as
-//! `None` and letting the caller decide.
+//! 写路径在 Redis 不可达时返回 [`AppError::RedisDown`]（503）；读路径失败时返回 None，
+//! 由调用方回落 SQLite。
 
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deadpool_redis::Pool as RedisPool;
 use redis::{AsyncCommands, Script};
 
-use crate::db::Db;
+use crate::db::{Db, Snapshot};
 use crate::error::{AppError, AppResult};
+use crate::state::Config;
 
-// --- key helpers -----------------------------------------------------------
+static ACQUIRE: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/acquire.lua")));
+static CONFIRM: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/confirm.lua")));
+static ROLLBACK: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/rollback.lua")));
+static CANCEL_BEGIN: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/cancel_begin.lua")));
+static CANCEL_RELEASE: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/cancel_release.lua")));
+static LEASE_END: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/lease_end.lua")));
+static FENCE_PUBLISH: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/fence_publish.lua")));
+static MIRROR_SET: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/mirror_set.lua")));
+static SESSION_CREATE: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/session_create.lua")));
+static LOGIN_FAIL: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../shared/lua/login_fail.lua")));
 
-pub fn k_stock(club_id: i64) -> String {
-    format!("stock:club:{club_id}")
-}
-pub fn k_stureg(student_id: i64) -> String {
-    format!("student:reg:{student_id}")
-}
-pub fn k_resv(student_id: i64) -> String {
-    format!("resv:{student_id}")
-}
-pub fn k_sess(token: &str) -> String {
-    format!("sess:{token}")
-}
-pub fn k_sess_epoch(role: &str) -> String {
-    format!("sess:epoch:{role}")
-}
-pub fn k_sess_version(role: &str, principal: &str) -> String {
-    format!("sess:version:{role}:{principal}")
-}
-pub fn k_sess_role_mutation(role: &str) -> String {
-    format!("sess:mutation:role:{role}")
-}
-pub fn k_sess_principal_mutation(role: &str, principal: &str) -> String {
-    format!("sess:mutation:{role}:{principal}")
-}
-pub fn k_op(student_id: i64) -> String {
-    format!("seat:op:{student_id}")
-}
+const MAINTENANCE_TTL: i64 = 300;
+const FENCE_TTL: i64 = 30;
+const FENCE_WAIT: Duration = Duration::from_secs(5);
+const LOGIN_WINDOW: i64 = 60;
+const DEVICE_TTL: i64 = 180 * 24 * 3600;
 
-pub const K_OPENAT: &str = "open_at";
-pub const K_REGISTRATION_LOCK: &str = "registration_locked";
-pub const K_CACHE_CLUBS: &str = "cache:clubs";
-pub const K_INIT: &str = "seats:initialized";
-pub const K_MAINT: &str = "seats:maintenance";
-
-/// Acquire Lua — byte-for-byte equivalent to `LUA_ACQUIRE` in `main.py`.
-/// Open-time check, maintenance gate, duplicate check, and decrement all happen
-/// in one Redis operation. KEYS=stock/stureg/resv/open_at/maintenance/seat-op/lock;
-/// ARGV=reservation_value/reservation-ttl/operation-ttl.
-const LUA_ACQUIRE: &str = r#"
-    if redis.replicate_commands then redis.replicate_commands() end
-    local reservation_ttl = tonumber(ARGV[2])
-    local operation_ttl = tonumber(ARGV[3])
-    if not reservation_ttl or reservation_ttl <= 0 or not operation_ttl or operation_ttl <= 0 then return -5 end
-    if redis.call('GET', KEYS[7]) == '1' then return -6 end
-    if redis.call('GET', KEYS[6]) == ARGV[1] then
-        if redis.call('GET', KEYS[3]) ~= ARGV[1] then
-            redis.call('SET', KEYS[3], ARGV[1], 'EX', reservation_ttl)
-        end
-        return 1
-    end
-    if redis.call('EXISTS', KEYS[5]) == 1 then return -3 end
-    local open_at = redis.call('GET', KEYS[4])
-    if not open_at then return -2 end
-    local now = redis.call('TIME')
-    if tonumber(now[1]) < tonumber(open_at) then return -4 end
-    if redis.call('EXISTS', KEYS[1]) == 0 then return -2 end
-    if redis.call('EXISTS', KEYS[2]) == 1 then return -1 end
-    if redis.call('EXISTS', KEYS[3]) == 1 then return -1 end
-    if redis.call('EXISTS', KEYS[6]) == 1 then return -1 end
-    local left = tonumber(redis.call('GET', KEYS[1]))
-    if left <= 0 then return 0 end
-    local resv_set = redis.pcall('SET', KEYS[3], ARGV[1], 'EX', reservation_ttl)
-    if type(resv_set) == 'table' and resv_set.err then return -5 end
-    local op_set = redis.pcall('SET', KEYS[6], ARGV[1], 'EX', operation_ttl)
-    if type(op_set) == 'table' and op_set.err then
-        redis.call('DEL', KEYS[3])
-        return -5
-    end
-    local decremented = redis.pcall('DECR', KEYS[1])
-    if type(decremented) == 'table' and decremented.err then
-        redis.call('DEL', KEYS[3])
-        redis.call('DEL', KEYS[6])
-        return -5
-    end
-return 1
-"#;
-
-static ACQUIRE_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(LUA_ACQUIRE));
-
-const LUA_CONFIRM: &str = r#"
-    if redis.call('GET', KEYS[2]) == ARGV[1] then
-        if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
-        if redis.call('GET', KEYS[3]) == ARGV[1] then redis.call('DEL', KEYS[3]) end
-        return 1
-    end
-    if redis.call('GET', KEYS[1]) ~= ARGV[1] and redis.call('GET', KEYS[3]) ~= ARGV[1] then return 0 end
-    redis.call('SET', KEYS[2], ARGV[1])
-    if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
-    if redis.call('GET', KEYS[3]) == ARGV[1] then redis.call('DEL', KEYS[3]) end
-    return 1
-"#;
-
-const LUA_ROLLBACK: &str = r#"
-    local stock = redis.call('GET', KEYS[1])
-    if not stock or not tonumber(stock) then return -1 end
-    if redis.call('EXISTS', KEYS[3]) == 1 then return 0 end
-    redis.call('SET', KEYS[3], '1', 'EX', 604800)
-    local owned = false
-    if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]); owned = true end
-    if redis.call('GET', KEYS[4]) == ARGV[1] then redis.call('DEL', KEYS[4]); owned = true end
-    if not owned then return 2 end
-    redis.call('INCR', KEYS[1])
-    return 1
-"#;
-
-const LUA_CANCEL: &str = r#"
-    local stock = redis.call('GET', KEYS[1])
-    if not stock or not tonumber(stock) then return -1 end
-    if redis.call('EXISTS', KEYS[4]) == 1 then return 0 end
-    redis.call('SET', KEYS[4], '1', 'EX', 604800)
-    local confirmed = redis.call('GET', KEYS[2])
-    if confirmed == ARGV[1] or confirmed == ARGV[2] then redis.call('DEL', KEYS[2]) end
-    if redis.call('GET', KEYS[3]) == ARGV[1] then redis.call('DEL', KEYS[3]) end
-    redis.call('INCR', KEYS[1])
-    return 1
-"#;
-
-static CONFIRM_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(LUA_CONFIRM));
-static ROLLBACK_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(LUA_ROLLBACK));
-static CANCEL_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(LUA_CANCEL));
-
-const LUA_STUDENT_OP_BEGIN: &str = r#"
-    if redis.call('GET', KEYS[2]) == ARGV[1] then return 1 end
-    if redis.call('EXISTS', KEYS[1]) == 1 then return -1 end
-    if redis.call('SET', KEYS[2], ARGV[1], 'NX', 'EX', tonumber(ARGV[2])) then return 1 end
-    return 0
-"#;
-
-const LUA_OWNED_DEL: &str = r#"
-    if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
-    return 0
-"#;
-
-static STUDENT_OP_BEGIN_SCRIPT: LazyLock<Script> =
-    LazyLock::new(|| Script::new(LUA_STUDENT_OP_BEGIN));
-static OWNED_DEL_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(LUA_OWNED_DEL));
-
-// Keep the session-generation protocol byte-for-byte equivalent to main.py.
-// A stale login that raced a delete/password change returns 0 and never emits a
-// usable cookie; an ordinary successful login increments its account version.
-const LUA_SESSION_CREATE: &str = r#"
-    local epoch = tonumber(redis.call('GET', KEYS[1]) or '0')
-    local version = tonumber(redis.call('GET', KEYS[2]) or '0')
-    if not epoch or not version then return -1 end
-    if redis.call('EXISTS', KEYS[4]) == 1 or redis.call('EXISTS', KEYS[5]) == 1 then return -2 end
-    if epoch ~= tonumber(ARGV[3]) or version ~= tonumber(ARGV[4]) then return 0 end
-    local next_version = version + 1
-    local payload = cjson.decode(ARGV[1])
-    payload['_session_epoch'] = epoch
-    payload['_session_version'] = next_version
-    local created = redis.pcall('SET', KEYS[3], cjson.encode(payload), 'EX', tonumber(ARGV[2]))
-    if type(created) == 'table' and created.err then return -3 end
-    local advanced = redis.pcall('INCR', KEYS[2])
-    if type(advanced) == 'table' and advanced.err then
-      redis.call('DEL', KEYS[3])
-      return -3
-    end
-    if tonumber(advanced) ~= next_version then
-      redis.call('DEL', KEYS[3])
-      return -3
-    end
-    return 1
-"#;
-
-const LUA_LOGIN_FAIL: &str = r#"
-    local n = redis.call('INCR', KEYS[1])
-    if n == 1 then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
-    return n
-"#;
-
-static SESSION_CREATE_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(LUA_SESSION_CREATE));
-static LOGIN_FAIL_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(LUA_LOGIN_FAIL));
-
-const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
-const REDIS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
-const OPERATION_TTL_SECS: i64 = 120;
-
-async fn redis_deadline<T, F>(future: F) -> AppResult<T>
-where
-    F: Future<Output = redis::RedisResult<T>>,
-{
-    tokio::time::timeout(REDIS_COMMAND_TIMEOUT, future)
-        .await
-        .map_err(|_| AppError::RedisDown)?
-        .map_err(|_| AppError::RedisDown)
-}
-
-fn parse_session_counter(value: Option<String>) -> AppResult<i64> {
-    match value {
-        None => Ok(0),
-        Some(value) => value
-            .parse::<i64>()
-            .ok()
-            .filter(|value| *value >= 0)
-            .ok_or_else(|| AppError::Internal("invalid session generation".into())),
-    }
-}
-
-fn session_identity(payload: &serde_json::Value) -> Option<(String, String)> {
-    match payload.get("role").and_then(|value| value.as_str()) {
-        Some("student") => payload
-            .get("student_id")
-            .and_then(|value| value.as_i64())
-            .filter(|student_id| *student_id > 0)
-            .map(|student_id| ("student".to_string(), student_id.to_string())),
-        Some("admin") => payload
-            .get("username")
-            .and_then(|value| value.as_str())
-            .filter(|username| !username.is_empty() && username.len() <= 80)
-            .map(|username| ("admin".to_string(), username.to_string())),
-        _ => None,
-    }
-}
-
-/// Outcome of a seat acquire attempt.
+/// 抢位脚本的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcquireOutcome {
-    /// Reservation taken; caller must persist to SQLite then confirm/release.
-    Ok,
-    /// Club is full.
+pub enum Acquire {
+    Acquired,
+    OtherAttempt,
     Full,
-    /// Already registered (confirmed or in-flight) for some club.
-    Already,
-    /// Stock key missing — needs a stock rebuild.
+    Existing,
     Uninitialized,
-    /// A maintenance operation currently owns the write gate.
-    Maintenance,
-    /// Registration is not open according to Redis TIME/open_at.
+    Fenced,
     NotOpen,
-    /// Administrator locked the published registration list.
     Locked,
+    Invalid,
 }
 
-impl AcquireOutcome {
+impl Acquire {
     fn from_code(code: i64) -> Self {
         match code {
-            1 => AcquireOutcome::Ok,
-            0 => AcquireOutcome::Full,
-            -1 => AcquireOutcome::Already,
-            -2 => AcquireOutcome::Uninitialized,
-            -3 => AcquireOutcome::Maintenance,
-            -4 => AcquireOutcome::NotOpen,
-            -6 => AcquireOutcome::Locked,
-            _ => AcquireOutcome::Uninitialized,
+            1 | 2 => Acquire::Acquired,
+            3 => Acquire::OtherAttempt,
+            0 => Acquire::Full,
+            -1 => Acquire::Existing,
+            -2 => Acquire::Uninitialized,
+            -3 => Acquire::Fenced,
+            -4 => Acquire::NotOpen,
+            -6 => Acquire::Locked,
+            _ => Acquire::Invalid,
         }
     }
 }
 
-/// Thin handle over the Redis pool with all seat/session operations.
-///
-/// Every method that a *write* endpoint depends on returns `AppResult` and maps
-/// a connection/command failure to [`AppError::RedisDown`], so the handler can
-/// reject with 503. Read-side helpers return `Option`/`bool` and swallow errors
-/// into a "miss" so callers can fall back to SQLite.
 #[derive(Clone)]
 pub struct Seats {
     pool: RedisPool,
+    prefix: String,
+    timeout: Duration,
+    op_ttl: i64,
 }
 
 impl Seats {
-    pub fn new(pool: RedisPool) -> Self {
-        Seats { pool }
+    pub fn new(pool: RedisPool, cfg: &Config) -> Self {
+        Seats {
+            pool,
+            prefix: cfg.redis_prefix.clone(),
+            timeout: cfg.redis_timeout,
+            op_ttl: cfg.seat_op_ttl,
+        }
     }
 
-    /// Liveness `PING`. `true` only if a connection is obtainable and answers.
+    // ---- 键 ----
+    fn key(&self, parts: &[&dyn std::fmt::Display]) -> String {
+        let joined: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+        format!("{}{}", self.prefix, joined.join(":"))
+    }
+    pub fn k_stock(&self, club: i64) -> String {
+        self.key(&[&"stock", &club])
+    }
+    pub fn k_reg(&self, student: i64) -> String {
+        self.key(&[&"reg", &student])
+    }
+    pub fn k_op(&self, student: i64) -> String {
+        self.key(&[&"op", &student])
+    }
+    pub fn k_inflight(&self, club: i64) -> String {
+        self.key(&[&"inflight", &club])
+    }
+    fn k_fence(&self, club: i64) -> String {
+        self.key(&[&"fence", &club])
+    }
+    fn k_open_at(&self) -> String {
+        self.key(&[&"open_at"])
+    }
+    fn k_locked(&self) -> String {
+        self.key(&[&"locked"])
+    }
+    fn k_init(&self) -> String {
+        self.key(&[&"init"])
+    }
+    fn k_maint(&self) -> String {
+        self.key(&[&"maint"])
+    }
+    fn k_repair(&self) -> String {
+        self.key(&[&"repair"])
+    }
+    fn k_sess(&self, token: &str) -> String {
+        self.key(&[&"sess", &token])
+    }
+    fn k_epoch(&self, role: &str) -> String {
+        self.key(&[&"sessgen", &"epoch", &role])
+    }
+    fn k_version(&self, role: &str, principal: &str) -> String {
+        self.key(&[&"sessgen", &"ver", &role, &principal])
+    }
+    fn k_role_mutation(&self, role: &str) -> String {
+        self.key(&[&"sessmut", &"role", &role])
+    }
+    fn k_principal_mutation(&self, role: &str, principal: &str) -> String {
+        self.key(&[&"sessmut", &role, &principal])
+    }
+    fn k_fail(&self, key: &str) -> String {
+        self.key(&[&"fail", &key])
+    }
+    fn k_trust(&self, role: &str, username: &str, device: &str) -> String {
+        self.key(&[&"trust", &role, &username, &device])
+    }
+
+    async fn deadline<T, F>(&self, future: F) -> AppResult<T>
+    where
+        F: Future<Output = redis::RedisResult<T>>,
+    {
+        tokio::time::timeout(self.timeout, future)
+            .await
+            .map_err(|_| AppError::RedisDown)?
+            .map_err(|_| AppError::RedisDown)
+    }
+
+    async fn conn(&self) -> AppResult<deadpool_redis::Connection> {
+        self.pool.get().await.map_err(|_| AppError::RedisDown)
+    }
+
+    /// 运行脚本；失败重试一次（脚本对同一参数幂等）。
+    async fn run(&self, script: &Script, keys: &[String], args: &[String]) -> AppResult<i64> {
+        for _ in 0..2 {
+            let Ok(mut conn) = self.pool.get().await else {
+                continue;
+            };
+            let mut invocation = script.prepare_invoke();
+            for key in keys {
+                invocation.key(key);
+            }
+            for arg in args {
+                invocation.arg(arg);
+            }
+            if let Ok(code) = self
+                .deadline(invocation.invoke_async::<i64>(&mut conn))
+                .await
+            {
+                return Ok(code);
+            }
+        }
+        Err(AppError::RedisDown)
+    }
+
     pub async fn alive(&self) -> bool {
         let Ok(mut conn) = self.pool.get().await else {
             return false;
         };
-        redis_deadline(redis::cmd("PING").query_async::<String>(&mut conn))
+        self.deadline(redis::cmd("PING").query_async::<String>(&mut conn))
             .await
             .is_ok()
     }
 
-    /// Atomic seat acquire via the Lua script. Redis unreachable -> RedisDown.
+    pub async fn initialized(&self) -> bool {
+        let Ok(mut conn) = self.pool.get().await else {
+            return false;
+        };
+        self.deadline(conn.exists(self.k_init()))
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn maintenance_active(&self) -> Option<bool> {
+        let mut conn = self.pool.get().await.ok()?;
+        self.deadline(conn.exists(self.k_maint())).await.ok()
+    }
+
+    // ---- 抢位、确认、撤销 ----
     pub async fn acquire(
         &self,
-        student_id: i64,
-        club_id: i64,
-        reservation_value: &str,
-        ttl: i64,
-    ) -> AppResult<AcquireOutcome> {
-        for _ in 0..2 {
-            let Ok(mut conn) = self.pool.get().await else {
-                continue;
-            };
-            let result = redis_deadline(
-                ACQUIRE_SCRIPT
-                    .key(k_stock(club_id))
-                    .key(k_stureg(student_id))
-                    .key(k_resv(student_id))
-                    .key(K_OPENAT)
-                    .key(K_MAINT)
-                    .key(k_op(student_id))
-                    .key(K_REGISTRATION_LOCK)
-                    .arg(reservation_value)
-                    .arg(ttl)
-                    .arg(OPERATION_TTL_SECS)
-                    .invoke_async::<i64>(&mut conn),
-            )
-            .await;
-            if let Ok(code) = result {
-                return Ok(AcquireOutcome::from_code(code));
-            }
-        }
-        let resolution_deadline =
-            tokio::time::Instant::now() + Duration::from_secs(OPERATION_TTL_SECS as u64);
-        while tokio::time::Instant::now() < resolution_deadline {
-            let Ok(mut conn) = self.pool.get().await else {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            };
-            let owner = tokio::time::timeout(
-                REDIS_RESOLUTION_TIMEOUT,
-                conn.get::<_, Option<String>>(k_op(student_id)),
-            )
-            .await;
-            match owner {
-                Ok(Ok(Some(value))) if value == reservation_value => {
-                    return Ok(AcquireOutcome::Ok);
-                }
-                Ok(Ok(Some(_))) => return Ok(AcquireOutcome::Already),
-                Ok(Ok(None)) => return Err(AppError::RedisDown),
-                _ => tokio::time::sleep(Duration::from_millis(100)).await,
-            }
-        }
-        Err(AppError::RedisDown)
+        student: i64,
+        club: i64,
+        lease: &str,
+        member: &str,
+        idem_prefix: &str,
+    ) -> AppResult<Acquire> {
+        let keys = [
+            self.k_stock(club),
+            self.k_reg(student),
+            self.k_op(student),
+            self.k_open_at(),
+            self.k_maint(),
+            self.k_locked(),
+            self.k_fence(club),
+            self.k_inflight(club),
+        ];
+        let args = [
+            lease.to_string(),
+            self.op_ttl.to_string(),
+            member.to_string(),
+            idem_prefix.to_string(),
+        ];
+        Ok(Acquire::from_code(self.run(&ACQUIRE, &keys, &args).await?))
     }
 
-    /// Confirm only the exact reservation generation that reached SQLite.
-    pub async fn confirm(&self, student_id: i64, reservation_value: &str) -> AppResult<bool> {
-        for _ in 0..2 {
-            let Ok(mut conn) = self.pool.get().await else {
-                continue;
-            };
-            let result = redis_deadline(
-                CONFIRM_SCRIPT
-                    .key(k_resv(student_id))
-                    .key(k_stureg(student_id))
-                    .key(k_op(student_id))
-                    .arg(reservation_value)
-                    .invoke_async::<i64>(&mut conn),
-            )
-            .await;
-            if let Ok(changed) = result {
-                return Ok(changed == 1);
-            }
-        }
-        Err(AppError::RedisDown)
-    }
-
-    /// Compensate one failed acquire exactly once. The operation key makes a
-    /// retry safe even if the reservation TTL has elapsed or a reply was lost.
-    pub async fn rollback_reservation(
+    pub async fn confirm(
         &self,
-        student_id: i64,
-        club_id: i64,
-        reservation_value: &str,
+        student: i64,
+        club: i64,
+        lease: &str,
+        mirror: &str,
+        member: &str,
     ) -> AppResult<bool> {
-        for _ in 0..2 {
-            let Ok(mut conn) = self.pool.get().await else {
-                continue;
-            };
-            let result = redis_deadline(
-                ROLLBACK_SCRIPT
-                    .key(k_stock(club_id))
-                    .key(k_resv(student_id))
-                    .key(format!("seat:rollback:{reservation_value}"))
-                    .key(k_op(student_id))
-                    .arg(reservation_value)
-                    .invoke_async::<i64>(&mut conn),
-            )
-            .await;
-            if let Ok(changed) = result {
-                if changed < 0 {
-                    return Err(AppError::Internal("invalid Redis stock state".to_string()));
-                }
-                if changed == 2 {
-                    // 租约已失效：库存交给对账修正，调用方据此请求对账。
-                    return Err(AppError::Internal("reservation lease expired".to_string()));
-                }
-                return Ok(changed == 1);
-            }
-        }
-        Err(AppError::RedisDown)
+        let keys = [
+            self.k_op(student),
+            self.k_reg(student),
+            self.k_inflight(club),
+        ];
+        let args = [lease.to_string(), mirror.to_string(), member.to_string()];
+        Ok(self.run(&CONFIRM, &keys, &args).await? == 1)
     }
 
-    /// Release one committed registration exactly once and only clear Redis
-    /// mirrors that belong to its operation generation.
-    pub async fn release_registration(
+    /// 撤销抢位；absorb=true 时不归还库存。租约失效时登记该社团待修复。
+    pub async fn rollback(
         &self,
+        student: i64,
+        club: i64,
+        lease: &str,
+        member: &str,
+        absorb: bool,
+    ) -> AppResult<i64> {
+        let keys = [
+            self.k_stock(club),
+            self.k_op(student),
+            self.k_inflight(club),
+            self.key(&[&"rb", &lease]),
+        ];
+        let mode = if absorb { "absorb" } else { "return" };
+        let args = [lease.to_string(), member.to_string(), mode.to_string()];
+        let code = self.run(&ROLLBACK, &keys, &args).await?;
+        if code == 2 {
+            self.request_repair(club).await;
+        }
+        if code < 0 {
+            return Err(AppError::Internal("stock key missing".into()));
+        }
+        Ok(code)
+    }
+
+    pub async fn cancel_begin(
+        &self,
+        student: i64,
+        club: i64,
+        lease: &str,
+        member: &str,
+    ) -> AppResult<i64> {
+        let keys = [
+            self.k_maint(),
+            self.k_fence(club),
+            self.k_op(student),
+            self.k_inflight(club),
+            self.k_locked(),
+        ];
+        let args = [
+            lease.to_string(),
+            self.op_ttl.to_string(),
+            member.to_string(),
+        ];
+        self.run(&CANCEL_BEGIN, &keys, &args).await
+    }
+
+    pub async fn cancel_release(
+        &self,
+        student: i64,
+        club: i64,
+        mirror: &str,
+        lease: &str,
+        member: &str,
         event_id: &str,
-        student_id: i64,
-        club_id: i64,
-        reservation_value: &str,
-    ) -> AppResult<bool> {
-        for _ in 0..2 {
-            let Ok(mut conn) = self.pool.get().await else {
-                continue;
-            };
-            let result = redis_deadline(
-                CANCEL_SCRIPT
-                    .key(k_stock(club_id))
-                    .key(k_stureg(student_id))
-                    .key(k_resv(student_id))
-                    .key(format!("seat:cancel:{event_id}"))
-                    .arg(reservation_value)
-                    .arg(club_id)
-                    .invoke_async::<i64>(&mut conn),
-            )
-            .await;
-            if let Ok(changed) = result {
-                if changed < 0 {
-                    return Err(AppError::Internal("invalid Redis stock state".to_string()));
-                }
-                return Ok(changed == 1);
-            }
+    ) -> AppResult<i64> {
+        let keys = [
+            self.k_stock(club),
+            self.k_reg(student),
+            self.k_op(student),
+            self.k_inflight(club),
+            self.key(&[&"cx", &event_id]),
+        ];
+        let args = [
+            mirror.to_string(),
+            club.to_string(),
+            lease.to_string(),
+            member.to_string(),
+        ];
+        let code = self.run(&CANCEL_RELEASE, &keys, &args).await?;
+        if code == 2 {
+            self.request_repair(club).await;
         }
-        Err(AppError::RedisDown)
+        if code < 0 {
+            return Err(AppError::Internal("stock key missing".into()));
+        }
+        Ok(code)
     }
 
-    /// Acquire a cross-service student mutation lock while respecting the
-    /// maintenance fence. Used by cancel; register creates the same key in its
-    /// acquire Lua.
-    pub async fn begin_student_op(&self, student_id: i64) -> AppResult<Option<String>> {
-        let token = new_operation_id();
-        for _ in 0..2 {
-            let Ok(mut conn) = self.pool.get().await else {
-                continue;
-            };
-            let result = redis_deadline(
-                STUDENT_OP_BEGIN_SCRIPT
-                    .key(K_MAINT)
-                    .key(k_op(student_id))
-                    .arg(&token)
-                    .arg(OPERATION_TTL_SECS)
-                    .invoke_async::<i64>(&mut conn),
-            )
-            .await;
-            if let Ok(code) = result {
-                return Ok((code == 1).then_some(token));
-            }
+    pub async fn lease_end(&self, key: String, value: &str, set: Option<(String, &str)>) {
+        let mut keys = vec![key];
+        let mut args = vec![value.to_string()];
+        if let Some((set_key, member)) = set {
+            keys.push(set_key);
+            args.push(member.to_string());
         }
-        Err(AppError::RedisDown)
+        let _ = self.run(&LEASE_END, &keys, &args).await;
     }
 
-    pub async fn end_student_op(&self, student_id: i64, token: &str) -> AppResult<()> {
-        for _ in 0..2 {
-            let Ok(mut conn) = self.pool.get().await else {
-                continue;
-            };
-            if redis_deadline(
-                OWNED_DEL_SCRIPT
-                    .key(k_op(student_id))
-                    .arg(token)
-                    .invoke_async::<i64>(&mut conn),
-            )
+    pub async fn lease_value(&self, student: i64) -> AppResult<Option<String>> {
+        let mut conn = self.conn().await?;
+        self.deadline(conn.get(self.k_op(student))).await
+    }
+
+    pub async fn mirror_value(&self, student: i64) -> AppResult<Option<String>> {
+        let mut conn = self.conn().await?;
+        self.deadline(conn.get(self.k_reg(student))).await
+    }
+
+    pub async fn mirror_set(&self, student: i64, mode: &str, value: &str) -> AppResult<i64> {
+        self.run(
+            &MIRROR_SET,
+            &[self.k_reg(student)],
+            &[mode.to_string(), value.to_string()],
+        )
+        .await
+    }
+
+    // ---- 单社团修复 ----
+    pub async fn request_repair(&self, club: i64) {
+        if let Ok(mut conn) = self.pool.get().await {
+            let _: AppResult<i64> = self.deadline(conn.sadd(self.k_repair(), club)).await;
+        }
+    }
+
+    pub async fn pending_repairs(&self) -> HashSet<i64> {
+        let Ok(mut conn) = self.pool.get().await else {
+            return HashSet::new();
+        };
+        self.deadline(conn.smembers::<_, HashSet<i64>>(self.k_repair()))
             .await
-            .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        Err(AppError::RedisDown)
+            .unwrap_or_default()
     }
 
-    /// Acquire the global maintenance fence and verify that no mutation from an
-    /// older generation is still active. New acquire/cancel operations observe
-    /// the marker atomically and refuse to start.
-    pub async fn begin_maintenance(&self) -> AppResult<Option<String>> {
-        let token = new_operation_id();
-        let mut acquired = false;
-        let mut conn = self.pool.get().await.map_err(|_| AppError::RedisDown)?;
-        for _ in 0..2 {
-            let result: AppResult<Option<String>> = redis_deadline(
+    pub async fn repair_done(&self, club: i64) {
+        if let Ok(mut conn) = self.pool.get().await {
+            let _: AppResult<i64> = self.deadline(conn.srem(self.k_repair(), club)).await;
+        }
+    }
+
+    /// (仍持有租约的在途成员数, 已失效的成员数)。
+    pub async fn inflight_state(&self, club: i64) -> AppResult<(usize, usize)> {
+        let mut conn = self.conn().await?;
+        let members: Vec<String> = self.deadline(conn.smembers(self.k_inflight(club))).await?;
+        if members.is_empty() {
+            return Ok((0, 0));
+        }
+        let parsed: Vec<(i64, String)> = members
+            .iter()
+            .filter_map(|m| {
+                let (student, lease) = m.split_once('|')?;
+                Some((student.parse().ok()?, lease.to_string()))
+            })
+            .collect();
+        let keys: Vec<String> = parsed.iter().map(|(s, _)| self.k_op(*s)).collect();
+        let current: Vec<Option<String>> = if keys.is_empty() {
+            Vec::new()
+        } else {
+            self.deadline(conn.mget(keys)).await?
+        };
+        let live = parsed
+            .iter()
+            .zip(current.iter())
+            .filter(|((_, lease), value)| value.as_deref() == Some(lease.as_str()))
+            .count();
+        Ok((live, members.len() - live))
+    }
+
+    /// 取得社团栅栏并等该社团的在途操作完成；超时放弃。
+    pub async fn fence_acquire(&self, club: i64) -> Option<String> {
+        let token = crate::redis_seats::random_token(12);
+        let mut conn = self.pool.get().await.ok()?;
+        let set: Option<String> = self
+            .deadline(
                 redis::cmd("SET")
-                    .arg(K_MAINT)
+                    .arg(self.k_fence(club))
                     .arg(&token)
                     .arg("NX")
                     .arg("EX")
-                    .arg(300)
+                    .arg(FENCE_TTL)
                     .query_async(&mut conn),
             )
-            .await;
-            match result {
-                Ok(Some(_)) => {
-                    acquired = true;
-                    break;
+            .await
+            .ok()?;
+        set?;
+        drop(conn);
+        let deadline = Instant::now() + FENCE_WAIT;
+        loop {
+            match self.inflight_state(club).await {
+                Ok((0, _)) => return Some(token),
+                Ok(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await
                 }
-                Ok(None) => {
-                    let owner: Option<String> = redis_deadline(conn.get(K_MAINT)).await?;
-                    acquired = owner.as_deref() == Some(token.as_str());
-                    break;
-                }
-                Err(_) => continue,
+                _ => break,
             }
         }
-        if !acquired {
-            drop(conn);
-            let _ = self.end_maintenance(&token).await;
+        self.fence_release(club, &token).await;
+        None
+    }
+
+    pub async fn fence_release(&self, club: i64, token: &str) {
+        self.lease_end(self.k_fence(club), token, None).await;
+    }
+
+    pub async fn fence_publish(
+        &self,
+        club: i64,
+        token: &str,
+        stock: i64,
+        mirrors: &BTreeMap<i64, String>,
+    ) -> AppResult<bool> {
+        let mut keys = vec![
+            self.k_fence(club),
+            self.k_stock(club),
+            self.k_inflight(club),
+        ];
+        let mut args = vec![token.to_string(), stock.to_string()];
+        for (student, value) in mirrors {
+            keys.push(self.k_reg(*student));
+            args.push(value.clone());
+        }
+        Ok(self.run(&FENCE_PUBLISH, &keys, &args).await? == 1)
+    }
+
+    pub async fn drop_club(&self, club: i64, token: &str) -> AppResult<()> {
+        let mut conn = self.conn().await?;
+        let owner: Option<String> = self.deadline(conn.get(self.k_fence(club))).await?;
+        if owner.as_deref() == Some(token) {
+            let _: i64 = self
+                .deadline(conn.del(vec![
+                    self.k_stock(club),
+                    self.k_inflight(club),
+                    self.k_fence(club),
+                ]))
+                .await?;
+        }
+        Ok(())
+    }
+
+    // ---- 全局维护(冷启动与清空类操作) ----
+    pub async fn maintenance_begin(&self) -> AppResult<Option<String>> {
+        let token = random_token(18);
+        let mut conn = self.conn().await?;
+        let set: Option<String> = self
+            .deadline(
+                redis::cmd("SET")
+                    .arg(self.k_maint())
+                    .arg(&token)
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(MAINTENANCE_TTL)
+                    .query_async(&mut conn),
+            )
+            .await?;
+        if set.is_none() {
             return Ok(None);
         }
+        drop(conn);
+        let deadline = Instant::now() + FENCE_WAIT;
+        loop {
+            match self.has_active_operations().await {
+                Some(false) => return Ok(Some(token)),
+                Some(true) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await
+                }
+                _ => break,
+            }
+        }
+        self.maintenance_end(&token).await;
+        Ok(None)
+    }
 
-        for pattern in ["resv:*", "seat:op:*"] {
-            let mut cursor = 0u64;
-            loop {
-                let scan = redis_deadline(
+    pub async fn maintenance_end(&self, token: &str) {
+        self.lease_end(self.k_maint(), token, None).await;
+    }
+
+    async fn scan(
+        &self,
+        conn: &mut deadpool_redis::Connection,
+        pattern: &str,
+        first_only: bool,
+    ) -> AppResult<Vec<String>> {
+        let mut cursor = 0u64;
+        let mut found = Vec::new();
+        loop {
+            let (next, keys): (u64, Vec<String>) = self
+                .deadline(
                     redis::cmd("SCAN")
                         .arg(cursor)
                         .arg("MATCH")
                         .arg(pattern)
                         .arg("COUNT")
-                        .arg(64)
-                        .query_async::<(u64, Vec<String>)>(&mut conn),
+                        .arg(1000)
+                        .query_async(conn),
                 )
-                .await;
-                let (next, keys) = match scan {
-                    Ok(result) => result,
-                    Err(e) => {
-                        let cleanup = redis_deadline(
-                            OWNED_DEL_SCRIPT
-                                .key(K_MAINT)
-                                .arg(&token)
-                                .invoke_async::<i64>(&mut conn),
-                        )
-                        .await;
-                        if cleanup.is_err() {
-                            drop(conn);
-                            let _ = self.end_maintenance(&token).await;
-                        }
-                        return Err(e);
-                    }
-                };
-                if !keys.is_empty() {
-                    let cleanup = redis_deadline(
-                        OWNED_DEL_SCRIPT
-                            .key(K_MAINT)
-                            .arg(&token)
-                            .invoke_async::<i64>(&mut conn),
-                    )
-                    .await;
-                    if cleanup.is_err() {
-                        drop(conn);
-                        let _ = self.end_maintenance(&token).await;
-                    }
-                    return Ok(None);
-                }
-                cursor = next;
-                if cursor == 0 {
-                    break;
-                }
+                .await?;
+            found.extend(keys);
+            if (first_only && !found.is_empty()) || next == 0 {
+                return Ok(found);
             }
+            cursor = next;
         }
-        Ok(Some(token))
     }
 
-    pub async fn end_maintenance(&self, token: &str) -> AppResult<()> {
-        for _ in 0..2 {
-            let Ok(mut conn) = self.pool.get().await else {
-                continue;
-            };
-            if redis_deadline(
-                OWNED_DEL_SCRIPT
-                    .key(K_MAINT)
-                    .arg(token)
-                    .invoke_async::<i64>(&mut conn),
-            )
+    pub async fn has_active_operations(&self) -> Option<bool> {
+        let mut conn = self.pool.get().await.ok()?;
+        let pattern = self.key(&[&"op", &"*"]);
+        self.scan(&mut conn, &pattern, true)
             .await
-            .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        Err(AppError::RedisDown)
+            .ok()
+            .map(|keys| !keys.is_empty())
     }
 
-    /// Batch live remaining-seats for `club_ids`. `None` on any Redis failure
-    /// (so the read handler can fall back to stored `current_students`). Inner
-    /// `None` means the key was absent.
-    pub async fn stock_left(&self, club_ids: &[i64]) -> Option<Vec<Option<i64>>> {
-        if club_ids.is_empty() {
+    /// 持有全局维护锁时整体发布库存、镜像、开放时间与锁定状态。
+    pub async fn publish_all(
+        &self,
+        token: &str,
+        snapshot: &Snapshot,
+        open_at: Option<i64>,
+    ) -> AppResult<()> {
+        let mut conn = self.conn().await?;
+        let mut stale = Vec::new();
+        for name in ["stock", "reg", "inflight", "fence"] {
+            let pattern = self.key(&[&name, &"*"]);
+            stale.extend(self.scan(&mut conn, &pattern, false).await?);
+        }
+        self.deadline(
+            redis::cmd("WATCH")
+                .arg(self.k_maint())
+                .query_async::<()>(&mut conn),
+        )
+        .await?;
+        let owner: Option<String> = self.deadline(conn.get(self.k_maint())).await?;
+        if owner.as_deref() != Some(token) {
+            let _: Result<(), _> = redis::cmd("UNWATCH").query_async(&mut conn).await;
+            return Err(AppError::Internal("maintenance lease changed".into()));
+        }
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        if !stale.is_empty() {
+            pipe.del(stale).ignore();
+        }
+        for club in &snapshot.clubs {
+            pipe.set(
+                self.k_stock(club.club_id),
+                (club.max_students - club.used).max(0),
+            )
+            .ignore();
+        }
+        for (student, club, operation_id) in &snapshot.registrations {
+            pipe.set(
+                self.k_reg(*student),
+                mirror_value(*club, operation_id.as_deref()),
+            )
+            .ignore();
+        }
+        match open_at {
+            Some(epoch) => pipe.set(self.k_open_at(), epoch).ignore(),
+            None => pipe.del(self.k_open_at()).ignore(),
+        };
+        if snapshot.locked {
+            pipe.set(self.k_locked(), "1").ignore();
+        } else {
+            pipe.del(self.k_locked()).ignore();
+        }
+        pipe.del(self.k_repair()).ignore();
+        pipe.set(self.k_init(), "1").ignore();
+        let committed: Option<()> = self.deadline(pipe.query_async(&mut conn)).await?;
+        committed
+            .ok_or_else(|| AppError::Internal("maintenance lease changed during publish".into()))
+    }
+
+    pub async fn stock_left(&self, clubs: &[i64]) -> Option<Vec<Option<i64>>> {
+        if clubs.is_empty() {
             return Some(Vec::new());
         }
         let mut conn = self.pool.get().await.ok()?;
-        let keys: Vec<String> = club_ids.iter().map(|c| k_stock(*c)).collect();
-        // MGET returns one entry per key; missing keys come back as nil.
-        let vals: Vec<Option<String>> = redis_deadline(conn.mget(keys)).await.ok()?;
+        let keys: Vec<String> = clubs.iter().map(|c| self.k_stock(*c)).collect();
+        let values: Vec<Option<String>> = self.deadline(conn.mget(keys)).await.ok()?;
         Some(
-            vals.into_iter()
-                .map(|v| v.and_then(|s| s.parse::<i64>().ok()))
+            values
+                .into_iter()
+                .map(|v| v.and_then(|s| s.parse().ok()))
                 .collect(),
         )
     }
 
-    /// Same clock with millisecond precision for browser offset calculation.
     pub async fn now_epoch_ms(&self) -> i64 {
         if let Ok(mut conn) = self.pool.get().await
-            && let Ok((secs, usecs)) =
-                redis_deadline(redis::cmd("TIME").query_async::<(i64, i64)>(&mut conn)).await
+            && let Ok((secs, usecs)) = self
+                .deadline(redis::cmd("TIME").query_async::<(i64, i64)>(&mut conn))
+                .await
         {
             return secs.saturating_mul(1000) + usecs / 1000;
         }
@@ -636,24 +645,54 @@ impl Seats {
             .unwrap_or(0)
     }
 
-    // --- sessions ----------------------------------------------------------
+    pub async fn open_at_get(&self) -> Option<i64> {
+        let mut conn = self.pool.get().await.ok()?;
+        let v: Option<String> = self.deadline(conn.get(self.k_open_at())).await.ok()?;
+        v.and_then(|s| s.parse().ok())
+    }
 
+    pub async fn open_at_set(&self, epoch: Option<i64>) -> AppResult<()> {
+        let mut conn = self.conn().await?;
+        match epoch {
+            Some(epoch) => {
+                self.deadline(conn.set::<_, _, ()>(self.k_open_at(), epoch))
+                    .await
+            }
+            None => self.deadline(conn.del::<_, ()>(self.k_open_at())).await,
+        }
+    }
+
+    pub async fn locked_get(&self) -> Option<bool> {
+        let mut conn = self.pool.get().await.ok()?;
+        let value: Option<String> = self.deadline(conn.get(self.k_locked())).await.ok()?;
+        Some(value.as_deref() == Some("1"))
+    }
+
+    pub async fn locked_set(&self, locked: bool) -> AppResult<()> {
+        let mut conn = self.conn().await?;
+        if locked {
+            self.deadline(conn.set::<_, _, ()>(self.k_locked(), "1"))
+                .await
+        } else {
+            self.deadline(conn.del::<_, ()>(self.k_locked())).await
+        }
+    }
+
+    // ---- 会话 ----
     pub async fn session_role_epoch(&self, role: &str) -> AppResult<i64> {
-        let mut conn = self.pool.get().await.map_err(|_| AppError::RedisDown)?;
-        let value: Option<String> = redis_deadline(conn.get(k_sess_epoch(role))).await?;
-        parse_session_counter(value)
+        let mut conn = self.conn().await?;
+        parse_counter(self.deadline(conn.get(self.k_epoch(role))).await?)
     }
 
     pub async fn session_principal_version(&self, role: &str, principal: &str) -> AppResult<i64> {
-        let mut conn = self.pool.get().await.map_err(|_| AppError::RedisDown)?;
-        let value: Option<String> =
-            redis_deadline(conn.get(k_sess_version(role, principal))).await?;
-        parse_session_counter(value)
+        let mut conn = self.conn().await?;
+        parse_counter(
+            self.deadline(conn.get(self.k_version(role, principal)))
+                .await?,
+        )
     }
 
-    /// Create a session only if the caller's prior database read still matches
-    /// the account/role generation. `Ok(None)` means a password change,
-    /// deletion, clear-all, or concurrent login invalidated that read.
+    /// 只有账号代际仍等于登录读取时的值才签发会话；成功后该账号的旧会话全部失效。
     pub async fn session_create(
         &self,
         payload: &serde_json::Value,
@@ -664,22 +703,22 @@ impl Seats {
         let Some((role, principal)) = session_identity(payload) else {
             return Err(AppError::Internal("invalid session payload".into()));
         };
-        let token = gen_token();
-        let mut conn = self.pool.get().await.map_err(|_| AppError::RedisDown)?;
-        let code = redis_deadline(
-            SESSION_CREATE_SCRIPT
-                .key(k_sess_epoch(&role))
-                .key(k_sess_version(&role, &principal))
-                .key(k_sess(&token))
-                .key(k_sess_role_mutation(&role))
-                .key(k_sess_principal_mutation(&role, &principal))
-                .arg(payload.to_string())
-                .arg(ttl)
-                .arg(expected_epoch)
-                .arg(expected_version)
-                .invoke_async::<i64>(&mut conn),
-        )
-        .await?;
+        let token = random_token(32);
+        let mut conn = self.conn().await?;
+        let mut invocation = SESSION_CREATE.prepare_invoke();
+        invocation
+            .key(self.k_epoch(&role))
+            .key(self.k_version(&role, &principal))
+            .key(self.k_sess(&token))
+            .key(self.k_role_mutation(&role))
+            .key(self.k_principal_mutation(&role, &principal))
+            .arg(payload.to_string())
+            .arg(ttl)
+            .arg(expected_epoch)
+            .arg(expected_version);
+        let code = self
+            .deadline(invocation.invoke_async::<i64>(&mut conn))
+            .await?;
         match code {
             1 => Ok(Some(token)),
             0 | -2 => Ok(None),
@@ -687,178 +726,125 @@ impl Seats {
         }
     }
 
-    /// Fetch + validate a session against its role/account generations.
-    /// Sessions from before the migration intentionally require one re-login.
     pub async fn session_get(&self, token: &str) -> AppResult<Option<serde_json::Value>> {
         if token.is_empty() {
             return Ok(None);
         }
-        let mut conn = self.pool.get().await.map_err(|_| AppError::RedisDown)?;
-        let raw: Option<String> = redis_deadline(conn.get(k_sess(token))).await?;
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        let mut conn = self.conn().await?;
+        let raw: Option<String> = self.deadline(conn.get(self.k_sess(token))).await?;
+        let Some(payload) =
+            raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        else {
             return Ok(None);
         };
         let Some((role, principal)) = session_identity(&payload) else {
             return Ok(None);
         };
-        let Some(epoch) = payload.get("_session_epoch").and_then(|v| v.as_i64()) else {
+        let epoch = payload.get("_session_epoch").and_then(|v| v.as_i64());
+        let version = payload.get("_session_version").and_then(|v| v.as_i64());
+        let (Some(epoch), Some(version)) = (epoch, version) else {
             return Ok(None);
         };
-        let Some(version) = payload.get("_session_version").and_then(|v| v.as_i64()) else {
-            return Ok(None);
-        };
-        if epoch < 0 || version < 0 {
-            return Ok(None);
-        }
-        let values: Vec<Option<String>> =
-            redis_deadline(conn.mget(vec![k_sess_epoch(&role), k_sess_version(&role, &principal)]))
-                .await?;
-        let current_epoch = parse_session_counter(values.first().cloned().flatten())?;
-        let current_version = parse_session_counter(values.get(1).cloned().flatten())?;
-        if epoch != current_epoch || version != current_version {
-            return Ok(None);
-        }
-        Ok(Some(payload))
+        let values: Vec<Option<String>> = self
+            .deadline(conn.mget(vec![self.k_epoch(&role), self.k_version(&role, &principal)]))
+            .await?;
+        let current_epoch = parse_counter(values.first().cloned().flatten())?;
+        let current_version = parse_counter(values.get(1).cloned().flatten())?;
+        Ok((epoch == current_epoch && version == current_version).then_some(payload))
     }
 
-    // --- login throttle (count failures only) ------------------------------
-
-    /// Read-only: is this key's failure count over `limit`? Errors -> not
-    /// blocked (fail open on the throttle so Redis hiccups don't lock users
-    /// out; the underlying password check still gates access).
+    // ---- 登录限流与受信设备 ----
     pub async fn login_blocked(&self, key: &str, limit: i64) -> bool {
         let Ok(mut conn) = self.pool.get().await else {
             return false;
         };
-        let n: Option<String> = redis_deadline(conn.get(format!("loginfail:{key}")))
+        let n: Option<String> = self
+            .deadline(conn.get(self.k_fail(key)))
             .await
             .unwrap_or(None);
         n.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) >= limit
     }
 
-    /// Count one failed attempt; only the first failure starts the 60s window.
-    /// This prevents an attacker from indefinitely extending a retry window.
     pub async fn login_fail(&self, key: &str) {
-        let Ok(mut conn) = self.pool.get().await else {
-            return;
-        };
-        let k = format!("loginfail:{key}");
-        let _ = redis_deadline(
-            LOGIN_FAIL_SCRIPT
-                .key(k)
-                .arg(60)
-                .invoke_async::<i64>(&mut conn),
-        )
-        .await;
+        let _ = self
+            .run(
+                &LOGIN_FAIL,
+                &[self.k_fail(key)],
+                &[LOGIN_WINDOW.to_string()],
+            )
+            .await;
     }
 
-    /// Clear a user's failure counter after a successful login.
-    pub async fn login_ok(&self, key: &str) {
+    pub async fn login_ok(&self, keys: &[&str]) {
         if let Ok(mut conn) = self.pool.get().await {
-            let _ = redis_deadline(conn.del::<_, ()>(format!("loginfail:{key}"))).await;
+            let keys: Vec<String> = keys.iter().map(|k| self.k_fail(k)).collect();
+            let _: AppResult<i64> = self.deadline(conn.del(keys)).await;
         }
     }
 
-    // --- open_at -----------------------------------------------------------
-
-    /// Read the registration-open epoch from Redis. `None` on miss/error.
-    pub async fn open_at_get(&self) -> Option<i64> {
-        let mut conn = self.pool.get().await.ok()?;
-        let v: Option<String> = redis_deadline(conn.get(K_OPENAT)).await.ok()?;
-        v.and_then(|s| s.parse::<i64>().ok())
-    }
-
-    /// Synchronize the durable registration-open epoch while maintenance owns
-    /// the write fence.
-    pub async fn open_at_seed(&self, epoch: i64) -> AppResult<bool> {
-        let mut conn = self.pool.get().await.map_err(|_| AppError::RedisDown)?;
-        let _: () = redis_deadline(
-            redis::cmd("SET")
-                .arg(K_OPENAT)
-                .arg(epoch)
-                .query_async(&mut conn),
-        )
-        .await?;
-        Ok(true)
-    }
-
-    pub async fn registration_locked_get(&self) -> Option<bool> {
-        let mut conn = self.pool.get().await.ok()?;
-        let value: Option<String> = redis_deadline(conn.get(K_REGISTRATION_LOCK)).await.ok()?;
-        Some(value.as_deref() == Some("1"))
-    }
-
-    pub async fn registration_lock_seed(&self, locked: bool) -> AppResult<()> {
-        let mut conn = self.pool.get().await.map_err(|_| AppError::RedisDown)?;
-        if locked {
-            let _: () = redis_deadline(conn.set(K_REGISTRATION_LOCK, "1")).await?;
-        } else {
-            let _: () = redis_deadline(conn.del(K_REGISTRATION_LOCK)).await?;
-        }
-        Ok(())
-    }
-
-    /// Whether `seats:initialized` is set — used by `/readyz`.
-    pub async fn initialized(&self) -> bool {
+    pub async fn device_trusted(&self, role: &str, username: &str, device: Option<&str>) -> bool {
+        let Some(device) = device else {
+            return false;
+        };
         let Ok(mut conn) = self.pool.get().await else {
             return false;
         };
-        redis_deadline(conn.exists(K_INIT)).await.unwrap_or(false)
-    }
-
-    pub async fn maintenance_active(&self) -> Option<bool> {
-        let mut conn = self.pool.get().await.ok()?;
-        redis_deadline(conn.exists(K_MAINT)).await.ok()
-    }
-
-    pub async fn has_active_operations(&self) -> Option<bool> {
-        let mut conn = self.pool.get().await.ok()?;
-        let mut cursor = 0u64;
-        loop {
-            let (next, keys): (u64, Vec<String>) = redis_deadline(
-                redis::cmd("SCAN")
-                    .arg(cursor)
-                    .arg("MATCH")
-                    .arg("seat:op:*")
-                    .arg("COUNT")
-                    .arg(128)
-                    .query_async(&mut conn),
-            )
+        self.deadline(conn.exists(self.k_trust(role, username, device)))
             .await
-            .ok()?;
-            if !keys.is_empty() {
-                return Some(true);
-            }
-            cursor = next;
-            if cursor == 0 {
-                return Some(false);
-            }
+            .unwrap_or(false)
+    }
+
+    pub async fn trust_device(&self, role: &str, username: &str, device: &str) {
+        if let Ok(mut conn) = self.pool.get().await {
+            let _: AppResult<()> = self
+                .deadline(conn.set_ex(self.k_trust(role, username, device), "1", DEVICE_TTL as u64))
+                .await;
         }
     }
 }
 
-/// 32 random bytes, URL-safe base64 without padding — same alphabet/entropy as
-/// Python's `secrets.token_urlsafe(32)`.
-fn gen_token() -> String {
-    use rand::RngExt;
-    let mut bytes = [0u8; 32];
-    rand::rng().fill(&mut bytes[..]);
-    url_safe_b64(&bytes)
+fn parse_counter(value: Option<String>) -> AppResult<i64> {
+    match value {
+        None => Ok(0),
+        Some(value) => value
+            .parse::<i64>()
+            .ok()
+            .filter(|v| *v >= 0)
+            .ok_or_else(|| AppError::Internal("invalid session generation".into())),
+    }
 }
 
-/// URL-safe base64 (RFC 4648 §5) without padding. Small inline impl to avoid a
-/// base64 crate dependency.
+fn session_identity(payload: &serde_json::Value) -> Option<(String, String)> {
+    match payload.get("role").and_then(|value| value.as_str()) {
+        Some("student") => payload
+            .get("student_id")
+            .and_then(|value| value.as_i64())
+            .filter(|id| *id > 0)
+            .map(|id| ("student".to_string(), id.to_string())),
+        Some("admin") => payload
+            .get("username")
+            .and_then(|value| value.as_str())
+            .filter(|name| !name.is_empty() && name.len() <= 80)
+            .map(|name| ("admin".to_string(), name.to_string())),
+        _ => None,
+    }
+}
+
+/// URL 安全的 base64 随机串，与 Python `secrets.token_urlsafe(n)` 同字母表。
+pub fn random_token(bytes: usize) -> String {
+    use rand::RngExt;
+    let mut raw = vec![0u8; bytes];
+    rand::rng().fill(&mut raw[..]);
+    url_safe_b64(&raw)
+}
+
 fn url_safe_b64(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
         out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
         if chunk.len() > 1 {
@@ -871,139 +857,100 @@ fn url_safe_b64(input: &[u8]) -> String {
     out
 }
 
-/// Rebuild Redis stock from SQLite ground truth at startup (idempotent):
-/// `SET stock:club:{id} = max - used` for every club, and rebuild the
-/// `student:reg:{sid}` mirror. Deletes any stale `stock:club:*` /
-/// `student:reg:*` first so removed clubs/students don't linger. Sets
-/// `seats:initialized=1`. No-op (with a warning) if Redis is down.
-pub async fn rebuild_stock(seats: &Seats, db: &Db, maintenance_token: &str) -> AppResult<()> {
-    if !seats.alive().await {
-        tracing::warn!("Redis unavailable, skipping stock rebuild (seckill degraded)");
-        return Err(AppError::RedisDown);
+/// 报名镜像值：`club_id|operation_id`，历史数据没有 operation_id 时只存 club_id。
+pub fn mirror_value(club: i64, operation_id: Option<&str>) -> String {
+    match operation_id {
+        Some(op) if !op.is_empty() => format!("{club}|{op}"),
+        _ => club.to_string(),
     }
-    let (clubs, regs) = db.seat_snapshot().await?;
+}
 
-    let mut conn = seats.pool.get().await.map_err(|_| AppError::RedisDown)?;
+// ---- 修复 ------------------------------------------------------------------
 
-    // Collect stale keys without changing live state. The maintenance marker
-    // blocks mutations; all deletes and replacement values publish in one EXEC.
-    let mut stale_keys = Vec::new();
-    for pattern in ["stock:club:*", "student:reg:*"] {
-        let mut cursor: u64 = 0;
-        loop {
-            let (next, keys): (u64, Vec<String>) = redis_deadline(
-                redis::cmd("SCAN")
-                    .arg(cursor)
-                    .arg("MATCH")
-                    .arg(pattern)
-                    .arg("COUNT")
-                    .arg(512)
-                    .query_async(&mut conn),
-            )
-            .await?;
-            if !keys.is_empty() {
-                stale_keys.extend(keys);
-            }
-            cursor = next;
-            if cursor == 0 {
-                break;
-            }
+/// 持有社团栅栏时以 SQLite 为准发布该社团的库存与镜像。
+pub async fn publish_club_with_fence(
+    seats: &Seats,
+    db: &Db,
+    club: i64,
+    token: &str,
+) -> AppResult<bool> {
+    let Some((maximum, registrations)) = db.club_seat_truth(club).await? else {
+        seats.drop_club(club, token).await?;
+        seats.repair_done(club).await;
+        return Ok(true);
+    };
+    let used = registrations.len() as i64;
+    let mirrors: BTreeMap<i64, String> = registrations
+        .iter()
+        .map(|(student, op)| (*student, mirror_value(club, op.as_deref())))
+        .collect();
+    if !seats
+        .fence_publish(club, token, (maximum - used).max(0), &mirrors)
+        .await?
+    {
+        return Ok(false);
+    }
+    db.mark_club_synced(club, used).await?;
+    seats.repair_done(club).await;
+    Ok(true)
+}
+
+/// 单社团修复：只暂停这一个社团的抢位。
+pub async fn repair_club(seats: &Seats, db: &Db, club: i64) -> bool {
+    let Some(token) = seats.fence_acquire(club).await else {
+        return false;
+    };
+    let result = publish_club_with_fence(seats, db, club, &token).await;
+    seats.fence_release(club, &token).await;
+    match result {
+        Ok(done) => done,
+        Err(e) => {
+            tracing::warn!(club, error = %e, "club seat repair failed");
+            false
         }
     }
-
-    redis_deadline(
-        redis::cmd("WATCH")
-            .arg(K_MAINT)
-            .query_async::<()>(&mut conn),
-    )
-    .await?;
-    let owner: Option<String> = redis_deadline(conn.get(K_MAINT)).await?;
-    if owner.as_deref() != Some(maintenance_token) {
-        let _: Result<(), _> = redis::cmd("UNWATCH").query_async(&mut conn).await;
-        return Err(AppError::Internal(
-            "maintenance lease changed before stock publish".to_string(),
-        ));
-    }
-
-    let mut pipe = redis::pipe();
-    pipe.atomic();
-    if !stale_keys.is_empty() {
-        pipe.del(stale_keys).ignore();
-    }
-    for c in &clubs {
-        let left = (c.max_students - c.used).max(0);
-        pipe.set(k_stock(c.club_id), left).ignore();
-    }
-    for (sid, cid, operation_id) in &regs {
-        let value = operation_id
-            .as_ref()
-            .map(|op| reservation_value(*cid, op))
-            .unwrap_or_else(|| cid.to_string());
-        pipe.set(k_stureg(*sid), value).ignore();
-    }
-    pipe.set(K_INIT, "1").ignore();
-    pipe.del(K_CACHE_CLUBS).ignore();
-    let committed: Option<()> = redis_deadline(pipe.query_async(&mut conn)).await?;
-    require_watch_commit(committed)?;
-    // SQLite marks a club locally unavailable when a low-frequency admin
-    // mutation commits but its targeted Redis publication is interrupted.  A
-    // completed full snapshot above is authoritative for every club, so it is
-    // now safe to release those durable per-club holds.
-    db.clear_all_seat_sync_pending().await?;
-
-    tracing::info!(clubs = clubs.len(), "Redis stock rebuilt");
-    Ok(())
 }
 
-/// Redis returns Nil from EXEC when a watched key changed. `()` would parse
-/// that Nil as success in redis-rs, so keep the Option boundary explicit.
-fn require_watch_commit(committed: Option<()>) -> AppResult<()> {
-    committed.ok_or_else(|| {
-        AppError::Internal("maintenance lease changed during stock publish".to_string())
-    })
-}
-
-/// Seed `open_at` from `settings.registration_start_time` at startup. Parses the
-/// `YYYY-MM-DD HH:MM:SS` local-time string to an epoch. Best-effort.
-pub async fn seed_open_at(seats: &Seats, db: &Db) -> AppResult<()> {
-    if let Some(value) = db.registration_start_time().await? {
-        let epoch = crate::auth::parse_local_datetime(&value).ok_or_else(|| {
-            AppError::Internal(format!("registration_start_time unparseable: {value}"))
-        })?;
-        seats.open_at_seed(epoch).await?;
+/// 以 SQLite 为准整体发布：首次启动或 Redis 重启后使用。
+pub async fn rebuild_all(seats: &Seats, db: &Db) -> AppResult<bool> {
+    if !seats.alive().await {
+        return Err(AppError::RedisDown);
     }
-    seats
-        .registration_lock_seed(db.registration_locked().await?)
-        .await?;
-    Ok(())
-}
-
-/// Redis value shared by reservation and confirmed-registration mirrors.
-pub fn reservation_value(club_id: i64, operation_id: &str) -> String {
-    format!("{club_id}|{operation_id}")
-}
-
-/// A URL-safe random identifier for one registration generation.
-pub fn new_operation_id() -> String {
-    gen_token()
+    let Some(token) = seats.maintenance_begin().await? else {
+        return Ok(false);
+    };
+    let result = async {
+        let snapshot = db.snapshot().await?;
+        let open_at = snapshot
+            .start_time
+            .as_deref()
+            .and_then(crate::auth::parse_local_datetime);
+        seats.publish_all(&token, &snapshot, open_at).await?;
+        db.mark_all_synced().await?;
+        tracing::info!(clubs = snapshot.clubs.len(), "Redis seats published");
+        Ok::<_, AppError>(())
+    }
+    .await;
+    seats.maintenance_end(&token).await;
+    result.map(|_| true)
 }
 
 #[cfg(test)]
-mod reconcile_tests {
-    use super::require_watch_commit;
-    use redis::FromRedisValue;
-
+mod tests {
     #[test]
-    fn watched_exec_abort_is_not_a_successful_rebuild() {
-        assert!(require_watch_commit(Some(())).is_ok());
-        assert!(require_watch_commit(None).is_err());
+    fn mirror_values_match_python() {
+        assert_eq!("3|7-abc", super::mirror_value(3, Some("7-abc")));
+        assert_eq!("3", super::mirror_value(3, None));
     }
 
     #[test]
-    fn redis_exec_nil_deserializes_to_none_not_success() {
-        let parsed = Option::<()>::from_redis_value(redis::Value::Nil).unwrap();
-        assert_eq!(None, parsed);
-        let committed = Option::<()>::from_redis_value(redis::Value::Array(vec![])).unwrap();
-        assert_eq!(Some(()), committed);
+    fn tokens_use_the_url_safe_alphabet() {
+        let token = super::random_token(32);
+        assert_eq!(43, token.len());
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        );
     }
 }

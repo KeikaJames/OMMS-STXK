@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import http.client
 import importlib.util
@@ -32,8 +31,18 @@ except ImportError:  # pragma: no cover
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAIN_PY = REPO_ROOT / "main.py"
+LUA_DIR = REPO_ROOT / "shared" / "lua"
 RUST_SEATS = REPO_ROOT / "club-hot" / "src" / "redis_seats.rs"
 REPLICATE_GUARD = "if redis.replicate_commands then redis.replicate_commands() end"
+PREFIX = "omms:"
+
+
+def key(*parts: object) -> str:
+    return PREFIX + ":".join(str(part) for part in parts)
+
+
+def lua_script(name: str) -> str:
+    return (LUA_DIR / f"{name}.lua").read_text(encoding="utf-8")
 
 
 def free_port(*, forbidden: set[int] | None = None) -> int:
@@ -45,16 +54,6 @@ def free_port(*, forbidden: set[int] | None = None) -> int:
         if port not in blocked:
             return port
     raise RuntimeError("no free loopback port")
-
-
-def lua_constant(name: str) -> str:
-    tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == name for target in node.targets
-        ):
-            return ast.literal_eval(node.value)
-    raise KeyError(name)
 
 
 def start_redis(port: int, workdir: Path):
@@ -119,8 +118,8 @@ def write_session(client, student_id: int = 1) -> str:
     token = secrets.token_urlsafe(32)
     payload = {"role": "student", "student_id": student_id, "name": "student", "class": "class",
                "student_no": "S0001", "_session_epoch": 0, "_session_version": 1}
-    client.set(f"sess:version:student:{student_id}", 1)
-    client.set(f"sess:{token}", json.dumps(payload, separators=(",", ":")), ex=3600)
+    client.set(key("sessgen", "ver", "student", student_id), 1)
+    client.set(key("sess", token), json.dumps(payload, separators=(",", ":")), ex=3600)
     return token
 
 
@@ -166,25 +165,35 @@ class LuaScriptTests(unittest.TestCase):
         stop_process(self.redis_process)
         self.tmp.cleanup()
 
-    def test_acquire_scripts_enable_effects_replication_before_writes(self) -> None:
-        self.assertTrue(lua_constant("LUA_ACQUIRE").lstrip().startswith(REPLICATE_GUARD))
+    def test_acquire_script_enables_effects_replication_before_writes(self) -> None:
+        code = [line for line in lua_script("acquire").splitlines() if not line.startswith("--")]
+        self.assertEqual(REPLICATE_GUARD, code[0])
         rust = RUST_SEATS.read_text(encoding="utf-8")
-        start = rust.index('const LUA_ACQUIRE: &str = r#"') + len('const LUA_ACQUIRE: &str = r#"')
-        self.assertTrue(rust[start:].lstrip().startswith(REPLICATE_GUARD))
+        self.assertIn('include_str!("../../shared/lua/acquire.lua")', rust)
 
     def test_rollback_returns_a_seat_only_while_the_lease_is_owned(self) -> None:
-        script = lua_constant("LUA_ROLLBACK")
-        self.redis.set("stock:club:1", 0)
-        self.redis.set("resv:1", "1|op-a", ex=60)
-        self.redis.set("seat:op:1", "1|op-a", ex=60)
-        owned = ["stock:club:1", "resv:1", "seat:rollback:1|op-a", "seat:op:1"]
-        self.assertEqual(1, self.redis.eval(script, 4, *owned, "1|op-a"))
-        self.assertEqual("1", self.redis.get("stock:club:1"))
-        self.assertEqual(0, self.redis.eval(script, 4, *owned, "1|op-a"))
-        self.assertEqual("1", self.redis.get("stock:club:1"))
-        expired = ["stock:club:1", "resv:2", "seat:rollback:1|op-b", "seat:op:2"]
-        self.assertEqual(2, self.redis.eval(script, 4, *expired, "1|op-b"))
-        self.assertEqual("1", self.redis.get("stock:club:1"))
+        script = lua_script("rollback")
+        self.redis.set(key("stock", 1), 0)
+        self.redis.set(key("op", 1), "1|1-a|n1", ex=60)
+        self.redis.sadd(key("inflight", 1), "1|1|1-a|n1")
+        owned = [key("stock", 1), key("op", 1), key("inflight", 1), key("rb", "1|1-a|n1")]
+        self.assertEqual(1, self.redis.eval(script, 4, *owned, "1|1-a|n1", "1|1|1-a|n1", "return"))
+        self.assertEqual("1", self.redis.get(key("stock", 1)))
+        self.assertEqual(0, self.redis.scard(key("inflight", 1)))
+        self.assertEqual(0, self.redis.eval(script, 4, *owned, "1|1-a|n1", "1|1|1-a|n1", "return"))
+        self.assertEqual("1", self.redis.get(key("stock", 1)))
+        expired = [key("stock", 1), key("op", 2), key("inflight", 1), key("rb", "1|2-b|n2")]
+        self.assertEqual(2, self.redis.eval(script, 4, *expired, "1|2-b|n2", "2|1|2-b|n2", "return"))
+        self.assertEqual("1", self.redis.get(key("stock", 1)))
+
+    def test_rollback_absorbs_a_seat_when_the_database_is_full(self) -> None:
+        script = lua_script("rollback")
+        self.redis.set(key("stock", 1), 5)
+        self.redis.set(key("op", 3), "1|3-c|n3", ex=60)
+        keys = [key("stock", 1), key("op", 3), key("inflight", 1), key("rb", "1|3-c|n3")]
+        self.assertEqual(1, self.redis.eval(script, 4, *keys, "1|3-c|n3", "3|1|3-c|n3", "absorb"))
+        self.assertEqual("5", self.redis.get(key("stock", 1)))
+        self.assertIsNone(self.redis.get(key("op", 3)))
 
 
 @unittest.skipIf(redis is None or shutil.which("redis-server") is None, "redis unavailable")
@@ -217,7 +226,7 @@ class LateRedisTests(unittest.TestCase):
                                             token=token, body={"club_id": 1})
                 self.assertEqual(200, status, payload)
                 self.assertTrue(payload.get("success"), payload)
-                self.assertEqual("0", client.get("stock:club:1"))
+                self.assertEqual("0", client.get(key("stock", 1)))
             finally:
                 stop_process(app)
                 stop_process(redis_process)
@@ -232,7 +241,7 @@ class PostCommitFailureTests(unittest.TestCase):
             seed_settings(db_path)
             redis_port = free_port()
             redis_process, client = start_redis(redis_port, workdir)
-            saved = {key: os.environ.get(key) for key in ("DB_PATH", "REDIS_URL", "LOG_LEVEL")}
+            saved = {name: os.environ.get(name) for name in ("DB_PATH", "REDIS_URL", "LOG_LEVEL")}
             os.environ.update({"DB_PATH": str(db_path),
                                "REDIS_URL": f"redis://127.0.0.1:{redis_port}/0",
                                "LOG_LEVEL": "CRITICAL"})
@@ -244,7 +253,7 @@ class PostCommitFailureTests(unittest.TestCase):
                 spec.loader.exec_module(module)
                 module.init_db()
                 seed_club_and_student(db_path, capacity=1)
-                client.set("stock:club:1", 1)
+                client.set(key("stock", 1), 1)
                 token = write_session(client)
 
                 def fail_after_commit(*_args, **_kwargs):
@@ -260,8 +269,8 @@ class PostCommitFailureTests(unittest.TestCase):
                 self.assertEqual(500, status)
                 with contextlib.closing(sqlite3.connect(db_path)) as conn:
                     self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM registrations").fetchone()[0])
-                self.assertEqual("0", client.get("stock:club:1"))
-                self.assertEqual([], client.keys("seat:rollback:*"))
+                self.assertEqual("0", client.get(key("stock", 1)))
+                self.assertEqual([], client.keys(key("rb", "*")))
             finally:
                 if httpd is not None:
                     httpd.shutdown()
@@ -270,11 +279,11 @@ class PostCommitFailureTests(unittest.TestCase):
                     module.RECONCILE_STOP.set()
                     if module.DB_POOL:
                         module.DB_POOL.close_all()
-                for key, value in saved.items():
+                for name, value in saved.items():
                     if value is None:
-                        os.environ.pop(key, None)
+                        os.environ.pop(name, None)
                     else:
-                        os.environ[key] = value
+                        os.environ[name] = value
                 stop_process(redis_process)
 
 
