@@ -3,6 +3,7 @@
 #   bash run.sh                      启动；已在运行时平滑重启
 #   bash run.sh stop                 停止
 #   OMMS_PYTHON_ONLY=1 bash run.sh   不编译 Rust，由 Python 服务全部接口
+# 没有 cargo、Rust 版本过旧或首次编译失败时，自动改用只运行 Python 的模式。
 set -o pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +28,17 @@ REDIS_PORT="${redis_address##*:}"
 mkdir -p "$RUN_DIR"
 
 say() { printf '%s\n' "$*"; }
+memory_mb() {
+    if [ -r /proc/meminfo ]; then
+        awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo
+    else
+        sysctl -n hw.memsize 2>/dev/null | awk '{ print int($1 / 1048576) }'
+    fi
+}
+version_at_least() {
+    # version_at_least 当前版本 最低版本
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)" = "$2" ]
+}
 rcli() { redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" "$@"; }
 redis_up() { rcli ping >/dev/null 2>&1; }
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
@@ -84,13 +96,34 @@ if [ "${1:-}" = "stop" ]; then
 fi
 
 # ---- 预检：在旧服务仍在线时完成，失败不影响旧服务 ----
+if ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 7))' 2>/dev/null; then
+    say "[python] 需要 Python 3.7 或更高版本（当前：$("$PYTHON" -V 2>&1)），可用 PYTHON=python3.8 指定"
+    exit 1
+fi
+if ! "$PYTHON" -c 'import redis, argon2' 2>/dev/null; then
+    say "[python] 缺少依赖，请先运行：$PYTHON -m pip install redis argon2-cffi pypinyin Pillow"
+    exit 1
+fi
+
 if [ "$PYTHON_ONLY" != "1" ]; then
     if ! command -v cargo >/dev/null 2>&1; then
         say "[build] 未找到 cargo，改用只运行 Python 的模式（OMMS_PYTHON_ONLY=1）"
         PYTHON_ONLY=1
-    elif ! cargo build --release --manifest-path "$DIR/club-hot/Cargo.toml" > "$RUN_DIR/build.log" 2>&1; then
-        say "[build] Rust 构建失败，旧服务保持不变（日志 $RUN_DIR/build.log）"
-        exit 1
+    else
+        # 每个 rustc 进程峰值约 700 MB，按内存决定并行数，内存小的机器不至于换页卡死。
+        build_jobs=$(( $(memory_mb || echo 1024) / 1024 ))
+        cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+        [ "$build_jobs" -gt "$cores" ] && build_jobs=$cores
+        [ "$build_jobs" -lt 1 ] && build_jobs=1
+        say "[build] 编译 Rust 热服务（并行 $build_jobs；首次编译在旧电脑上需要几分钟）"
+        if ! cargo build --release --jobs "$build_jobs" --manifest-path "$DIR/club-hot/Cargo.toml" > "$RUN_DIR/build.log" 2>&1; then
+            if [ -x "$RUST_BIN" ]; then
+                say "[build] Rust 构建失败，旧服务保持不变（日志 $RUN_DIR/build.log）"
+                exit 1
+            fi
+            say "[build] Rust 构建失败，改用只运行 Python 的模式（日志 $RUN_DIR/build.log）"
+            PYTHON_ONLY=1
+        fi
     fi
 fi
 
@@ -108,11 +141,23 @@ if ! rcli ping >/dev/null 2>&1; then
 fi
 say "[redis] $REDIS_HOST:$REDIS_PORT 就绪"
 
-sed -e "s#__APP_ROOT__#$DIR#g" -e "s#__RUN_DIR__#$RUN_DIR#g" "$DIR/nginx.conf" > "$NGINX_CONF.new"
-if [ "$PYTHON_ONLY" = "1" ]; then
-    sed -i.bak -e '/server 127.0.0.1:2002 /d' -e 's/server 127.0.0.1:2001 backup;/server 127.0.0.1:2001;/' "$NGINX_CONF.new"
-    rm -f "$NGINX_CONF.new.bak"
+if ! command -v nginx >/dev/null 2>&1; then
+    say "[nginx] 未找到 nginx，请先安装（Debian/Ubuntu：apt install nginx；CentOS：yum install nginx）"
+    exit 1
 fi
+sed -e "s#__APP_ROOT__#$DIR#g" -e "s#__RUN_DIR__#$RUN_DIR#g" "$DIR/nginx.conf" > "$NGINX_CONF.new"
+nginx_version=$(nginx -v 2>&1 | sed -n 's#^.*nginx/\([0-9][0-9.]*\).*$#\1#p')
+if ! version_at_least "${nginx_version:-0}" 1.17.6; then
+    # 1.17.6 之前没有 $limit_req_status、$limit_conn_status 变量。
+    # shellcheck disable=SC2016
+    sed -i.bak -e 's/ limit_req=\$limit_req_status limit_conn=\$limit_conn_status//' "$NGINX_CONF.new"
+fi
+if [ "$PYTHON_ONLY" = "1" ]; then
+    # Python 每个连接占一个线程，不保留空闲的上游长连接。
+    sed -i.bak -e '/server 127.0.0.1:2002 /d' -e 's/server 127.0.0.1:2001 backup;/server 127.0.0.1:2001;/' \
+        -e '/^ *keepalive 64;$/d' "$NGINX_CONF.new"
+fi
+rm -f "$NGINX_CONF.new.bak"
 if ! nginx -t -p "$RUN_DIR" -c "$NGINX_CONF.new" >/dev/null 2>&1; then
     nginx -t -p "$RUN_DIR" -c "$NGINX_CONF.new"
     say "[nginx] 新配置校验失败，旧服务保持不变"
@@ -122,6 +167,15 @@ fi
 # ---- 切换：摘流、等在途报名完成、重启后端 ----
 stop_all
 mv "$NGINX_CONF.new" "$NGINX_CONF"
+# 上一次的服务日志留一份（首次启动的管理员密码在里面）；访问日志超过 64 MB 时换新文件。
+for log_file in "$RUN_DIR/python.log" "$RUN_DIR/rust.log"; do
+    if [ -s "$log_file" ]; then
+        mv -f "$log_file" "$log_file.1"
+    fi
+done
+if [ -f "$NGINX_ACCESS_LOG" ] && [ "$(wc -c < "$NGINX_ACCESS_LOG")" -gt 67108864 ]; then
+    mv -f "$NGINX_ACCESS_LOG" "$NGINX_ACCESS_LOG.1"
+fi
 
 HOST=127.0.0.1 PORT=2001 nohup "$PYTHON" "$DIR/main.py" > "$RUN_DIR/python.log" 2>&1 &
 echo $! > "$RUN_DIR/python.pid"

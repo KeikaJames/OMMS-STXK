@@ -58,10 +58,10 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut redis_cfg = RedisConfig::from_url(cfg.redis_url.clone());
     let mut pool_cfg = RedisPoolConfig::new(cfg.redis_pool_size);
-    let wait = Some(Duration::from_millis(cfg.redis_pool_wait_ms));
-    pool_cfg.timeouts.wait = wait;
-    pool_cfg.timeouts.create = wait;
-    pool_cfg.timeouts.recycle = wait;
+    // 取连接时会先 PING 校验；旧电脑上 Redis 稍慢，建连与校验按 REDIS_TIMEOUT 等待。
+    pool_cfg.timeouts.wait = Some(Duration::from_millis(cfg.redis_pool_wait_ms));
+    pool_cfg.timeouts.create = Some(cfg.redis_timeout);
+    pool_cfg.timeouts.recycle = Some(cfg.redis_timeout);
     redis_cfg.pool = Some(pool_cfg);
     let redis = redis_cfg
         .create_pool(Some(RedisRuntime::Tokio1))
@@ -73,7 +73,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         db: db.clone(),
         redis: redis.clone(),
         cfg: Arc::new(cfg.clone()),
-        auth_gate: Arc::new(Semaphore::new(cfg.auth_concurrency)),
+        auth: auth::AuthPool::new(cfg.auth_concurrency, cfg.auth_queue, handlers::AUTH_WAIT),
         registration_gate: registration_gate.clone(),
         reconcile_requested: reconcile_requested.clone(),
         catalog: Arc::new(Mutex::new(None)),

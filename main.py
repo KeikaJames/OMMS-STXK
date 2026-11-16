@@ -19,6 +19,7 @@ import time
 import ipaddress
 import re
 import hashlib
+import importlib.util
 import warnings
 from datetime import datetime, timedelta, timezone
 
@@ -34,22 +35,9 @@ try:
 except ImportError:  # pragma: no cover
     PasswordHasher = None
 
-try:
-    from pypinyin import lazy_pinyin  # noqa: F401  (导入学生用户名时可用，缺失有 fallback)
-    HAS_PYPINYIN = True
-except ImportError:
-    HAS_PYPINYIN = False
-
-try:
-    from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
-    HAS_PILLOW = True
-except ImportError:  # pragma: no cover - endpoint returns a clear error
-    Image = ImageOps = ImageSequence = None
-
-    class UnidentifiedImageError(OSError):
-        pass
-
-    HAS_PILLOW = False
+# pypinyin 与 Pillow 在导入学生、上传图片时才加载，常驻内存少约 55 MB。
+HAS_PYPINYIN = importlib.util.find_spec("pypinyin") is not None
+HAS_PILLOW = importlib.util.find_spec("PIL") is not None
 
 # ---- 配置(环境变量可覆盖) ------------------------------------------------
 DB_PATH = os.environ.get("DB_PATH", "club_system.db")
@@ -69,12 +57,16 @@ LOGIN_WINDOW = 60
 DEVICE_TTL = 180 * 24 * 3600
 MAX_BODY = max(1024, int(os.environ.get("MAX_BODY", str(8 * 1024 * 1024))))
 AUTH_CONCURRENCY = max(1, int(os.environ.get("AUTH_CONCURRENCY", str(min(4, CPU_COUNT)))))
+AUTH_WAIT = 10.0
 ARGON2_TIME_COST = max(1, int(os.environ.get("ARGON2_TIME_COST", "2")))
 ARGON2_MEMORY_KIB = max(8192, int(os.environ.get("ARGON2_MEMORY_KIB", "19456")))
 ARGON2_PARALLELISM = max(1, int(os.environ.get("ARGON2_PARALLELISM", "1")))
 REGISTER_CONCURRENCY = max(1, int(os.environ.get("REGISTER_CONCURRENCY", "1")))
 REGISTER_QUEUE_TIMEOUT = max(0.1, float(os.environ.get("REGISTER_QUEUE_TIMEOUT", "10")))
 MAX_HTTP_WORKERS = max(8, int(os.environ.get("MAX_HTTP_WORKERS", "128")))
+# 排队等口令校验的请求各占一个线程，最多用掉一半线程。
+AUTH_QUEUE = max(AUTH_CONCURRENCY, int(os.environ.get(
+    "AUTH_QUEUE", str(min(AUTH_CONCURRENCY * 16, max(AUTH_CONCURRENCY, MAX_HTTP_WORKERS // 2))))))
 SEAT_OP_TTL = max(5, int(os.environ.get("SEAT_OP_TTL", "30")))
 MAINTENANCE_TTL = 300
 FENCE_TTL = 30
@@ -139,10 +131,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("club")
 
+# nginx 1.17.6 之前没有 limit_req/limit_conn 字段，run.sh 会去掉它们。
 _ACCESS_LOG_RE = re.compile(
     r"^ts=(?P<ts>\d+(?:\.\d+)?)\s+status=(?P<status>\d{3})\s+"
-    r"upstream=\"(?P<upstream>[^\"]*)\"\s+request_time=(?P<request_time>\S+)\s+"
-    r"limit_req=(?P<limit_req>\S+)\s+limit_conn=(?P<limit_conn>\S+)$"
+    r"upstream=\"(?P<upstream>[^\"]*)\"\s+request_time=(?P<request_time>\S+)"
+    r"(?:\s+limit_req=(?P<limit_req>\S+)\s+limit_conn=(?P<limit_conn>\S+))?\s*$"
 )
 
 with open(os.path.join(SHARED_DIR, "messages.json"), encoding="utf-8") as _messages_file:
@@ -701,7 +694,6 @@ class RedisGate:
 
 
 RG = RedisGate(REDIS_URL)
-AUTH_SLOTS = threading.BoundedSemaphore(AUTH_CONCURRENCY)
 REGISTRATION_SLOTS = threading.BoundedSemaphore(REGISTER_CONCURRENCY)
 RECONCILE_REQUESTED = threading.Event()   # 需要整体发布(Redis 重启或首次启动)
 RECONCILE_STOP = threading.Event()
@@ -738,6 +730,89 @@ def verify_password(stored, plain):
     if stored.startswith("plain$"):
         return secrets.compare_digest(stored[6:], plain), True
     return secrets.compare_digest(stored, plain), True
+
+
+class AuthBusy:
+    """口令队列排不进去：wait 是建议浏览器等待的秒数。"""
+
+    def __init__(self, wait):
+        self.wait = wait
+
+
+class AuthQueue:
+    """口令哈希在固定数量的线程里先到先算，占用内存不超过线程数 × ARGON2_MEMORY_KIB。
+
+    排不进去的请求按服务速度依次约定回来的时间（Retry-After），回来时队列正好有空位。
+    """
+
+    def __init__(self, workers, limit):
+        self._workers = workers
+        self._limit = limit
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="auth")
+        self._lock = threading.Lock()
+        self._pending = 0
+        self._seconds = 0.1
+        self._next_slot = 0.0
+
+    def _timed(self, fn, args):
+        started = time.monotonic()
+        try:
+            return fn(*args)
+        finally:
+            elapsed = time.monotonic() - started
+            with self._lock:
+                self._seconds += (elapsed - self._seconds) * 0.2
+                self._pending -= 1
+
+    def _saturated_locked(self):
+        # 队列满，或按最近耗时估算排到也要接近 AUTH_WAIT，都请浏览器稍后再来。
+        return (self._pending >= self._limit
+                or self._pending * self._seconds / self._workers >= AUTH_WAIT * 0.8)
+
+    def _defer_locked(self):
+        now = time.monotonic()
+        interval = self._seconds / self._workers
+        self._next_slot = max(self._next_slot, now + self._pending * interval) + interval
+        return max(1, min(30, int(self._next_slot - now) + 1))
+
+    def admission(self):
+        """有空位返回 0，否则返回建议等待的秒数。"""
+        with self._lock:
+            return self._defer_locked() if self._saturated_locked() else 0
+
+    def submit(self, fn, *args, force=False):
+        """返回 (future, 0)；排不进去时返回 (None, 建议等待的秒数)。"""
+        with self._lock:
+            if not force and self._saturated_locked():
+                return None, self._defer_locked()
+            self._pending += 1
+        return self._pool.submit(self._timed, fn, args), 0
+
+    def run(self, fn, *args):
+        """排队执行 fn 并返回结果；排不进去或等待超过 AUTH_WAIT 时返回 AuthBusy。"""
+        future, wait = self.submit(fn, *args)
+        if future is None:
+            return AuthBusy(wait)
+        try:
+            return future.result(timeout=AUTH_WAIT)
+        except concurrent.futures.TimeoutError:
+            if future.cancel():
+                with self._lock:
+                    self._pending -= 1
+            return AuthBusy(1)
+
+
+AUTH = AuthQueue(AUTH_CONCURRENCY, AUTH_QUEUE)
+
+
+def verify_and_upgrade(stored, plain):
+    ok, upgrade = verify_password(stored, plain)
+    return ok, (hash_password(plain) if ok and upgrade else None)
+
+
+def verify_and_replace(stored, current, new):
+    ok, _ = verify_password(stored, current)
+    return ok, (hash_password(new) if ok else None)
 
 
 def gen_password(length=8):
@@ -889,6 +964,7 @@ def _sanitize_club_image(raw, declared_type):
     """Decode, bound, and re-encode JPEG/PNG/WebP/GIF before persistence."""
     if not HAS_PILLOW:
         raise ClubImageFeatureUnavailable("服务器暂未启用图片处理，请联系管理员")
+    from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
     if not raw or len(raw) > MAX_CLUB_IMAGE_BYTES:
         raise ClubImageError("图片内容为空或超过 2MB")
     declared_type = (declared_type or "").split(";", 1)[0].strip().lower()
@@ -1040,9 +1116,12 @@ def operations_snapshot():
                 response_counts["5xx"] += 1
             elif status >= 500:
                 response_counts["5xx"] += 1
-            if match.group("limit_req") not in ("-", "", "PASSED"):
+            limit_req, limit_conn = match.group("limit_req"), match.group("limit_conn")
+            if limit_req is None:
+                limited["rate"] += status == 429
+            elif limit_req not in ("-", "", "PASSED"):
                 limited["rate"] += 1
-            if match.group("limit_conn") not in ("-", "", "PASSED"):
+            if limit_conn not in (None, "-", "", "PASSED"):
                 limited["connections"] += 1
             address = match.group("upstream")
             # nginx emits all attempted upstreams separated by ", ".  The
@@ -1375,10 +1454,22 @@ DB_POOL = None  # init_db() 后赋值
 # ==========================================================================
 # 用户名生成(复用调用者连接 + 同事务/本批去重，原子)
 # ==========================================================================
+def _lazy_pinyin():
+    # 用户名只需可读、唯一，加载单字表即可；词组表另占约 40 MB。
+    os.environ.setdefault("PYPINYIN_NO_PHRASES", "true")
+    os.environ.setdefault("PYPINYIN_NO_DICT_COPY", "true")
+    try:
+        from pypinyin import lazy_pinyin
+    except ImportError:
+        return None
+    return lazy_pinyin
+
+
 def gen_username(name, cursor, seen):
     raw = str(name).strip()
-    if HAS_PYPINYIN:
-        base = "".join(c for c in "".join(lazy_pinyin(raw)).lower() if c.isalnum()) or "stu"
+    to_pinyin = _lazy_pinyin() if HAS_PYPINYIN else None
+    if to_pinyin is not None:
+        base = "".join(c for c in "".join(to_pinyin(raw)).lower() if c.isalnum()) or "stu"
     else:
         base = "".join(c for c in raw if c.strip()) or "user"
     candidate = base
@@ -1758,6 +1849,7 @@ GET_ROUTES = {
     "/api/export_unregistered": ("_h_export_unregistered", ROLE_ADMIN),
     "/api/admin/audit_events": ("_h_audit_events", ROLE_ADMIN),
     "/api/admin/operations_snapshot": ("_h_operations_snapshot", ROLE_ADMIN),
+    "/api/admin/summary": ("_h_admin_summary", ROLE_ADMIN),
     "/api/admin/preflight_plan": ("_h_preflight_plan", ROLE_ADMIN),
 }
 POST_ROUTES = {
@@ -2242,6 +2334,9 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._reply(400, "login_empty")
         if len(username) > MAX_USERNAME or len(password) > MAX_PASSWORD:
             return self._reply(400, "bad_request")
+        wait = AUTH.admission()
+        if wait:
+            return self._login_queued(wait)
         # 受信设备按"账号+设备"计数，其他设备按账号计数：别人输错密码不影响本人设备登录。
         device = self._device_token()
         trusted = RG.device_trusted(role, username, device)
@@ -2271,13 +2366,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             principal_version = RG.session_principal_version(role, principal)
         except RuntimeError:
             return self._reply(503, "unavailable")
-        if not AUTH_SLOTS.acquire(timeout=1.0):
-            return self._reply(503, "login_queued")
-        try:
-            ok, upgrade = verify_password(stored, password)
-            upgraded_hash = hash_password(password) if ok and upgrade else None
-        finally:
-            AUTH_SLOTS.release()
+        verified = AUTH.run(verify_and_upgrade, stored, password)
+        if isinstance(verified, AuthBusy):
+            return self._login_queued(verified.wait)
+        ok, upgraded_hash = verified
         if not ok:
             RG.login_fail(throttle_key)
             return self._reply(401, "login_failed")
@@ -2317,6 +2409,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(200, {"success": True, "student_id": row[0], "name": row[2],
                                     "class": row[3], "student_no": row[5]}, extra=cookies)
         self._json(200, {"success": True}, extra=cookies)
+
+    def _login_queued(self, wait):
+        return self._reply(503, "login_queued", extra=[("Retry-After", str(wait))])
+
+    def _auth_busy(self, busy):
+        return self._json(503, {"success": False, "message": "密码服务繁忙，请稍后重试"},
+                          extra=[("Retry-After", str(busy.wait))])
 
     def _h_logout(self, sess, data):
         token = _session_cookie_token_from_headers(self.headers)
@@ -2659,13 +2758,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             row = c.fetchone()
         if not row:
             return self._json(404, {"success": False, "message": "用户不存在"})
-        if not AUTH_SLOTS.acquire(blocking=False):
-            return self._json(503, {"success": False, "message": "密码服务繁忙，请稍后重试"})
-        try:
-            ok, _ = verify_password(row[0], cur_pw)
-            new_hash = hash_password(new_pw) if ok else None
-        finally:
-            AUTH_SLOTS.release()
+        verified = AUTH.run(verify_and_replace, row[0], cur_pw, new_pw)
+        if isinstance(verified, AuthBusy):
+            return self._auth_busy(verified)
+        ok, new_hash = verified
         if not ok:
             return self._json(400, {"success": False, "message": "当前密码不正确"})
         try:
@@ -2713,13 +2809,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             c = conn.cursor()
             c.execute("SELECT id, admin_password FROM settings WHERE admin_username = ?", (uname,))
             row = c.fetchone()
-        if not AUTH_SLOTS.acquire(blocking=False):
-            return self._json(503, {"success": False, "message": "密码服务繁忙，请稍后重试"})
-        try:
-            ok, _ = verify_password(row[1], cur_pw) if row else (False, False)
-            new_hash = hash_password(new_pw) if ok else None
-        finally:
-            AUTH_SLOTS.release()
+        verified = AUTH.run(verify_and_replace, row[1] if row else None, cur_pw, new_pw)
+        if isinstance(verified, AuthBusy):
+            return self._auth_busy(verified)
+        ok, new_hash = verified
         if not ok:
             return self._json(400, {"success": False, "message": "当前密码不正确"})
         try:
@@ -2777,13 +2870,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                                     "message": "该重置请求已执行；临时密码不会再次显示"})
         if not student:
             return self._json(404, {"success": False, "message": "学生不存在"})
-        if not AUTH_SLOTS.acquire(timeout=1.0):
-            return self._json(503, {"success": False, "message": "密码服务繁忙，请稍后重试"})
-        try:
-            temporary_password = gen_password(length=12)
-            password_hash = hash_password(temporary_password)
-        finally:
-            AUTH_SLOTS.release()
+        temporary_password = gen_password(length=12)
+        password_hash = AUTH.run(hash_password, temporary_password)
+        if isinstance(password_hash, AuthBusy):
+            return self._auth_busy(password_hash)
         try:
             mutation_lock = RG.session_begin_mutation("student", str(student_id))
         except RuntimeError:
@@ -3490,6 +3580,15 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             ],
         }, extra=[("Cache-Control", "no-store")])
 
+    def _h_admin_summary(self, sess):
+        """工作台每 6 秒刷新一次，只返回人数。"""
+        with DB_POOL.connection() as conn:
+            students, registered = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM students), (SELECT COUNT(*) FROM registrations)"
+            ).fetchone()
+        self._json(200, {"students": students, "registered": registered},
+                   extra=[("Cache-Control", "no-store")])
+
     def _h_get_registrations(self, sess):
         with DB_POOL.connection() as conn:
             cur = conn.cursor()
@@ -3587,13 +3686,9 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 continue
             rows.append((name, klass, derive_grade(klass), student_no, gen_password()))
 
-        def hashed(plain):
-            with AUTH_SLOTS:
-                return hash_password(plain)
-
-        # 哈希在事务外并行完成，写事务只做插入。
-        with concurrent.futures.ThreadPoolExecutor(max_workers=AUTH_CONCURRENCY) as pool:
-            hashes = list(pool.map(hashed, [row[4] for row in rows]))
+        # 哈希在事务外由口令队列完成，写事务只做插入。
+        futures = [AUTH.submit(hash_password, row[4], force=True)[0] for row in rows]
+        hashes = [future.result() for future in futures]
         try:
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()
@@ -3974,6 +4069,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
 # ==========================================================================
 # 有上限的多线程服务器
 # ==========================================================================
+BUSY_BODY = json.dumps({"success": False, "code": "queued", "message": MESSAGES["queued"]},
+                       ensure_ascii=False).encode("utf-8")
+
+
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -3985,7 +4084,7 @@ class Server(socketserver.ThreadingTCPServer):
 
     def process_request(self, request, client_address):
         if not self._request_slots.acquire(blocking=False):
-            body = b'{"success":false,"message":"service busy"}'
+            body = BUSY_BODY
             response = (
                 b"HTTP/1.1 503 Service Unavailable\r\n"
                 b"Content-Type: application/json; charset=utf-8\r\n"

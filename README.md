@@ -38,7 +38,8 @@
 - 抢位在 Redis 里一步完成；SQLite 容量触发器为每个社团设定最终上限。
 - 名额修复以社团为单位进行，其他社团照常报名；Redis 重启后由 SQLite 自动重建。
 - 名额快照带 ETag，由 nginx 每秒生成一次，全校轮询集中在一份缓存上。
-- 一条命令启动整套服务；只装 Python 的服务器可以单独运行 Python 服务。
+- 登录高峰时口令校验按到达顺序排队，浏览器按服务器约定的时间自动重试，直到登录成功。
+- 一条命令启动整套服务；没有 Rust 编译环境的旧电脑自动只运行 Python 服务。
 
 <div align="center">
 <img src="docs/dashboard.jpg" alt="学生选课页" width="560">&nbsp;&nbsp;<img src="docs/mobile.jpg" alt="手机上的选课页" width="180">
@@ -71,7 +72,7 @@ bash run.sh                         # 打开 http://127.0.0.1:8080
 
 运行文件都放在 `run/` 目录下。再次执行即为平滑重启，`bash run.sh stop` 停止。
 
-服务器只装了 Python 时，`run.sh` 自动切换为只运行 Python 的模式。也可以手动指定：
+没有 cargo、Rust 版本低于 1.88 或首次编译失败时，`run.sh` 自动改用只运行 Python 的模式。也可以手动指定：
 
 ```bash
 OMMS_PYTHON_ONLY=1 bash run.sh
@@ -89,6 +90,42 @@ sudo systemctl enable --now omms-python omms-hot
 ```
 
 nginx 使用仓库里的 `nginx.conf`：把 `__APP_ROOT__`、`__RUN_DIR__` 替换为实际路径，再加上 443 端口的 TLS 配置。
+
+## 在旧电脑上运行
+
+学校的旧台式机可以直接做服务器：装好 Python 3.7+、nginx 和 Redis 3.2+ 即可，Rust 热服务可选。
+
+下表在 Apple M4 Max 的 4 个能效核上以后台优先级运行全部服务端进程测得，单核速度约为平时的六分之一；浏览器端按前端的重试规则模拟 1000 名学生，同时操作。
+
+| 场景 | 只运行 Python | 加上 Rust 热服务 |
+|---|---|---|
+| 同时登录，全部登上 | 26 秒 | 17 秒 |
+| 抢 100 个名额，全部拿到结果 | 2.6 秒 | 0.2 秒 |
+| 各自报名不同社团，全部写库 | 3.3 秒 | 0.7 秒 |
+| 开放期间每人每 2–2.8 秒刷新名额 | nginx 占单核 6%，后端基本空闲 | 同左 |
+
+| 进程 | 空闲内存 | 1000 人登录后 |
+|---|---|---|
+| Python 服务 | 62 MB | 151 MB |
+| Rust 热服务 | 6 MB | 126 MB |
+| nginx（2 个工作进程） | 20 MB | 32 MB |
+| Redis | 7 MB | 10 MB |
+
+登录后增加的内存是口令哈希的工作区：每个校验线程 19 MB，线程数为 `AUTH_CONCURRENCY`。
+
+- **登录**：口令校验是最耗 CPU 的环节，这类机器上每次约 50–70 毫秒。请学生提前几分钟登录；人多时浏览器自动排队，最长等 2 分钟。
+- **时钟**：报名按服务器时钟开放。服务器与管理员电脑相差超过一分钟时，工作台会提示校准（Linux：`timedatectl set-ntp true`）。
+- **内存 2 GB 以下**：把 `AUTH_CONCURRENCY` 设为 2，口令校验最多占用 38 MB。
+- **Rust**：同样条件下从零编译约 3 分钟，单个编译进程峰值约 650 MB，`run.sh` 按内存决定并行数。也可以在同架构的另一台 Linux 机器上编译，把 `club-hot/target/release/club-hot` 拷过来。
+- **nginx**：1.12 及以上；`run.sh` 在 1.17.6 以前的版本上自动调整访问日志格式。
+- **浏览器**：Chrome 57、Edge 15、Firefox 52、Safari 10.1 及以上。360、QQ、搜狗浏览器默认使用极速模式，更旧的浏览器会看到换浏览器的提示。
+
+在目标电脑上可以用同样的方法测一次：
+
+```bash
+python3 tests/stress_site.py login --backend python --users 1000
+python3 tests/stress_site.py hot --backend python --users 1000
+```
 
 ## 使用流程
 
@@ -134,7 +171,8 @@ nginx 使用仓库里的 `nginx.conf`：把 `__APP_ROOT__`、`__RUN_DIR__` 替�
 | `COOKIE_SECURE` | `0` | 使用 HTTPS 时设为 `1` |
 | `SQLITE_SYNCHRONOUS` | `NORMAL` | SQLite 同步级别 |
 | `ARGON2_MEMORY_KIB` / `ARGON2_TIME_COST` / `ARGON2_PARALLELISM` | `19456` / `2` / `1` | 口令哈希参数 |
-| `AUTH_CONCURRENCY` | CPU 核数（最多 4） | 同时计算口令哈希的数量 |
+| `AUTH_CONCURRENCY` | CPU 核数（最多 4） | 同时计算口令哈希的线程数 |
+| `AUTH_QUEUE` | Python：线程数 × 16；Rust：线程数 × 64 | 排队等待口令校验的请求上限 |
 | `SEAT_OP_TTL` | `30` | 报名租约秒数 |
 | `MAX_IMPORT_STUDENTS` | `500` | 每批导入学生上限 |
 | `SEATS_CACHE_MS` | `500` | 后端名额快照缓存毫秒数 |
@@ -171,6 +209,8 @@ python3 tests/stress_registration.py --seats 100 --users 1000 --concurrency 1000
 
 压测在临时 SQLite 和随机端口的私有 Redis 上进行，结束后检查 16 项一致性条件：成功数等于名额、数据库人数、Redis 库存、报名镜像、在途成员与租约。
 
+`tests/stress_site.py` 经 nginx 压测整站：登录高峰、抢课、分散报名和轮询，浏览器端按前端的重试规则执行，并报告每个服务进程的 CPU 时间和内存。
+
 在一台 Apple Silicon 笔记本上的实测结果：
 
 | 场景 | 吞吐 | p99 |
@@ -184,7 +224,7 @@ python3 tests/stress_registration.py --seats 100 --users 1000 --concurrency 1000
 
 - 开启 HTTPS，两个服务设置 `COOKIE_SECURE=1`。
 - Redis 使用 `deploy/redis.conf`，或者为本系统单独分配一个库和键前缀。
-- 按学校时区设置 `APP_UTC_OFFSET`。
+- 按学校时区设置 `APP_UTC_OFFSET`，并校准服务器时钟。
 - 提醒学生提前几分钟登录，让口令校验的计算分散在开放之前。
 
 ## 项目结构

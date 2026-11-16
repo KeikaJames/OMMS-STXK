@@ -53,6 +53,17 @@ fn conditional(cached: CachedJson, headers: &HeaderMap) -> Response {
 // 登录
 // ===========================================================================
 
+pub const AUTH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 口令队列排不进去：告诉浏览器约定好的等待秒数。
+fn login_queued(wait: u64) -> Response {
+    let mut response = fail(StatusCode::SERVICE_UNAVAILABLE, "login_queued");
+    if let Ok(value) = HeaderValue::from_str(&wait.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LoginReq {
     #[serde(default)]
@@ -76,6 +87,9 @@ pub async fn login(
     }
     if username.len() > 80 || password.len() > 256 {
         return fail(StatusCode::BAD_REQUEST, "bad_request");
+    }
+    if let Some(wait) = state.auth.saturated() {
+        return login_queued(wait);
     }
     let redis = seats(&state);
     // 受信设备按"账号+设备"计数，其他设备按账号计数。
@@ -117,27 +131,21 @@ pub async fn login(
         Ok(version) => version,
         Err(e) => return e.into_response(),
     };
-    let Ok(Ok(permit)) = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        state.auth_gate.clone().acquire_owned(),
-    )
-    .await
-    else {
-        return fail(StatusCode::SERVICE_UNAVAILABLE, "login_queued");
-    };
     let stored = row.password.clone();
     let plain = password.clone();
-    let verified = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let v = auth::verify_password(&stored, &plain);
-        let upgraded = (v.ok && v.needs_upgrade)
-            .then(|| auth::hash_password(&plain).ok())
-            .flatten();
-        (v, upgraded)
-    })
-    .await;
-    let Ok((verify, upgraded_hash)) = verified else {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    let verified = state
+        .auth
+        .run(AUTH_WAIT, move || {
+            let v = auth::verify_password(&stored, &plain);
+            let upgraded = (v.ok && v.needs_upgrade)
+                .then(|| auth::hash_password(&plain).ok())
+                .flatten();
+            (v, upgraded)
+        })
+        .await;
+    let (verify, upgraded_hash) = match verified {
+        Ok(result) => result,
+        Err(wait) => return login_queued(wait),
     };
     if !verify.ok {
         redis.login_fail(&throttle_key).await;

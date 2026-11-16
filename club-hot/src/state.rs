@@ -7,6 +7,7 @@ use std::time::Duration;
 use deadpool_redis::Pool as RedisPool;
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::auth::AuthPool;
 use crate::cache::{CachedJson, Catalog};
 use crate::db::Db;
 
@@ -22,6 +23,7 @@ pub struct Config {
     pub seat_op_ttl: i64,
     pub login_max_fails: i64,
     pub auth_concurrency: usize,
+    pub auth_queue: usize,
     pub argon2_memory_kib: u32,
     pub argon2_time_cost: u32,
     pub argon2_parallelism: u32,
@@ -69,6 +71,7 @@ impl Config {
             "OFF" | "NORMAL" | "FULL" | "EXTRA" => synchronous,
             _ => "NORMAL".to_string(),
         };
+        let auth_concurrency = env_parse("AUTH_CONCURRENCY", cores.min(4)).max(1);
         Config {
             bind: env_or("BIND", "127.0.0.1:2002"),
             db_path: env_or("DB_PATH", "club_system.db"),
@@ -79,7 +82,8 @@ impl Config {
             cookie_secure: env_bool("COOKIE_SECURE"),
             seat_op_ttl: env_parse("SEAT_OP_TTL", 30i64).max(5),
             login_max_fails: env_parse("LOGIN_MAX_FAILS", 10i64).max(1),
-            auth_concurrency: env_parse("AUTH_CONCURRENCY", cores.min(4)).max(1),
+            auth_concurrency,
+            auth_queue: env_parse("AUTH_QUEUE", auth_concurrency * 64).max(auth_concurrency),
             argon2_memory_kib: env_parse("ARGON2_MEMORY_KIB", 19_456u32).max(8_192),
             argon2_time_cost: env_parse("ARGON2_TIME_COST", 2u32).max(1),
             argon2_parallelism: env_parse("ARGON2_PARALLELISM", 1u32).max(1),
@@ -87,7 +91,7 @@ impl Config {
             register_wait: Duration::from_millis(env_parse("REGISTER_WAIT_MS", 8_000u64).max(100)),
             read_pool_size: env_parse("DB_POOL_SIZE", 12usize).max(1),
             redis_pool_size: env_parse("REDIS_POOL_SIZE", 32usize).max(1),
-            redis_pool_wait_ms: env_parse("REDIS_POOL_WAIT_MS", 250u64).max(1),
+            redis_pool_wait_ms: env_parse("REDIS_POOL_WAIT_MS", 1_000u64).max(1),
             max_concurrency: env_parse("MAX_CONCURRENCY", 1024usize).max(1),
             request_timeout_secs: env_parse("REQUEST_TIMEOUT_SECS", 15u64).max(1),
             sqlite_synchronous: synchronous,
@@ -103,7 +107,7 @@ pub struct AppState {
     pub db: Db,
     pub redis: RedisPool,
     pub cfg: Arc<Config>,
-    pub auth_gate: Arc<Semaphore>,
+    pub auth: Arc<AuthPool>,
     pub registration_gate: Arc<Semaphore>,
     pub reconcile_requested: Arc<AtomicBool>,
     pub catalog: Arc<Mutex<Option<Arc<Catalog>>>>,

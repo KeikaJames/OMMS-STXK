@@ -1,10 +1,13 @@
 'use strict';
 
 (() => {
+  // 登录人数多时服务器让请求排队，浏览器按服务器给出的秒数一直重试，最多等两分钟。
+  const QUEUE_WINDOW_MS = 120000;
   let role = 'student';
   const form = $('#login-form');
   const submit = $('#login-submit');
   const error = $('#login-error');
+  const wait = $('#login-wait');
 
   $$('.seg button').forEach(button => {
     button.addEventListener('click', () => {
@@ -14,7 +17,12 @@
     });
   });
 
-  async function signIn(attempt = 0) {
+  function shouldWait(result) {
+    if (result.status === 0 || result.status === 503) return true;
+    return result.status === 429 && !(result.data && result.data.code === 'login_throttled');
+  }
+
+  async function signIn() {
     const username = $('#username').value.trim();
     const password = $('#password').value;
     if (!username || !password) {
@@ -22,14 +30,19 @@
       return;
     }
     error.textContent = '';
-    App.busy(submit, attempt ? '排队中' : '登录中');
+    const started = Date.now();
     const path = role === 'student' ? '/api/login' : '/api/admin_login';
-    const result = await App.request(path, { method: 'POST', body: { username, password } });
-    if (result.status === 503 && attempt < 5) {
-      // 登录人数较多时按服务器给出的间隔自动重试。
-      setTimeout(() => signIn(attempt + 1), result.retryAfter * 1000 + Math.random() * 400);
-      return;
+    App.busy(submit, '登录中');
+    let result;
+    for (;;) {
+      result = await App.request(path, { method: 'POST', body: { username, password } });
+      if (!shouldWait(result) || Date.now() - started > QUEUE_WINDOW_MS) break;
+      App.busy(submit, '排队中');
+      wait.hidden = false;
+      wait.textContent = '登录的人比较多，正在排队，请不要关闭页面（已等 ' + Math.round((Date.now() - started) / 1000) + ' 秒）';
+      await new Promise(resolve => setTimeout(resolve, result.retryAfter * 1000 + Math.random() * 600));
     }
+    wait.hidden = true;
     App.busy(submit, null);
     if (result.ok && result.data && result.data.success) {
       location.href = role === 'student' ? '/student/dashboard' : '/admin/dashboard';
@@ -45,6 +58,6 @@
 
   form.addEventListener('submit', event => {
     event.preventDefault();
-    signIn();
+    if (!submit.disabled) signIn();
   });
 })();

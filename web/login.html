@@ -2,15 +2,20 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="renderer" content="webkit">
+<meta name="force-rendering" content="webkit">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#F4EFE6">
 <title>登录 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=17">
-<script src="/js/common.js?v=17" defer></script>
-<script src="/js/login.js?v=15" defer></script>
+<link rel="stylesheet" href="/app.css?v=18">
+<script src="/js/legacy.js?v=18" defer></script>
+<script src="/js/common.js?v=18" defer></script>
+<script src="/js/login.js?v=18" defer></script>
 </head>
 <body class="login-body">
+<div class="legacy-note" id="legacy" hidden>这个浏览器版本太旧，打不开选课页面。请换用新版 Edge、Chrome 或 Firefox；360、QQ、搜狗浏览器请点地址栏右侧的图标切换到“极速模式”。</div>
 <main class="card login-card">
   <div class="login-head">
     <img src="/img/school-emblem.webp" alt="鄂尔多斯市实验中学校徽" width="56" height="56">
@@ -31,6 +36,7 @@
       <input class="input" id="password" name="password" type="password" autocomplete="current-password" required>
     </div>
     <p class="error" id="login-error" role="alert"></p>
+    <p class="hint queue-note" id="login-wait" role="status" hidden></p>
     <button class="btn btn-primary btn-block" id="login-submit" type="submit">登录</button>
   </form>
   <p class="login-foot">建议开放前几分钟登录 · 忘记密码请联系班主任重置</p>
