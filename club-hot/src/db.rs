@@ -561,7 +561,7 @@ impl Db {
             .interact(move |conn| {
                 conn.query_row(
                     "SELECT s.name, s.class, s.student_id, s.username, \
-                            c.name, r.registration_time \
+                            c.name, r.registration_time, r.club_id \
                      FROM students s \
                      LEFT JOIN registrations r ON r.student_id = s.id \
                      LEFT JOIN clubs c ON c.id = r.club_id \
@@ -575,6 +575,7 @@ impl Db {
                             username: r.get(3)?,
                             registered_club: r.get(4)?,
                             registration_time: r.get(5)?,
+                            registered_club_id: r.get(6)?,
                         })
                     },
                 )
@@ -583,6 +584,23 @@ impl Db {
             .await
             .map_err(|e| AppError::Db(format!("interact: {e}")))??;
         Ok(row)
+    }
+
+    /// 按操作代际查询报名是否已落库。
+    pub async fn registration_by_operation(&self, operation_id: String) -> AppResult<Option<i64>> {
+        let conn = self.read.get().await?;
+        let id = conn
+            .interact(move |conn| {
+                conn.query_row(
+                    "SELECT id FROM registrations WHERE operation_id = ?1",
+                    [operation_id],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| AppError::Db(format!("interact: {e}")))??;
+        Ok(id)
     }
 
     pub async fn registered_club_id(&self, id: StudentId) -> AppResult<Option<i64>> {
@@ -829,6 +847,7 @@ pub struct StudentInfoRow {
     pub username: String,
     pub registered_club: Option<String>,
     pub registration_time: Option<String>,
+    pub registered_club_id: Option<i64>,
 }
 
 // bring `.optional()` into scope for query_row.

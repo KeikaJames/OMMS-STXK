@@ -67,6 +67,7 @@ pub const K_MAINT: &str = "seats:maintenance";
 /// in one Redis operation. KEYS=stock/stureg/resv/open_at/maintenance/seat-op/lock;
 /// ARGV=reservation_value/reservation-ttl/operation-ttl.
 const LUA_ACQUIRE: &str = r#"
+    if redis.replicate_commands then redis.replicate_commands() end
     local reservation_ttl = tonumber(ARGV[2])
     local operation_ttl = tonumber(ARGV[3])
     if not reservation_ttl or reservation_ttl <= 0 or not operation_ttl or operation_ttl <= 0 then return -5 end
@@ -124,9 +125,11 @@ const LUA_ROLLBACK: &str = r#"
     if not stock or not tonumber(stock) then return -1 end
     if redis.call('EXISTS', KEYS[3]) == 1 then return 0 end
     redis.call('SET', KEYS[3], '1', 'EX', 604800)
+    local owned = false
+    if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]); owned = true end
+    if redis.call('GET', KEYS[4]) == ARGV[1] then redis.call('DEL', KEYS[4]); owned = true end
+    if not owned then return 2 end
     redis.call('INCR', KEYS[1])
-    if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
-    if redis.call('GET', KEYS[4]) == ARGV[1] then redis.call('DEL', KEYS[4]) end
     return 1
 "#;
 
@@ -401,6 +404,10 @@ impl Seats {
             if let Ok(changed) = result {
                 if changed < 0 {
                     return Err(AppError::Internal("invalid Redis stock state".to_string()));
+                }
+                if changed == 2 {
+                    // 租约已失效：库存交给对账修正，调用方据此请求对账。
+                    return Err(AppError::Internal("reservation lease expired".to_string()));
                 }
                 return Ok(changed == 1);
             }

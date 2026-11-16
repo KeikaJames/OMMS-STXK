@@ -125,6 +125,7 @@ K_OP = "seat:op:{}"
 # ARGV=reservation_value/reservation_ttl/operation_ttl。
 # 返回 1 成功 / 0 满员 / -1 已报名 / -2 库存未初始化 / -3 维护中 / -4 未开放。
 LUA_ACQUIRE = """
+if redis.replicate_commands then redis.replicate_commands() end
 local reservation_ttl = tonumber(ARGV[2])
 local operation_ttl = tonumber(ARGV[3])
 if not reservation_ttl or reservation_ttl <= 0 or not operation_ttl or operation_ttl <= 0 then return -5 end
@@ -188,14 +189,17 @@ if redis.call('GET', KEYS[3]) == ARGV[1] then redis.call('DEL', KEYS[3]) end
 return 1
 """
 
+# 只归还仍由本操作持有的名额；租约已失效时返回 2，由对账统一修正库存。
 LUA_ROLLBACK = """
 local stock = redis.call('GET', KEYS[1])
 if not stock or not tonumber(stock) then return -1 end
 if redis.call('EXISTS', KEYS[3]) == 1 then return 0 end
 redis.call('SET', KEYS[3], '1', 'EX', 604800)
+local owned = false
+if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]); owned = true end
+if redis.call('GET', KEYS[4]) == ARGV[1] then redis.call('DEL', KEYS[4]); owned = true end
+if not owned then return 2 end
 redis.call('INCR', KEYS[1])
-if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
-if redis.call('GET', KEYS[4]) == ARGV[1] then redis.call('DEL', KEYS[4]) end
 return 1
 """
 
@@ -366,26 +370,25 @@ class RedisGate:
         self._capacity_adjust = None
         self._registration_lock = None
         if _redis is not None:
-            try:
-                self._r = _redis.Redis.from_url(
-                    url, decode_responses=True,
-                    socket_timeout=0.5, socket_connect_timeout=0.5,
-                )
-                self._r.ping()
-                self._acquire = self._r.register_script(LUA_ACQUIRE)
-                self._confirm = self._r.register_script(LUA_CONFIRM)
-                self._rollback = self._r.register_script(LUA_ROLLBACK)
-                self._cancel = self._r.register_script(LUA_CANCEL)
-                self._maint_end = self._r.register_script(LUA_MAINT_END)
-                self._student_op_begin = self._r.register_script(LUA_STUDENT_OP_BEGIN)
-                self._session_create = self._r.register_script(LUA_SESSION_CREATE)
-                self._login_fail_script = self._r.register_script(LUA_LOGIN_FAIL)
-                self._capacity_adjust = self._r.register_script(LUA_CAPACITY_ADJUST)
-                self._registration_lock = self._r.register_script(LUA_REGISTRATION_LOCK)
+            # 客户端与脚本对象在启动时就建好，连接池在 Redis 可用后自动重连。
+            self._r = _redis.Redis.from_url(
+                url, decode_responses=True,
+                socket_timeout=0.5, socket_connect_timeout=0.5,
+            )
+            self._acquire = self._r.register_script(LUA_ACQUIRE)
+            self._confirm = self._r.register_script(LUA_CONFIRM)
+            self._rollback = self._r.register_script(LUA_ROLLBACK)
+            self._cancel = self._r.register_script(LUA_CANCEL)
+            self._maint_end = self._r.register_script(LUA_MAINT_END)
+            self._student_op_begin = self._r.register_script(LUA_STUDENT_OP_BEGIN)
+            self._session_create = self._r.register_script(LUA_SESSION_CREATE)
+            self._login_fail_script = self._r.register_script(LUA_LOGIN_FAIL)
+            self._capacity_adjust = self._r.register_script(LUA_CAPACITY_ADJUST)
+            self._registration_lock = self._r.register_script(LUA_REGISTRATION_LOCK)
+            if self.alive():
                 log.info("Redis 已连接: %s", url)
-            except Exception as e:  # noqa: BLE001
-                log.warning("Redis 连接失败(将降级): %s", e)
-                self._r = None
+            else:
+                log.warning("Redis 暂未就绪，恢复后自动连接: %s", url)
         else:
             log.warning("redis 模块未安装,名额/会话能力降级")
 
@@ -454,7 +457,9 @@ class RedisGate:
                 ))
                 if changed < 0:
                     raise RuntimeError("invalid stock state")
-                return bool(changed)
+                if changed == 2:
+                    RECONCILE_REQUESTED.set()
+                return changed == 1
             except Exception as e:  # noqa: BLE001
                 last_error = e
         raise RuntimeError("redis unavailable") from last_error
@@ -494,9 +499,9 @@ class RedisGate:
                     continue
             if not acquired:
                 return None
-            has_resv = next(self._r.scan_iter(match="resv:*", count=1), None) is not None
+            has_resv = next(self._r.scan_iter(match="resv:*", count=1000), None) is not None
             has_other_op = next(
-                self._r.scan_iter(match="seat:op:*", count=1), None) is not None
+                self._r.scan_iter(match="seat:op:*", count=1000), None) is not None
             if has_resv or has_other_op:
                 self.end_maintenance(token)
                 return None
@@ -601,7 +606,7 @@ class RedisGate:
         if self._r is None:
             return None
         try:
-            return next(self._r.scan_iter(match="seat:op:*", count=128), None) is not None
+            return next(self._r.scan_iter(match="seat:op:*", count=1000), None) is not None
         except Exception:  # noqa: BLE001
             return None
 
@@ -2421,12 +2426,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             if not stu:
                 return self._json(404, {"success": False, "message": "学生不存在"})
             cur.execute(
-                "SELECT c.name, r.registration_time FROM registrations r "
+                "SELECT c.name, r.registration_time, r.club_id FROM registrations r "
                 "JOIN clubs c ON r.club_id = c.id WHERE r.student_id = ?", (sid,))
             reg = cur.fetchone()
         self._json(200, {
             "name": stu[0], "class": stu[1], "student_id": stu[2], "username": stu[3],
             "registered_club": reg[0] if reg else None,
+            "registered_club_id": reg[2] if reg else None,
             "registration_time": reg[1] if reg else None,
         }, extra=[("Cache-Control", "no-store")])
 
@@ -2500,123 +2506,135 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         if code != 1:
             return self._json(503, {"success": False, "message": "名额状态异常,请稍后重试"})
 
-        # 抢到 -> 同步落库
+        # 抢到 -> 同步落库。提交之后的任何异常都只影响响应，不再回滚名额。
         try:
-            with DB_POOL.connection() as conn:
-                cur = conn.cursor()
-                conn.execute("BEGIN IMMEDIATE")
-                # The precheck above keeps bad requests out of Redis, but an
-                # administrator can change eligibility/enablement after it and
-                # before this writer transaction.  Re-check in the final
-                # SQLite transaction just as Rust does; otherwise Python
-                # fallback could admit one stale request after a policy edit.
-                admission = cur.execute(
-                    "SELECT c.enabled, c.seat_sync_pending, c.allowed_grades, c.allowed_classes, "
-                    "s.grade, s.class FROM clubs c JOIN students s ON s.id=? WHERE c.id=?",
-                    (sid, club_id),
-                ).fetchone()
-                admission_message = None
-                admission_status = 200
-                if not admission:
-                    admission_message = "社团不存在"
-                elif not admission[0]:
-                    admission_message = "该社团当前未开放报名"
-                elif admission[1]:
-                    admission_message = "该社团名额正在同步，请稍后重试"
-                    admission_status = 503
-                else:
-                    eligible, restriction_message = student_matches_restrictions(
-                        admission[4], admission[5], admission[2], admission[3]
-                    )
-                    if not eligible:
-                        admission_message = restriction_message
-                if admission_message:
-                    conn.rollback()
-                    try:
-                        RG.rollback_reservation(sid, club_id, reservation_value)
-                    except RuntimeError as rollback_error:
-                        log.error("报名策略变更后回滚失败 sid=%s op=%s: %s",
-                                  sid, operation_id, rollback_error)
-                        RECONCILE_REQUESTED.set()
-                        return self._json(503, {"success": False,
-                                                "message": "名额状态暂不可用，请稍后重试"})
-                    return self._json(
-                        admission_status,
-                        {"success": False, "message": admission_message},
-                        extra=[("Retry-After", "2")] if admission_status == 503 else None,
-                    )
-                cur.execute(
-                    "INSERT INTO registrations "
-                    "(student_id, club_id, registration_time, operation_id) VALUES (?,?,?,?)",
-                    (sid, club_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), operation_id))
-                registration_id = cur.lastrowid
-                cur.execute("UPDATE clubs SET current_students = current_students + 1 WHERE id = ?",
-                            (club_id,))
-                append_audit_event(
-                    cur, event_id="registration-" + operation_id,
-                    actor_role="student", actor_id=sid, action="registration.created",
-                    target_type="registration", target_id=registration_id,
-                    before={"registered_club_id": None},
-                    after={"registration_id": registration_id, "club_id": club_id},
-                    metadata={"operation_id": operation_id},
-                )
-                conn.commit()
-            try:
-                confirmed = RG.confirm_seat(sid, reservation_value)
-            except RuntimeError as e:
-                confirmed = False
-                log.error("报名已落库但 Redis 确认失败 reg=%s: %s", registration_id, e)
-                RECONCILE_REQUESTED.set()
-            # confirmed=False 也可能是并发退选已经删除了同一 registration。
-            if not confirmed:
-                RECONCILE_REQUESTED.set()
-                with DB_POOL.connection() as conn:
-                    still_exists = conn.execute(
-                        "SELECT 1 FROM registrations WHERE id=? AND operation_id=?",
-                        (registration_id, operation_id)).fetchone() is not None
-                if not still_exists:
-                    return self._json(200, {"success": False, "message": "报名已被并发退选取消"})
-            self._json(200, {"success": True,
-                             "message": "报名成功" if confirmed else "报名成功,状态同步稍有延迟"})
+            persisted = self._persist_registration(sid, club_id, operation_id)
         except sqlite3.IntegrityError as e:
-            try:
-                RG.rollback_reservation(sid, club_id, reservation_value)
-            except RuntimeError as re:
-                log.error("报名回滚同步失败 sid=%s op=%s: %s", sid, operation_id, re)
-                RECONCILE_REQUESTED.set()
-            is_full = "club full" in str(e).lower()
-            try:
-                with DB_POOL.connection() as conn:
-                    club_exists = conn.execute(
-                        "SELECT EXISTS(SELECT 1 FROM clubs WHERE id = ?)", (club_id,)
-                    ).fetchone()[0]
-                    existing = conn.execute(
-                        "SELECT club_id FROM registrations WHERE student_id = ?", (sid,)).fetchone()
-            except Exception as lookup_error:  # noqa: BLE001
-                log.error("报名冲突后的 SQLite 检查失败 sid=%s club=%s: %s",
-                          sid, club_id, lookup_error)
-                RECONCILE_REQUESTED.set()
-                return self._json(503, {"success": False, "message": "系统繁忙,请稍后重试"})
-            if not club_exists:
-                # The pre-check passed but a maintenance-protected admin delete
-                # won the race. Exact rollback restored Redis, so this is a
-                # business missing response rather than global stock drift.
-                return self._json(200, {"success": False, "message": "社团不存在"})
-            RECONCILE_REQUESTED.set()
-            if not is_full:
-                if existing and int(existing[0]) == club_id:
-                    return self._json(200, {"success": True, "message": "您已报名该社团"})
-            message = "该社团已满员" if is_full else "您已报名其他社团或请勿重复提交"
-            self._json(200, {"success": False, "message": message})
+            return self._registration_conflict(sid, club_id, reservation_value, operation_id, e)
         except Exception as e:  # noqa: BLE001
             log.error("报名落库失败 sid=%s club=%s: %s", sid, club_id, e)
-            try:
-                RG.rollback_reservation(sid, club_id, reservation_value)
-            except RuntimeError as re:
-                log.error("报名回滚同步失败 sid=%s op=%s: %s", sid, operation_id, re)
+            persisted = self._lookup_registration(operation_id)
+            if persisted is None:
                 RECONCILE_REQUESTED.set()
+                return self._json(503, {"success": False, "message": "报名结果确认中,请稍后刷新"},
+                                  extra=[("Retry-After", "2")])
+            if persisted is False:
+                return self._release_reservation_and_reply(
+                    sid, club_id, reservation_value, operation_id, 200, "报名失败,请重试")
+        if isinstance(persisted, tuple):
+            status, message = persisted
+            return self._release_reservation_and_reply(
+                sid, club_id, reservation_value, operation_id, status, message)
+        self._confirm_registration(sid, reservation_value, persisted, operation_id)
+
+    def _persist_registration(self, sid, club_id, operation_id):
+        """写入报名；成功返回 registration id，准入未通过返回 (status, message)。"""
+        with DB_POOL.connection() as conn:
+            cur = conn.cursor()
+            conn.execute("BEGIN IMMEDIATE")
+            # 管理员可能在预检之后修改了资格或启用状态，最终事务内再核对一次。
+            admission = cur.execute(
+                "SELECT c.enabled, c.seat_sync_pending, c.allowed_grades, c.allowed_classes, "
+                "s.grade, s.class FROM clubs c JOIN students s ON s.id=? WHERE c.id=?",
+                (sid, club_id),
+            ).fetchone()
+            rejected = None
+            if not admission:
+                rejected = (200, "社团不存在")
+            elif not admission[0]:
+                rejected = (200, "该社团当前未开放报名")
+            elif admission[1]:
+                rejected = (503, "该社团名额正在同步，请稍后重试")
+            else:
+                eligible, restriction_message = student_matches_restrictions(
+                    admission[4], admission[5], admission[2], admission[3]
+                )
+                if not eligible:
+                    rejected = (200, restriction_message)
+            if rejected:
+                conn.rollback()
+                return rejected
+            cur.execute(
+                "INSERT INTO registrations "
+                "(student_id, club_id, registration_time, operation_id) VALUES (?,?,?,?)",
+                (sid, club_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), operation_id))
+            registration_id = cur.lastrowid
+            cur.execute("UPDATE clubs SET current_students = current_students + 1 WHERE id = ?",
+                        (club_id,))
+            append_audit_event(
+                cur, event_id="registration-" + operation_id,
+                actor_role="student", actor_id=sid, action="registration.created",
+                target_type="registration", target_id=registration_id,
+                before={"registered_club_id": None},
+                after={"registration_id": registration_id, "club_id": club_id},
+                metadata={"operation_id": operation_id},
+            )
+            conn.commit()
+            return registration_id
+
+    @staticmethod
+    def _lookup_registration(operation_id):
+        """按操作代际查库：返回 registration id、False（不存在）或 None（查询失败）。"""
+        try:
+            with DB_POOL.connection() as conn:
+                row = conn.execute(
+                    "SELECT id FROM registrations WHERE operation_id=?", (operation_id,)
+                ).fetchone()
+        except Exception as e:  # noqa: BLE001
+            log.error("按操作代际查询报名失败 op=%s: %s", operation_id, e)
+            return None
+        return int(row[0]) if row else False
+
+    def _release_reservation_and_reply(self, sid, club_id, reservation_value, operation_id,
+                                       status, message):
+        try:
+            RG.rollback_reservation(sid, club_id, reservation_value)
+        except RuntimeError as e:
+            log.error("报名回滚失败 sid=%s op=%s: %s", sid, operation_id, e)
             RECONCILE_REQUESTED.set()
-            self._json(200, {"success": False, "message": "报名失败,请重试"})
+            return self._json(503, {"success": False, "message": "名额状态暂不可用,请稍后重试"})
+        return self._json(status, {"success": False, "message": message},
+                          extra=[("Retry-After", "2")] if status == 503 else None)
+
+    def _confirm_registration(self, sid, reservation_value, registration_id, operation_id):
+        try:
+            confirmed = RG.confirm_seat(sid, reservation_value)
+        except RuntimeError as e:
+            log.error("报名已落库但 Redis 确认失败 reg=%s: %s", registration_id, e)
+            confirmed = False
+        if not confirmed:
+            RECONCILE_REQUESTED.set()
+            if self._lookup_registration(operation_id) is False:
+                return self._json(200, {"success": False, "message": "报名已被并发退选取消"})
+        self._json(200, {"success": True,
+                         "message": "报名成功" if confirmed else "报名成功,状态同步稍有延迟"})
+
+    def _registration_conflict(self, sid, club_id, reservation_value, operation_id, error):
+        try:
+            RG.rollback_reservation(sid, club_id, reservation_value)
+        except RuntimeError as e:
+            log.error("报名回滚同步失败 sid=%s op=%s: %s", sid, operation_id, e)
+            RECONCILE_REQUESTED.set()
+        is_full = "club full" in str(error).lower()
+        try:
+            with DB_POOL.connection() as conn:
+                club_exists = conn.execute(
+                    "SELECT EXISTS(SELECT 1 FROM clubs WHERE id = ?)", (club_id,)
+                ).fetchone()[0]
+                existing = conn.execute(
+                    "SELECT club_id FROM registrations WHERE student_id = ?", (sid,)).fetchone()
+        except Exception as lookup_error:  # noqa: BLE001
+            log.error("报名冲突后的 SQLite 检查失败 sid=%s club=%s: %s",
+                      sid, club_id, lookup_error)
+            RECONCILE_REQUESTED.set()
+            return self._json(503, {"success": False, "message": "系统繁忙,请稍后重试"})
+        if not club_exists:
+            return self._json(200, {"success": False, "message": "社团不存在"})
+        RECONCILE_REQUESTED.set()
+        if not is_full and existing and int(existing[0]) == club_id:
+            return self._json(200, {"success": True, "message": "您已报名该社团"})
+        message = "该社团已满员" if is_full else "您已报名其他社团或请勿重复提交"
+        return self._json(200, {"success": False, "message": message})
 
     def _h_cancel_registration(self, sess, data):
         sid = sess["student_id"]
