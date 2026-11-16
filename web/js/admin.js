@@ -420,11 +420,12 @@
   function auditTarget(event) {
     const before = event.before || {};
     const after = event.after || {};
+    const studentKnown = id => studentRows.some(row => String(row.id) === String(id));
     switch (event.target_type) {
-      case 'student': return studentLabel(event.target_id);
-      case 'club': return clubLabel(event.target_id);
+      case 'student': return !studentKnown(event.target_id) && before.name ? before.name + (before.class ? '（' + before.class + '）' : '') : studentLabel(event.target_id);
+      case 'club': return !clubIndex.has(Number(event.target_id)) && before.name ? splitRoom(before.name).name : clubLabel(event.target_id);
       case 'registration': return clubLabel(after.club_id || before.club_id);
-      case 'students': return after.success !== undefined ? after.success + ' 名' : '全部学生';
+      case 'students': return after.success !== undefined ? after.success + ' 名' : before.students !== undefined ? before.students + ' 名' : '全部学生';
       case 'clubs': return after.success !== undefined ? after.success + ' 个' : '全部社团';
       default: return '';
     }
