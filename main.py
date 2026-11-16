@@ -431,13 +431,24 @@ class RedisGate:
 
     def inflight_state(self, club_id):
         """返回 (仍持有租约的在途成员数, 已失效的成员数)。"""
-        members = list(self._call("smembers", k_inflight(club_id)))
+        key = k_inflight(club_id)
+        members = list(self._call("smembers", key))
         if not members:
             return 0, 0
         parsed = [(member.partition("|")[0], member.partition("|")[2]) for member in members]
         current = self._call("mget", [k_op(student) for student, _lease in parsed])
-        live = sum(1 for (_student, lease), value in zip(parsed, current) if value == lease)
-        return live, len(parsed) - live
+        stale = [member for member, (_student, lease), value in zip(members, parsed, current) if value != lease]
+        live = len(members) - len(stale)
+        if stale:
+            # 两次读取之间刚确认或撤销的操作已经移出集合，仍在集合里的才算失效。
+            try:
+                pipe = self._r.pipeline(transaction=False)
+                for member in stale:
+                    pipe.sismember(key, member)
+                stale = [member for member, present in zip(stale, pipe.execute()) if present]
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError("redis unavailable") from e
+        return live, len(stale)
 
     def fence_acquire(self, club_id, wait=FENCE_WAIT):
         """取得社团栅栏并等该社团的在途操作完成；超时则放弃。"""
