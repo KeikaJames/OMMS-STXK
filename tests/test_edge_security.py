@@ -367,7 +367,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             "content-security-policy",
         ):
             self.assertIn(name, headers)
-        static_status, static_headers, _ = self._request_raw(self.edge_port, "GET", "/easter-egg.js")
+        static_status, static_headers, _ = self._request_raw(self.edge_port, "GET", "/js/common.js")
         self.assertEqual(200, static_status)
         self.assertIn("content-security-policy", static_headers)
 

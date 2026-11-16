@@ -1,12 +1,13 @@
 <div align="center">
 
-# 社团选课系统 · OMMS-STXK
+# 社团选课 · OMMS-STXK
 
-开抢时间一到,一个年级几百名学生在同一秒争抢有限的社团名额。这是一套为这种场景写的选课系统。
+面向中学社团选课的报名系统。开放时间一到，全年级同时报名，每个名额只分给一个人。
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Python](https://img.shields.io/badge/Python-stdlib-3776AB?logo=python&logoColor=white)
-![Rust](https://img.shields.io/badge/Rust-hot_path-CE422B?logo=rust&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.7%2B-3776AB?logo=python&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-1.88%2B-CE422B?logo=rust&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-3.2%2B-DC382D?logo=redis&logoColor=white)
 
 <sub>为 <b>鄂尔多斯市实验中学</b> 而做</sub>
 
@@ -14,125 +15,196 @@
 
 </div>
 
-## 这是一个秒杀问题
+## 功能
 
-抢课的难点不在功能多,而在那一瞬间的并发。一个 30 人的社团,可能有 300 人同时点"报名"。系统要做的事只有一件,但必须做对:在所有人里挑出前 30 个,一个不多——不能把 30 人的社团塞进 31 个人。
+**学生端**
 
-把这件事做对,是这套系统的全部设计意图。下面讲它是怎么做到的,以及怎么用。
+- 倒计时与服务器时钟同步，到达开放时间后报名按钮自动亮起。
+- 社团卡片展示简介、指导老师、活动时间、地点、面向年级与实时余量。
+- 按名称、老师、地点搜索；筛选"我能报名""还有名额""收藏"，收藏的社团排在最前。
+- 报名与退选在排队或确认期间自动重试同一请求，结果以服务器为准。
 
-## 怎么实现的
+**管理端**
 
-**热计数在 Redis,最终容量底线在 SQLite。** 每个社团的实时剩余名额是 Redis 整数键 `stock:club:{id}`,用来在开抢瞬间快速挡住满员请求。SQLite 保存最终报名记录；数据库另有 `registrations_capacity_guard` 触发器,会独立拒绝第 `max + 1` 条记录。因此即便 Redis 因故障或运维操作发生漂移,也不能把超卖真正写进数据库。`clubs.current_students` 只是管理后台使用的派生镜像。
+- 从 Excel 粘贴名单，自动识别姓名、班级、学号列，分批创建账号并下载账号密码表。
+- 编辑社团名称、容量、简介、老师、时间地点、年级与班级范围、卡片图片，单独开放或暂停某个社团。
+- 在学生名单里查找学生，为学生代为报名、调整社团、移出社团或重置密码。
+- 设置开放时间，报名结束后一键锁定名单。
+- 每次修改写入操作记录，可分别查看管理操作和学生报名。
+- 导出报名总表、未报名名单、各社团名册。
 
-**抢占是一段 Lua 脚本,在 Redis 里一步完成。** 报名请求到达时,服务端不是先查询、再判断、再扣减——那样会在两步之间留下缝隙,让两个人同时看到"还剩 1 个"。它把整个判断交给一段 Lua,Redis 单线程逐条执行,中途不会插进别的请求:
+**并发与运维**
 
-```lua
-if redis.call('EXISTS', KEYS[5]) == 1 then return -3 end   -- 维护中
-local open_at = redis.call('GET', KEYS[4])
-if not open_at or tonumber(redis.call('TIME')[1]) < tonumber(open_at) then
-  return -4                                                  -- 尚未开放
-end
-if redis.call('EXISTS', KEYS[1]) == 0 then return -2 end   -- 名额状态缺失,拒绝猜测恢复
-if redis.call('EXISTS', KEYS[2]) == 1 then return -1 end   -- 已确认报名
-if redis.call('EXISTS', KEYS[3]) == 1 then return -1 end   -- 已有在途占位
-if redis.call('EXISTS', KEYS[6]) == 1 then return -1 end   -- 同一学生有最终化任务
-local left = tonumber(redis.call('GET', KEYS[1]))
-if left <= 0 then return 0 end                             -- 满员
-redis.call('SET', KEYS[3], ARGV[1], 'EX', tonumber(ARGV[2]))  -- club_id|operation_id
-redis.call('SET', KEYS[6], ARGV[1], 'EX', tonumber(ARGV[3]))  -- 跨服务 operation lease
-redis.call('DECR', KEYS[1])                                -- 最后扣一个名额
-return 1                                                    -- 抢到
-```
+- 抢位在 Redis 里一步完成；SQLite 容量触发器为每个社团设定最终上限。
+- 名额修复以社团为单位进行，其他社团照常报名；Redis 重启后由 SQLite 自动重建。
+- 名额快照带 ETag，由 nginx 每秒生成一次，全校轮询集中在一份缓存上。
+- 一条命令启动整套服务；只装 Python 的服务器可以单独运行 Python 服务。
 
-"检查维护/开放时间 → 查重 → 看余量 → 扣减 → 占位"在一个 Lua 脚本里完成。两个人不可能同时扣到最后一个名额:Redis 让其中一个先跑完,另一个再跑时 `left` 已是 0。SQLite 的 `UNIQUE(student_id)` 又为"一人一社"提供了持久层保护。
+<div align="center">
+<img src="docs/dashboard.jpg" alt="学生选课页" width="560">&nbsp;&nbsp;<img src="docs/mobile.jpg" alt="手机上的选课页" width="180">
+</div>
 
-**抢到之后,用操作代际完成或补偿。** 每次报名生成唯一 `operation_id`,`resv:{student}`、`seat:op:{student}` 和确认态都关联同一代操作。确认、失败回补、退选分别使用 CAS/幂等 Lua,旧请求不能在延迟后误删新报名或重复归还座位。Rust 先取得 finalizer 槽位,再把 acquire、SQLite 落库和 Redis 最终化整体放进独立任务；客户端断开或外层超时不会取消该任务。Redis 命令有内部 deadline,同 operation 可安全重试；仍失败时,后台会等所有 operation lease 排空后取得 maintenance fence 做一致快照对账。预留 TTL 默认 60 秒；TTL 本身不会凭空归还库存。
+## 快速开始
 
-**两个服务,一套键。** 管理后台用 Python 写(`main.py`),抢课热路径用 Rust 写(`club-hot/`,axum + 有界 Redis/SQLite 连接池)。两者共享 Redis 键、CAS Lua、SQLite 容量触发器和 operation ID。最外层 nginx 直接发送静态资源,按 session 限制狂点，并叠加不依赖 Cookie 真实性的源 IP 热路径桶；把六个热端点转给 Rust,其余转给 Python。Python 可以在 Rust 连接失败时维持低容量降级服务,但它不是与 Rust 等价的高并发副本。
-
-**会话也有代际。** Python 和 Rust 都只接受恰好一个 `session` Cookie；重复 cookie 一律拒绝，避免两个后端选中不同身份。每个账号只保留最近一次登录对应的有效会话；再次登录、改密码、删除学生或清空学生都会立即使旧 token 失效。改密/删除期间会话创建还会被 Redis mutation lock 暂停，防止旧密码在 SQLite 提交前抢到“新代际” token。部署这套协议时必须同时切换 Python 与 Rust；已有旧 token 会被要求重新登录一次。
-
-**代价说在前面。** 单机进程若在 Redis 已扣减、SQLite 尚未记录的极窄窗口被强杀,仍可能暂时少卖一个；数据库容量触发器保证这种故障不会反向变成超卖。Python 启动时会先取得跨服务 maintenance fence,确认没有在途报名/退选后才安全对账；拿不到 fence 就保留 live Redis、不覆盖。对于需要多机、多地域和掉电后自动恢复的部署,还应增加持久 outbox/队列与可查询的请求幂等键。
-
-## 怎么用
-
-**管理员**(`/admin/dashboard`,登录时切到"管理员"):
-
-1. **导入学生名单**——粘贴或上传(姓名、班级、学号)。系统为每人生成账号和随机密码,**这批密码只在导入完成时显示这一次**,请当场导出、线下发给学生。
-2. **建社团、设名额**——逐个建,或批量导入(社团名 + 容量)。
-3. **设开抢时间**——到这个时间点之前,后端拒绝一切报名;到点自动放行。
-4. **开抢后**——实时看各社团报名进度、导出报名表、导出未报名名单、按社团下载名册。学生账号密码表也在这里导出。
-
-**学生**(`/student/dashboard`):用老师发的账号登录,页面有倒计时和每个社团的实时余额。到点点"报名";已报名的可以在"个人信息"里退选、改选——始终一人一社。为降低 token 泄露后的风险，同一账号在另一台设备重新登录会使前一台设备退出。
-
-<div align="center"><img src="docs/dashboard.png" alt="学生抢课页" width="760"></div>
-
-## 跑起来
-
-单机起 Python 一个进程可以用于开发和小规模，但登录、报名和退选仍需要 Redis server；`redis` 客户端包与 `argon2-cffi` 是完整/安全运行所需，`pypinyin` 用于更好的账号生成。若管理员要上传社团 JPEG/PNG/WebP/GIF 图片，还需安装 `Pillow`：
+### 开发机：Python + Redis
 
 ```bash
-brew services start redis                # macOS 示例；其他系统用各自服务管理器
-redis-cli ping                           # 必须返回 PONG
 pip install redis argon2-cffi pypinyin Pillow
-python3 main.py                          # 打开 http://127.0.0.1:2001
+redis-server --port 6379 --save "" --daemonize yes
+python3 main.py                     # 打开 http://127.0.0.1:2001
 ```
 
-首次启动会在运行窗口打印一行随机管理员密码,抄下、登录、尽快改掉。
+`pypinyin` 用于按姓名生成拼音账号，`Pillow` 用于处理社团卡片图片。
 
-要完整的双服务(nginx 限流 + Rust 热路径 + Redis),一键编排:
+首次启动时，日志里输出一次管理员账号和初始密码，登录后请在"设置"里修改。
+
+### 完整部署：nginx + Rust 热路径 + Python 管理服务
 
 ```bash
-bash run.sh                              # 打开 http://127.0.0.1:8080
+bash run.sh                         # 打开 http://127.0.0.1:8080
 ```
 
-`run.sh` 会先在旧入口仍在线时完成 Rust 构建、Redis 与 nginx 配置预检；构建失败会保留旧站点。预检通过后才摘流、等待在途报名/退选排空、启动 Python(:2001)并安全对账，再启动当前源码的 Rust(:2002)和 nginx(:8080)。新 Rust 未通过 readiness 时会明确改用低容量 Python backup。
+`run.sh` 适用于 macOS 和 Linux，依次完成以下步骤：
 
-## 管理运营接口
+1. 编译 Rust 热服务，启动专用 Redis（`deploy/redis.conf`），生成并校验 nginx 配置。
+2. 平滑切换：先等在途报名完成，再启动 Python（:2001）、Rust（:2002）和 nginx（:8080）。
 
-管理员可以在界面中使用以下能力；新增的单项重置、社团编辑、图片和手工调剂动作要求原因与前端生成的请求 ID，并写入 append-only 审计事件：
+运行文件都放在 `run/` 目录下。再次执行即为平滑重启，`bash run.sh stop` 停止。
 
-- 重置单名学生密码：旧 session 立即撤销，临时密码只在首次响应中显示一次。
-- 更新社团名称、容量、描述、指导老师、时间地点、年级/班级限制与启用状态。容量变化在 maintenance fence 下用定向 Redis 更新处理；若发布中断，仅对应社团会短暂显示“名额同步中”，正常路径不会触发全量库存对账。
-- 手工加入、移出或转移学生报名。普通调剂仍遵守容量和资格限制；如需越过资格限制，管理员必须显式标记并说明原因，容量不会被绕过。
-- 查看分页审计历史与固定 60 秒的运行快照；快照只显示聚合 QPS、状态码、上游分布、限流计数和名额状态，不泄露请求日志、IP、Cookie 或密码。
-- “预演压测”页面只提供隔离 CLI 命令与最近结果说明；网页不会启动进程或对运行中的数据库、Redis、8080 服务发压。
+服务器只装了 Python 时，`run.sh` 自动切换为只运行 Python 的模式。也可以手动指定：
 
-## 高并发验证
+```bash
+OMMS_PYTHON_ONLY=1 bash run.sh
+```
 
-仓库自带完全隔离的 Rust 压测器：每轮创建临时 SQLite、随机非 6379 的 Redis 端口和独立学生 session,结束后自动清理。它不只看 HTTP QPS,还同时检查业务成功数、DB 容量、`current_students`、Redis stock、确认代际和残留 reservation：
+### Linux 服务器：systemd
+
+单元文件按仓库位于 `/opt/omms`、以 `omms` 用户运行编写，部署到其他路径时同步修改。
+
+```bash
+cp deploy/omms.env.example deploy/omms.env
+cargo build --release --manifest-path club-hot/Cargo.toml
+sudo cp deploy/systemd/omms-*.service /etc/systemd/system/
+sudo systemctl enable --now omms-python omms-hot
+```
+
+nginx 使用仓库里的 `nginx.conf`：把 `__APP_ROOT__`、`__RUN_DIR__` 替换为实际路径，再加上 443 端口的 TLS 配置。
+
+## 使用流程
+
+**管理员**（登录页选择"管理员"）
+
+1. **导入学生**：粘贴名单，核对识别出的列后创建账号，在"账号发放"里下载账号密码表，线下发给学生。
+2. **添加社团**：批量粘贴"名称，人数上限"，再在社团卡片里补充简介、老师、时间地点和年级范围。
+3. **设置开放时间**：按学校时间填写，学生端会显示倒计时。
+4. **报名期间**：在"报名数据"里查看各社团进度；学生忘记密码或需要调整时，在"学生名单"里点"管理"处理。
+5. **报名结束**：在"设置"里锁定名单，再导出报名总表和各社团名册。
+
+**学生**：用发下来的账号登录，开放前先收藏想去的社团；到点后点"报名"，在"我的社团"里可以退选和改选。每人始终最多报名一个社团。
+
+## 工作原理
+
+```
+浏览器 ──▶ nginx :8080 ──┬─ 静态资源、名额快照缓存（1 秒）
+                         ├─ 热接口 ──▶ Rust :2002（备用：Python :2001）
+                         └─ 管理接口 ──▶ Python :2001
+                                  │
+                       Redis（名额、会话） + SQLite（报名记录、审计）
+```
+
+- **抢位一步完成**：`shared/lua/acquire.lua` 在一个 Redis 脚本里依次检查锁定、维护、开放时间、是否已报名，然后扣减名额、登记租约和在途成员。
+- **两层上限**：Redis 负责快速放行；SQLite 触发器 `registrations_capacity_guard` 让落库人数始终在容量以内，`UNIQUE(student_id)` 保证一人一社。
+- **只有抢到名额的请求写库**：单写者队列按顺序落库，确认后写入报名镜像；落库结果待确认时按操作代际查库，再决定确认或撤销。
+- **按社团修复**：每个社团有在途集合和栅栏。修复时只暂停这个社团，等在途操作完成后，以 SQLite 为准发布库存。失效租约、确认中断、管理端调整都会进入后台修复队列。
+- **幂等请求**：前端为每次报名生成 `request_id`。服务端把它和学生 ID 组成操作代际，重试同一请求总能得到同一结果。
+- **两个服务，一份协议**：Python 和 Rust 读取同一组 Lua 脚本（`shared/lua`）和提示文案（`shared/messages.json`），共用 Redis 键名和会话格式。
+
+完整设计见 [docs/architecture.md](docs/architecture.md)。
+
+## 配置
+
+两个服务读取相同的环境变量。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DB_PATH` | `club_system.db` | SQLite 数据库路径 |
+| `REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis 地址 |
+| `REDIS_PREFIX` | `omms:` | Redis 键前缀，便于与其他应用共用实例 |
+| `APP_UTC_OFFSET` | `+08:00` | 学校所在时区，开放时间按此解释 |
+| `COOKIE_SECURE` | `0` | 使用 HTTPS 时设为 `1` |
+| `SQLITE_SYNCHRONOUS` | `NORMAL` | SQLite 同步级别 |
+| `ARGON2_MEMORY_KIB` / `ARGON2_TIME_COST` / `ARGON2_PARALLELISM` | `19456` / `2` / `1` | 口令哈希参数 |
+| `AUTH_CONCURRENCY` | CPU 核数（最多 4） | 同时计算口令哈希的数量 |
+| `SEAT_OP_TTL` | `30` | 报名租约秒数 |
+| `MAX_IMPORT_STUDENTS` | `500` | 每批导入学生上限 |
+| `SEATS_CACHE_MS` | `500` | 后端名额快照缓存毫秒数 |
+| `REGISTER_WAIT_MS` | `8000` | Rust 报名请求等待结果的时长，超出后返回 `pending` |
+| `MAX_CONCURRENCY` | `1024` | Rust 同时处理的请求上限 |
+
+## 学生端接口
+
+| 接口 | 说明 |
+|---|---|
+| `POST /api/login` | 学生登录，签发会话与受信设备 Cookie |
+| `GET /api/catalog` | 社团目录，带 ETag |
+| `GET /api/seats` | 名额快照、开放时间与锁定状态，带 ETag |
+| `GET /api/check_registration_time` | 服务器时间与开放时间 |
+| `POST /api/register_club` | 报名，参数 `club_id`、`request_id` |
+| `POST /api/cancel_registration` | 退选 |
+| `GET /api/get_student_info` | 个人信息与报名结果 |
+
+响应统一包含 `success`、`code`、`message`：
+
+- 200：业务结果，例如 `registered`、`full`、`not_open`、`registered_other`；
+- 202 `pending`：已受理，正在确认；
+- 503：繁忙或名额更新中，按 `Retry-After` 用同一个 `request_id` 重试即可。
+
+提示码与文案见 `shared/messages.json`。
+
+## 测试与压测
 
 ```bash
 cargo build --release --manifest-path club-hot/Cargo.toml
-python3 tests/stress_registration.py --seats 100 --users 1000 --concurrency 300
-python3 -m unittest discover -s tests -p 'test_python_races.py' -v
-python3 -m unittest tests.test_edge_security -v
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+python3 tests/stress_registration.py --seats 100 --users 1000 --concurrency 1000
 ```
 
-Rust 默认总在途上限已按实测从 512 调整为 1024。本机让 `1000` 名独立学生真正同时争 `100` 个名额的收尾三轮中,每次都恰好 `100` 个成功、`900` 个满员、无 HTTP/传输错误；完成吞吐中位数约 `3064 req/s`,p99 中位数约 `237 ms`,16 项 SQLite/Redis/operation lease 不变量全部通过。这些数字只能说明本机容量余量，不能当生产尾延迟承诺；上线前仍要在真实服务器、校园 NAT、TLS 和混合轮询下复测。
+压测在临时 SQLite 和随机端口的私有 Redis 上进行，结束后检查 16 项一致性条件：成功数等于名额、数据库人数、Redis 库存、报名镜像、在途成员与租约。
 
-更重的“1000 并发、1000 次都必须真正写 SQLite”场景收尾三轮也全部成功、零状态漂移：完成吞吐中位数约 `1781 次报名/秒`,p99 中位数约 `470 ms`，三轮都在约 `0.54–0.65 s` 内完成全部 1000 次写入。
+在一台 Apple Silicon 笔记本上的实测结果：
 
-## 上线前
+| 场景 | 吞吐 | p99 |
+|---|---|---|
+| 1000 名学生同时争抢 100 个名额 | 5828 次/秒 | 109 ms |
+| 1000 名学生全部报名成功、全部写库 | 3369 次/秒 | 198 ms |
 
-- **生产必须开 HTTPS。** 自带的 `nginx.conf` 是开发用的明文 8080;正式部署改 443 + TLS，并设置 `COOKIE_SECURE=1`，否则密码明文过网、Cookie 也不能标记为 `Secure`。HTTP 环境不应配置 HSTS。
-- **初始密码一次性下发。** 管理员密码首启打印一次,学生密码导入时返回一次——系统不长期保存明文,丢了只能重置或重新导入。
-- **校园出口不能作为学生身份。** 全校常共用一个公网 IP；认证后的报名与轮询按真实会话限速，Nginx 还用源 IP 桶阻挡伪造随机 Cookie 的绕过。应用层不再因共享 IP 的失败登录计数锁死全校；仍需按真实学生数复测边缘 burst。
-- **安全回归记录。** 本轮请求 framing、Cookie、会话撤销、导入边界、Nginx 响应头和边缘限流的修复与隔离验证见 [security-remediation-2026-09-03](docs/security-remediation-2026-09-03/task_plan.md)。
+上线前请在目标服务器上用同样的命令测一次。
+
+## 上线清单
+
+- 开启 HTTPS，两个服务设置 `COOKIE_SECURE=1`。
+- Redis 使用 `deploy/redis.conf`，或者为本系统单独分配一个库和键前缀。
+- 按学校时区设置 `APP_UTC_OFFSET`。
+- 提醒学生提前几分钟登录，让口令校验的计算分散在开放之前。
 
 ## 项目结构
 
 ```
-main.py        Python 管理后台 + 热路径后备(标准库 + SQLite)
-club-hot/      Rust 热服务(axum + Redis,可选)
-web/           前端(纯 HTML/CSS,无构建步骤)
-nginx.conf     边缘限流 / 静态 / 路由        run.sh  一键编排
+main.py          Python 管理服务与热接口备用实现（标准库 + SQLite）
+club-hot/        Rust 热路径服务（axum + Redis + SQLite）
+shared/          两个服务共用的 Lua 脚本与提示文案
+web/             前端页面、样式、脚本与插画（原生 HTML、CSS、JS）
+nginx.conf       边缘限流、缓存与路由
+run.sh           一键启动与平滑重启
+deploy/          Redis 配置、环境变量模板、systemd 单元
+tests/           隔离的回归测试与压测
+docs/            设计说明与截图
 ```
 
 ## 参与贡献
 
-欢迎 PR。本项目只接受 Pull Request、不直推 `main`,并有代码风格约定——动手前请读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+欢迎提交 Pull Request，提交前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 作者与许可
 
-在 **Vles0123** 的原始版本之上,由 **BIRI GA([KeikaJames](https://github.com/KeikaJames))** 经原作者授权强化改造(并发抢占、安全加固、界面重做),以 [Apache-2.0](LICENSE) 分发,署名见 [NOTICE](NOTICE)。
+由 **BIRI GA（[KeikaJames](https://github.com/KeikaJames)）** 在 **Vles0123** 的原始版本上经授权重写和扩展，以 [Apache-2.0](LICENSE) 分发，署名见 [NOTICE](NOTICE)。

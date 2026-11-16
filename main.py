@@ -1589,8 +1589,7 @@ def init_db():
         cur.execute("SELECT id, admin_password FROM settings LIMIT 1")
         row = cur.fetchone()
         if row is None:
-            # 首启随机生成管理员口令，只打印一次到运行窗口(开源仓库不保留弱默认口令)。
-            # 用去歧义字母表(无 0/O/1/l/I),方便部署者从终端抄走后立即登录改密。
+            # 首次启动生成随机管理员口令，只在日志里输出一次；字母表去掉易混淆字符。
             _pw_alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
             init_admin_pw = "".join(secrets.choice(_pw_alphabet) for _ in range(12))
             cur.execute(
@@ -1598,8 +1597,8 @@ def init_db():
                 (now_text(), hash_password(init_admin_pw)),
             )
             log.warning("=" * 60)
-            log.warning("首次初始化:管理员账号 admin   初始密码  %s", init_admin_pw)
-            log.warning("此密码仅显示这一次，请立即登录后修改;切勿用于生产明文环境。")
+            log.warning("首次启动：管理员账号 admin，初始密码 %s", init_admin_pw)
+            log.warning("这个密码只输出这一次，登录后请在“设置”里修改。")
             log.warning("=" * 60)
         else:
             # 管理员口令一次性迁移成 argon2
@@ -1793,7 +1792,7 @@ STATIC_TYPES = {
     "webp": "image/webp",
     "woff2": "font/woff2",
 }
-STATIC_PATH_RE = re.compile(r"^/(?:(?:css|js|img|fonts|vendor)/)?[A-Za-z0-9][A-Za-z0-9._-]*\.([a-z0-9]+)$")
+STATIC_PATH_RE = re.compile(r"^/(?:(?:js|img)/)?[A-Za-z0-9][A-Za-z0-9._-]*\.([a-z0-9]+)$")
 SECURITY_HEADERS = [
     ("X-Content-Type-Options", "nosniff"),
     ("X-Frame-Options", "DENY"),
@@ -1801,7 +1800,7 @@ SECURITY_HEADERS = [
     ("Content-Security-Policy",
      "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; "
      "form-action 'self'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; "
-     "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"),
+     "style-src 'self'; script-src 'self'"),
 ]
 
 
@@ -2055,7 +2054,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         except OSError:
             return self._reply(404, "not_found")
         self._send(200, body, ctype=ctype,
-                   extra=SECURITY_HEADERS + [("Cache-Control", "public, max-age=300")])
+                   extra=SECURITY_HEADERS + [("Cache-Control", "no-cache")])
 
     def _serve_club_image(self, path):
         target = _club_image_disk_path(path)
@@ -2444,6 +2443,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._reply(*persisted)
         # 提交之后只做确认与响应，任何异常都不再回滚名额。
         self._confirm_registration(sid, club_id, mirror, lease, member)
+        SEATS_CACHE.invalidate()
         self._reply(200, "registered", success=True)
 
     def _persist_registration(self, sid, club_id, operation_id):
@@ -2589,6 +2589,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             except RuntimeError as e:
                 log.error("退选已落库，归还名额失败 sid=%s: %s", sid, e)
                 RG.request_repair(club_id)
+            SEATS_CACHE.invalidate()
             self._reply(200, "cancelled", success=True)
         finally:
             if not released:
@@ -3443,14 +3444,15 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             limit = int((qs.get("limit") or ["50"])[0])
         except ValueError:
             return self._json(400, {"success": False, "message": "cursor 或 limit 格式错误"})
-        if cursor < 0 or not 1 <= limit <= 100:
-            return self._json(400, {"success": False, "message": "cursor 或 limit 超出范围"})
+        role = (qs.get("role") or [""])[0]
+        if cursor < 0 or not 1 <= limit <= 100 or role not in {"", "admin", "student"}:
+            return self._json(400, {"success": False, "message": "cursor、limit 或 role 超出范围"})
         with DB_POOL.connection() as conn:
             rows = conn.execute(
                 "SELECT id,event_id,occurred_at,actor_role,actor_id,action,target_type,target_id,"
                 "request_id,reason,before_json,after_json,metadata_json FROM audit_events "
-                "WHERE (?=0 OR id<?) ORDER BY id DESC LIMIT ?",
-                (cursor, cursor, limit),
+                "WHERE (?=0 OR id<?) AND (?='' OR actor_role=?) ORDER BY id DESC LIMIT ?",
+                (cursor, cursor, role, role, limit),
             ).fetchall()
         events = [{
             "id": row[0], "event_id": row[1], "occurred_at": row[2],
@@ -3492,10 +3494,12 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_get_all_students(self, sess):
         with DB_POOL.connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT id, name, class, grade, student_id, username FROM students ORDER BY class, name")
+            cur.execute("SELECT s.id, s.name, s.class, s.grade, s.student_id, s.username, r.club_id "
+                        "FROM students s LEFT JOIN registrations r ON r.student_id = s.id "
+                        "ORDER BY s.class, s.name")
             rows = cur.fetchall()
         data = [{"id": r[0], "name": r[1], "class": r[2], "grade": r[3],
-                 "student_id": r[4], "username": r[5]}
+                 "student_id": r[4], "username": r[5], "club_id": r[6]}
                 for r in rows]
         self._json(200, data, extra=[("Cache-Control", "no-store")])
 
