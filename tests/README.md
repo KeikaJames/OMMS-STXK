@@ -5,7 +5,7 @@
 ## 准备
 
 ```bash
-pip install redis argon2-cffi pypinyin
+pip install redis argon2-cffi pypinyin Pillow
 cargo build --release --manifest-path club-hot/Cargo.toml
 redis-server --version
 nginx -v
@@ -22,12 +22,12 @@ cargo test --manifest-path club-hot/Cargo.toml
 
 | 文件 | 覆盖内容 |
 |---|---|
-| `test_python_races.py` | Python 服务：同一请求幂等、失效租约按社团修复、旧报名镜像清理、受信设备登录、名额快照 ETag、学校时区、100 个并发退选只归还一次、SQLite 容量触发器、会话吊销、管理员代为报名与调整、锁定后调剂（按年级范围安排人数最多、重复提交只执行一次、Redis 名额同步）、Excel 与 CSV 导出、重置密码、社团编辑、操作记录 |
+| `test_python_races.py` | Python 服务：同一请求幂等、失效租约按社团修复、旧报名镜像清理、受信设备登录、名额快照 ETag、学校时区、100 个并发退选只归还一次、SQLite 容量触发器、会话吊销、管理员代为报名与调整、锁定后调剂（按年级范围安排人数最多、重复提交只执行一次、Redis 名额同步）、Excel 与 CSV 导出、重置密码、社团编辑与图片、操作记录 |
 | `test_redis_recovery.py` | Lua 脚本：写入前开启效果复制、租约回滚与吸收模式、Redis 晚于服务启动、提交后故障保持名额占用 |
-| `test_edge_security.py` | nginx + Python + Rust：响应头、Cookie 轮换限额、已移除的图片路径返回 404、栅栏只暂停对应社团、后台修复、登录失败计数隔离、两个服务的准入规则与会话格式一致、请求 ID 幂等 |
+| `test_edge_security.py` | nginx + Python + Rust：响应头、Cookie 轮换限额、图片代理、栅栏只暂停对应社团、后台修复、登录失败计数隔离、两个服务的准入规则与会话格式一致、请求 ID 幂等 |
 | `test_inflight_scan.py` | 后台扫描两次读取之间完成的报名不算失效，租约缺失或被替换的成员算失效 |
 | `test_lifecycle.py` | 空数据库首次启动不开放报名，开放时间的设置、清除与重启后的同步；截止时间到点停止报名与退选并写入锁定；清空报名、自动快照、完整备份的下载与恢复、命令行重置管理员密码；修改学生信息、按班重置密码；工作台摘要的名额合计与导出、备份记录 |
-| `test_low_end.py` | 口令队列的容量、顺序、超时与约定的等待时间，新旧 nginx 访问日志格式，按需加载 pypinyin、不加载图像库，繁忙响应的提示码 |
+| `test_low_end.py` | 口令队列的容量、顺序、超时与约定的等待时间，新旧 nginx 访问日志格式，按需加载 pypinyin 与 Pillow，繁忙响应的提示码 |
 | `club-hot` 单元测试 | Cookie 解析、口令哈希与 Python 互通、口令队列、学校时区、ETag、提示文案覆盖全部返回码、报名镜像格式、令牌字符集 |
 
 ## 压测

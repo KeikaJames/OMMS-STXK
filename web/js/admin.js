@@ -1055,6 +1055,9 @@
     enabled.checked = Boolean(club.enabled);
     const enabledLabel = el('label', 'check');
     enabledLabel.append(enabled, document.createTextNode('开放报名'));
+    const image = el('input', 'input');
+    image.type = 'file';
+    image.accept = 'image/jpeg,image/png,image/webp,image/gif';
     const error = el('p', 'error');
     const save = el('button', 'btn btn-primary btn-sm', '保存');
     save.type = 'submit';
@@ -1068,9 +1071,9 @@
     row3.append(field('年级限制', grades), field('班级限制', classes));
     const buttons = el('div', 'actions');
     buttons.append(save, cancel);
-    form.append(row1, field('简介', description), row2, field('地点', location), row3, enabledLabel, error, buttons);
-    let requestId = App.requestId();
-    form.addEventListener('input', () => { requestId = App.requestId(); });
+    form.append(row1, field('简介', description), row2, field('地点', location), row3, enabledLabel, field('社团照片（可选，10 MB 以内）', image), error, buttons);
+    const requestIds = { update: App.requestId(), upload: App.requestId() };
+    form.addEventListener('input', () => { requestIds.update = App.requestId(); });
     cancel.addEventListener('click', () => { editingClub = null; loadClubs(); });
     form.addEventListener('submit', async event => {
       event.preventDefault();
@@ -1084,7 +1087,7 @@
       App.busy(save, '保存中');
       error.textContent = '';
       const payload = {
-        club_id: club.id, request_id: requestId, reason: '管理员编辑社团信息',
+        club_id: club.id, request_id: requestIds.update, reason: '管理员编辑社团信息',
         expected_revision: club.revision, name: name.value.trim(), max_students: max,
         description: description.value.trim(), advisor_name: advisor.value.trim(),
         meeting_time: meeting.value.trim(), location: location.value.trim(),
@@ -1095,6 +1098,17 @@
         App.busy(save, null);
         error.textContent = message(result, '保存失败');
         return;
+      }
+      const file = image.files && image.files[0];
+      if (file) {
+        const revision = result.data.club ? result.data.club.revision : club.revision + 1;
+        const params = new URLSearchParams({ club_id: String(club.id), expected_revision: String(revision), request_id: requestIds.upload, reason: '管理员更新社团卡片图片' });
+        const upload = await App.request('/api/upload_club_image?' + params, { method: 'POST', headers: { 'Content-Type': file.type }, body: file });
+        if (!ok(upload)) {
+          App.busy(save, null);
+          error.textContent = '社团信息已保存；' + message(upload, '照片上传失败');
+          return;
+        }
       }
       editingClub = null;
       App.toast('已保存', 'ok');

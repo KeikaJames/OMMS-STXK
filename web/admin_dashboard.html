@@ -12,8 +12,8 @@
 <link rel="stylesheet" href="/app.css?v=23">
 <script src="/js/legacy.js?v=18" defer></script>
 <script src="/js/common.js?v=18" defer></script>
-<script src="/js/club-art.js?v=2" defer></script>
-<script src="/js/admin.js?v=27" defer></script>
+<script src="/js/club-art.js?v=3" defer></script>
+<script src="/js/admin.js?v=28" defer></script>
 </head>
 <body>
 <div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
@@ -112,7 +112,7 @@
 
   <section data-view="clubs" id="view-clubs" hidden>
     <article data-pane="clubs-cards">
-      <div class="pane-head"><h2>社团</h2><p>编辑社团名称、名额、简介、时间地点和报名范围。</p></div>
+      <div class="pane-head"><h2>社团</h2><p>编辑社团名称、名额、简介、时间地点和照片。</p></div>
       <div class="project-grid" id="club-list"><div class="sk"></div></div>
     </article>
 
@@ -187,7 +187,7 @@
     </article>
 
     <article class="card" data-pane="settings-backup" hidden>
-      <div class="pane-head"><h2>备份</h2><p>完整备份为数据库的压缩包，下载后保存到另一台电脑。名单锁定时，以及调剂、清空报名、清空学生、清空社团之前，系统自动保存数据库快照。</p></div>
+      <div class="pane-head"><h2>备份</h2><p>完整备份包含数据库和社团照片，下载后保存到另一台电脑。名单锁定时，以及调剂、清空报名、清空学生、清空社团之前，系统自动保存数据库快照。</p></div>
       <div class="actions"><a class="btn btn-primary" href="/api/admin/backup">下载完整备份</a></div>
       <div class="table-wrap"><table class="tbl" id="backup-tbl"><tbody><tr><td>读取中</td></tr></tbody></table></div>
       <p class="hint" id="backup-note"></p>

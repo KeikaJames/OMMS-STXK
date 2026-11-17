@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -405,14 +406,35 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         self.assertIsInstance(json.loads(second_response[2]), list)
         self.assertNotIn(b"Unsupported method", second_response[2])
 
-    def test_club_image_routes_are_gone(self) -> None:
-        status, _headers, _body = self._request_raw(self.edge_port, "GET", "/club-images/1-" + "a" * 32 + ".jpg")
-        self.assertEqual(404, status)
-        admin = self._login(self.python_port, "admin", "admin-password", admin=True)
-        status, _headers, _body = self._request_raw(
-            self.edge_port, "POST", "/api/upload_club_image?club_id=1", body={}, cookie=f"session={admin}"
-        )
-        self.assertEqual(404, status)
+    def test_club_images_are_safely_proxied_through_nginx(self) -> None:
+        self._reset_state()
+        admin_token = self._login(self.edge_port, "admin", "admin-password", admin=True)
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow unavailable")
+        image = Image.new("RGBA", (8, 8), (0, 0, 128, 200))
+        out = io.BytesIO()
+        image.save(out, format="PNG")
+        raw = out.getvalue()
+        upload = (
+            f"POST /api/upload_club_image?club_id=1&expected_revision=0&request_id=edge-image-0001&reason=upload "
+            f"HTTP/1.1\r\nHost: 127.0.0.1:{self.edge_port}\r\nContent-Type: image/png\r\n"
+            f"Content-Length: {len(raw)}\r\nCookie: session={admin_token}\r\nConnection: close\r\n\r\n"
+        ).encode("ascii") + raw
+        status, _headers, body = self._raw_edge_request(upload)
+        self.assertEqual(200, status)
+        uploaded = json.loads(body)
+        image_path = uploaded["club"]["image_path"]
+        status, headers, content = self._request_raw(self.edge_port, "GET", image_path)
+        self.assertEqual(200, status)
+        self.assertEqual("image/png", headers.get("content-type"))
+        self.assertGreater(len(content), 0)
+        status, _headers, clubs_body = self._request_raw(self.edge_port, "GET", "/api/get_clubs")
+        self.assertEqual(200, status)
+        edge_club = json.loads(clubs_body)[0]
+        self.assertEqual(image_path, edge_club["image_path"])
+        self.assertEqual(uploaded["club"]["revision"], edge_club["revision"])
 
     def test_python_and_rust_pause_only_a_fenced_club(self) -> None:
         """单社团栅栏期间，两个后端都只暂停这一个社团的报名与退选。"""

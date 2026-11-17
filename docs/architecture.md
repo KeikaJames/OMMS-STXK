@@ -72,8 +72,8 @@
 ## 备份与恢复
 
 - **自动快照**：名单锁定时，以及调剂、清空报名、清空学生、清空社团之前，用 SQLite 备份接口把数据库复制到 `BACKUP_DIR`，文件名为 `年月日-时分秒-原因.db`，保留最近 `BACKUP_KEEP` 份。危险操作的快照失败时，操作不执行。
-- **完整备份**：`GET /api/admin/backup` 返回 zip，内含 `club_system.db`；`?name=` 下载指定的自动快照。
-- **恢复**：`bash run.sh restore 文件` 先停止服务，再由 `main.py restore` 校验文件（`integrity_check` 和四张数据表），把当前数据库存为 `before-restore` 快照，复制备份中的数据库。随后删除本系统在 Redis 中的全部键，服务启动时按 SQLite 重新发布名额，原有会话失效。
+- **完整备份**：`GET /api/admin/backup` 返回 zip，内含 `club_system.db` 和 `club-images/` 下的社团照片；`?name=` 下载指定的自动快照。
+- **恢复**：`bash run.sh restore 文件` 先停止服务，再由 `main.py restore` 校验文件（`integrity_check` 和四张数据表），把当前数据库存为 `before-restore` 快照，复制备份中的数据库；zip 备份同时替换社团照片。随后删除本系统在 Redis 中的全部键，服务启动时按 SQLite 重新发布名额，原有会话失效。
 - **管理员密码**：`bash run.sh reset-admin` 生成新密码、写入哈希、使管理员会话失效，并记入操作记录。
 
 ## 导出
@@ -159,13 +159,14 @@
 
 - 没有 cargo、Rust 版本过旧或首次编译失败时，`run.sh` 只运行 Python 服务，nginx 配置去掉 Rust 上游和到 Python 的长连接，Python 的线程只在处理请求时占用。也可以用 `OMMS_PYTHON_ONLY=1` 指定。接口与 Rust 版本一致。
 - 编译 Rust 时按内存决定并行数，每个编译进程按 1 GB 计。
-- Python 服务启动时只加载必需的模块：pypinyin 在导入学生时加载，并且只加载单字表。空闲内存约 62 MB。
+- Python 服务启动时只加载必需的模块：pypinyin 在导入学生时加载，并且只加载单字表；Pillow 在上传社团图片时加载。空闲内存约 62 MB。
 - `ARGON2_MEMORY_KIB`、`AUTH_CONCURRENCY`、`MAX_HTTP_WORKERS`、`DB_POOL_SIZE` 按内存和核数下调。
 - Rust 从连接池取 Redis 连接最多等 1 秒（`REDIS_POOL_WAIT_MS`），建立和校验连接按 `REDIS_TIMEOUT`；Redis 稍慢时请求继续等待。
 - `SQLITE_SYNCHRONOUS=NORMAL` 配合 WAL；数据盘较慢时同样适用。
 - `deploy/redis.conf` 关闭持久化、限制 256 MB 内存并使用 `noeviction`，名额以 SQLite 为准，重启后自动重建。
 - `run.sh` 每次启动保留上一次的服务日志（`python.log.1`、`rust.log.1`），访问日志超过 64 MB 时换新文件。
 - 前端为原生 HTML、CSS、JS；登录页与工作台插画为 WebP（单张 21–56 KB），社团默认插图和管理端图标为内嵌 SVG。页面使用纯色顶栏和小范围阴影，适合集成显卡。
+- 社团照片上传后按 EXIF 方向摆正，缩到长边 960 像素，带透明通道的存 PNG，其余存 JPEG（质量 82），每张约 70–160 KB；文件名随每次上传变化，响应带一年的 `immutable` 缓存。
 - 管理端工作台比较服务器与管理员电脑的时钟，相差超过一分钟时提示校准。
 
 `tests/stress_site.py` 用来在目标机器上测量登录高峰、抢课和轮询，见 [tests/README.md](../tests/README.md)。

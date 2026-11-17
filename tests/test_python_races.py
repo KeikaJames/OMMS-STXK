@@ -1160,6 +1160,60 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertEqual(200, plan_status)
         self.assertEqual("isolated-cli-only", plan["mode"])
 
+    def test_admin_upload_and_remove_club_image_are_revisioned_and_allowlisted(self) -> None:
+        self._seed_scenario(users=1, capacity=2, redis_stock=2)
+        admin_token = self._admin_token()
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow unavailable")
+        def upload(picture, revision: int, request_id: str) -> dict:
+            out = io.BytesIO()
+            picture.save(out, format="PNG")
+            raw = out.getvalue()
+            request = (
+                f"POST /api/upload_club_image?club_id=1&expected_revision={revision}&request_id={request_id}"
+                f"&reason=upload HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\n"
+                "Content-Type: image/png\r\n"
+                f"Content-Length: {len(raw)}\r\nCookie: session={admin_token}\r\nConnection: close\r\n\r\n"
+            ).encode("ascii") + raw
+            status, headers, body = self._one_raw_request(request)
+            self.assertEqual(200, status, body)
+            self.assertEqual("application/json; charset=utf-8", headers.get("content-type"))
+            return json.loads(body)
+
+        def fetch(path: str) -> tuple[int, dict[str, str], bytes]:
+            return self._one_raw_request(
+                f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\nConnection: close\r\n\r\n".encode("ascii"))
+
+        transparent = upload(Image.new("RGBA", (8, 8), (0, 0, 128, 200)), 0, "image-upload-0001")
+        self.assertRegex(transparent["club"]["image_path"], r"^/club-images/1-[0-9a-f]{32}\.png$")
+        image_status, image_headers, _image_body = fetch(transparent["club"]["image_path"])
+        self.assertEqual((200, "image/png"), (image_status, image_headers.get("content-type")))
+
+        uploaded = upload(Image.new("RGB", (2400, 1600), "navy"), transparent["club"]["revision"], "image-upload-0002")
+        image_path = uploaded["club"]["image_path"]
+        self.assertRegex(image_path, r"^/club-images/1-[0-9a-f]{32}\.jpg$")
+        image_status, image_headers, image_body = fetch(image_path)
+        self.assertEqual((200, "image/jpeg"), (image_status, image_headers.get("content-type")))
+        self.assertEqual((960, 640), Image.open(io.BytesIO(image_body)).size)
+        self.assertEqual(404, fetch(transparent["club"]["image_path"])[0])
+        image_get = (
+            f"GET {image_path} HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\nConnection: close\r\n\r\n"
+        ).encode("ascii")
+        clubs_status, clubs = self._request_json("GET", "/api/get_clubs")
+        self.assertEqual(200, clubs_status)
+        self.assertEqual(image_path, clubs[0]["image_path"])
+        self.assertEqual(uploaded["club"]["revision"], clubs[0]["revision"])
+        remove_status, removed = self._request_json(
+            "POST", "/api/remove_club_image", token=admin_token,
+            body={"club_id": 1, "expected_revision": uploaded["club"]["revision"],
+                  "request_id": "image-remove-0001", "reason": "remove"},
+        )
+        self.assertEqual(200, remove_status, removed)
+        self.assertIsNone(removed["club"]["image_path"])
+        self.assertEqual(404, self._one_raw_request(image_get)[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

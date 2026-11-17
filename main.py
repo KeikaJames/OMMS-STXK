@@ -25,6 +25,7 @@ import ipaddress
 import re
 import hashlib
 import importlib.util
+import warnings
 import zipfile
 from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape as xml_escape
@@ -41,8 +42,9 @@ try:
 except ImportError:  # pragma: no cover
     PasswordHasher = None
 
-# pypinyin 在导入学生时才加载，并且只加载单字表。
+# pypinyin 与 Pillow 在导入学生、上传图片时才加载，常驻内存少约 55 MB。
 HAS_PYPINYIN = importlib.util.find_spec("pypinyin") is not None
+HAS_PILLOW = importlib.util.find_spec("PIL") is not None
 
 # ---- 配置(环境变量可覆盖) ------------------------------------------------
 DB_PATH = os.environ.get("DB_PATH", "club_system.db")
@@ -86,6 +88,19 @@ MAX_USERNAME = 80
 MAX_PASSWORD = 256
 MAX_IMPORT_STUDENTS = max(1, int(os.environ.get("MAX_IMPORT_STUDENTS", "500")))
 MAX_CLUB_CAPACITY = 10_000
+CLUB_IMAGE_DIR = os.path.abspath(os.environ.get(
+    "CLUB_IMAGE_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "club-images"),
+))
+MAX_CLUB_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_CLUB_IMAGE_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_CLUB_IMAGE_PIXELS = 50_000_000
+CLUB_IMAGE_SIDE = 960           # 照片长边缩到 960 像素，卡片在 2 倍屏上仍然清晰
+MAX_CLUB_IMAGE_WIDTH = 1920     # GIF 不缩放，保持原有尺寸上限
+MAX_CLUB_IMAGE_HEIGHT = 1080
+MAX_CLUB_GIF_FRAMES = 120
+MAX_CLUB_GIF_DURATION_MS = 30_000
+MAX_CLUB_GIF_DECODED_PIXELS = 12_000_000
+IMAGE_PROCESS_SLOTS = threading.BoundedSemaphore(1)
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0").strip().lower() in {"1", "true", "yes", "on"}
 NGINX_ACCESS_LOG = os.environ.get("NGINX_ACCESS_LOG", "/tmp/club_nginx_access.log")
 METRICS_WINDOW_SECONDS = 60
@@ -954,6 +969,135 @@ def admin_request_id(data):
     return value
 
 
+class ClubImageError(ValueError):
+    """An uploaded club image failed bounded decode or normalization."""
+
+
+class ClubImageFeatureUnavailable(RuntimeError):
+    """The server is intentionally refusing unvalidated image persistence."""
+
+
+_CLUB_IMAGE_NAME = re.compile(
+    r"^(?P<club_id>[1-9][0-9]*)-(?P<object_id>[0-9a-f]{32})\.(?P<ext>gif|jpg|png|webp)$"
+)
+_CLUB_IMAGE_MIME = {
+    "GIF": ("gif", "image/gif"),
+    "JPEG": ("jpg", "image/jpeg"),
+    "PNG": ("png", "image/png"),
+    "WEBP": ("webp", "image/webp"),
+}
+
+
+def _sanitize_club_image(raw, declared_type):
+    """Decode, bound, and re-encode JPEG/PNG/WebP/GIF before persistence."""
+    if not HAS_PILLOW:
+        raise ClubImageFeatureUnavailable("服务器暂未启用图片处理，请联系管理员")
+    from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
+    if not raw or len(raw) > MAX_CLUB_IMAGE_BYTES:
+        raise ClubImageError("图片内容为空或超过 10 MB")
+    declared_type = (declared_type or "").split(";", 1)[0].strip().lower()
+    if declared_type not in {mime for _ext, mime in _CLUB_IMAGE_MIME.values()}:
+        raise ClubImageError("仅支持 JPEG、PNG、WebP 和 GIF")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as source:
+                image_format = (source.format or "").upper()
+                if image_format not in _CLUB_IMAGE_MIME:
+                    raise ClubImageError("无法识别图片格式")
+                extension, actual_type = _CLUB_IMAGE_MIME[image_format]
+                if declared_type != actual_type:
+                    raise ClubImageError("图片内容与 Content-Type 不一致")
+                width, height = source.size
+                if image_format == "GIF" and not (1 <= width <= MAX_CLUB_IMAGE_WIDTH
+                                                  and 1 <= height <= MAX_CLUB_IMAGE_HEIGHT):
+                    raise ClubImageError("GIF 尺寸不能超过 1920×1080")
+                if not 1 <= width * height <= MAX_CLUB_IMAGE_PIXELS:
+                    raise ClubImageError("图片不能超过 5000 万像素")
+                output = io.BytesIO()
+                frames, duration_ms = 1, 0
+                if image_format == "GIF":
+                    rendered, durations = [], []
+                    decoded_pixels = 0
+                    for frames, frame in enumerate(ImageSequence.Iterator(source), start=1):
+                        if frames > MAX_CLUB_GIF_FRAMES:
+                            raise ClubImageError("GIF 不能超过 120 帧")
+                        frame.load()
+                        decoded_pixels += width * height
+                        if decoded_pixels > MAX_CLUB_GIF_DECODED_PIXELS:
+                            raise ClubImageError("GIF 解码规模过大")
+                        duration = frame.info.get("duration", source.info.get("duration", 100))
+                        duration = max(80, min(int(duration) if isinstance(duration, (int, float)) else 100, 2000))
+                        duration_ms += duration
+                        if duration_ms > MAX_CLUB_GIF_DURATION_MS:
+                            raise ClubImageError("GIF 总时长不能超过 30 秒")
+                        rendered.append(frame.convert("RGBA"))
+                        durations.append(duration)
+                    rendered[0].save(output, format="GIF", save_all=True, append_images=rendered[1:],
+                                     duration=durations, loop=int(source.info.get("loop", 0) or 0),
+                                     disposal=2, optimize=True)
+                else:
+                    # 照片统一缩到长边 CLUB_IMAGE_SIDE；带透明通道的存 PNG，其余存 JPEG（旧版 iOS 不支持 WebP）。
+                    if image_format == "JPEG":
+                        source.draft("RGB", (CLUB_IMAGE_SIDE * 2, CLUB_IMAGE_SIDE * 2))
+                    source.load()
+                    image = ImageOps.exif_transpose(source)
+                    image.thumbnail((CLUB_IMAGE_SIDE, CLUB_IMAGE_SIDE), Image.LANCZOS)
+                    width, height = image.size
+                    if "A" in image.getbands() or image.mode == "P" and "transparency" in image.info:
+                        image.convert("RGBA").save(output, format="PNG", optimize=True)
+                        extension, actual_type = _CLUB_IMAGE_MIME["PNG"]
+                    else:
+                        image.convert("RGB").save(output, format="JPEG", quality=82, optimize=True,
+                                                  progressive=True, subsampling="4:2:0")
+                        extension, actual_type = _CLUB_IMAGE_MIME["JPEG"]
+    except ClubImageError:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ClubImageError("图片损坏或无法完整解码") from exc
+    normalized = output.getvalue()
+    if not normalized or len(normalized) > MAX_CLUB_IMAGE_OUTPUT_BYTES:
+        raise ClubImageError("处理后的图片过大")
+    return normalized, extension, actual_type, width, height, frames, duration_ms
+
+
+def _club_image_disk_path(image_path):
+    if not isinstance(image_path, str) or not image_path.startswith("/club-images/"):
+        return None
+    name = image_path[len("/club-images/"):]
+    if not _CLUB_IMAGE_NAME.fullmatch(name):
+        return None
+    root = os.path.realpath(CLUB_IMAGE_DIR)
+    target = os.path.realpath(os.path.join(root, name))
+    try:
+        return target if os.path.commonpath((root, target)) == root else None
+    except ValueError:
+        return None
+
+
+def _remove_managed_club_image(image_path):
+    target = _club_image_disk_path(image_path)
+    if not target:
+        return
+    # Immutable object names are unique per upload, but keep a DB reference
+    # check as a second line of defense for legacy files or operator repairs.
+    # If the database is unavailable, retaining an orphan is safer than
+    # deleting a currently referenced public asset.
+    try:
+        with DB_POOL.connection() as conn:
+            if conn.execute("SELECT 1 FROM clubs WHERE image_path=? LIMIT 1", (image_path,)).fetchone():
+                return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("跳过社团图片回收 path=%s error=%s", image_path, exc)
+        return
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("清理旧社团图片失败 path=%s error=%s", image_path, exc)
+
+
 def _percentile(values, fraction):
     if not values:
         return None
@@ -1361,13 +1505,18 @@ def snapshot_database(label):
 
 
 def backup_archive():
-    """完整备份：数据库的一致副本，压缩为 zip。"""
+    """完整备份：数据库与当前的社团照片，打成 zip。"""
     out = io.BytesIO()
     with tempfile.TemporaryDirectory(prefix="omms-backup-") as tmp:
         database = os.path.join(tmp, BACKUP_DB_NAME)
         copy_database(DB_PATH, database)
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(database, BACKUP_DB_NAME)
+            with contextlib.suppress(OSError):
+                for entry in sorted(os.listdir(CLUB_IMAGE_DIR)):
+                    if _CLUB_IMAGE_NAME.fullmatch(entry):
+                        archive.write(os.path.join(CLUB_IMAGE_DIR, entry), "club-images/" + entry,
+                                      compress_type=zipfile.ZIP_STORED)
     return out.getvalue()
 
 
@@ -1406,6 +1555,7 @@ def cli_restore(path):
         print("找不到备份文件：" + path)
         return 1
     with tempfile.TemporaryDirectory(prefix="omms-restore-") as tmp:
+        images = None
         source = path
         if zipfile.is_zipfile(path):
             with zipfile.ZipFile(path) as archive:
@@ -1416,6 +1566,11 @@ def cli_restore(path):
                 source = os.path.join(tmp, BACKUP_DB_NAME)
                 with archive.open(BACKUP_DB_NAME) as src, open(source, "wb") as dst:
                     shutil.copyfileobj(src, dst)
+                images = {}
+                for name in names:
+                    base = name[len("club-images/"):] if name.startswith("club-images/") else ""
+                    if _CLUB_IMAGE_NAME.fullmatch(base):
+                        images[base] = archive.read(name)
         try:
             students, clubs, registrations = database_counts(source)
         except (ValueError, sqlite3.Error) as exc:
@@ -1423,11 +1578,21 @@ def cli_restore(path):
             return 1
         saved = snapshot_database("before-restore") if os.path.exists(DB_PATH) else None
         copy_database(source, DB_PATH)
+        if images is not None:
+            os.makedirs(CLUB_IMAGE_DIR, mode=0o700, exist_ok=True)
+            for entry in os.listdir(CLUB_IMAGE_DIR):
+                if _CLUB_IMAGE_NAME.fullmatch(entry):
+                    os.remove(os.path.join(CLUB_IMAGE_DIR, entry))
+            for base, data in images.items():
+                descriptor = os.open(os.path.join(CLUB_IMAGE_DIR, base), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(descriptor, "wb") as target:
+                    target.write(data)
     try:
         flush_redis_state()
     except Exception:  # noqa: BLE001
         print("Redis 未连接：会话与名额在下次启动时重新发布。")
-    print("已恢复：学生 {} 名，社团 {} 个，报名 {} 条。".format(students, clubs, registrations))
+    print("已恢复：学生 {} 名，社团 {} 个，报名 {} 条{}。".format(
+        students, clubs, registrations, "，照片 {} 张".format(len(images)) if images is not None else ""))
     if saved:
         print("恢复前的数据库已保存为 " + os.path.join(BACKUP_DIR, saved))
     return 0
@@ -2206,6 +2371,10 @@ POST_ROUTES = {
     "/api/admin/clear_registrations": ("_h_clear_registrations", ROLE_ADMIN),
     "/api/admin/update_student": ("_h_update_student", ROLE_ADMIN),
     "/api/admin/reset_class_passwords": ("_h_reset_class_passwords", ROLE_ADMIN),
+    "/api/remove_club_image": ("_h_remove_club_image", ROLE_ADMIN),
+}
+RAW_POST_ROUTES = {
+    "/api/upload_club_image": ("_h_upload_club_image", ROLE_ADMIN),
 }
 WEB_DIR = os.environ.get("WEB_DIR", "web")  # 前端资源目录
 PAGES = {
@@ -2357,7 +2526,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return False
         return sess
 
-    def _read_raw_body(self):
+    def _read_raw_body(self, max_bytes=None):
         """读完恰好一个 Content-Length 请求体，或标记连接关闭，保证复用连接上的请求边界。"""
         transfer_encodings = self.headers.get_all("Transfer-Encoding") or []
         lengths = self.headers.get_all("Content-Length") or []
@@ -2372,7 +2541,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             raise RequestBodyError("非法 Content-Length")
         n = int(length)
-        limit = MAX_BODY
+        limit = MAX_BODY if max_bytes is None else int(max_bytes)
         if n > limit:
             self.close_connection = True
             raise RequestBodyError("请求体过大", status=413)
@@ -2408,6 +2577,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path in PAGES:
             return self._serve_page(PAGES[path])
+        if path.startswith("/club-images/"):
+            return self._serve_club_image(path)
         static = STATIC_PATH_RE.fullmatch(path)
         if static and ".." not in path and static.group(1) in STATIC_TYPES:
             return self._serve_static(path[1:], STATIC_TYPES[static.group(1)])
@@ -2429,11 +2600,22 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         route = POST_ROUTES.get(path)
+        raw_route = RAW_POST_ROUTES.get(path)
         try:
-            raw = self._read_raw_body()
+            raw = self._read_raw_body(MAX_CLUB_IMAGE_BYTES if raw_route is not None else None)
         except RequestBodyError as e:
             return self._json(e.status, {"success": False, "code": "bad_request",
                                          "message": "请求格式错误：{}".format(e)})
+        if raw_route is not None:
+            name, role = raw_route
+            sess = self._require(role)
+            if sess is False:
+                return
+            try:
+                return getattr(self, name)(sess, raw)
+            except Exception as e:  # noqa: BLE001
+                log.exception("raw POST %s 处理异常: %s", path, e)
+                return self._reply(500, "server_error")
         if route is None:
             return self._reply(404, "not_found")
         name, role = route
@@ -2475,6 +2657,39 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         self._send(200, body, ctype=ctype,
                    extra=SECURITY_HEADERS + [("Cache-Control", "no-cache")])
 
+    def _serve_club_image(self, path):
+        target = _club_image_disk_path(path)
+        match = _CLUB_IMAGE_NAME.fullmatch(os.path.basename(target or ""))
+        content_type = {
+            "gif": "image/gif", "jpg": "image/jpeg", "png": "image/png", "webp": "image/webp",
+        }.get(match.group("ext") if match else "")
+        if not target or not content_type:
+            return self._reply(404, "not_found")
+        # 只有当前社团仍在引用的图片对外可见。
+        try:
+            with DB_POOL.connection() as conn:
+                referenced = conn.execute(
+                    "SELECT 1 FROM clubs WHERE image_path=? LIMIT 1", (path,)
+                ).fetchone() is not None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("社团图片引用检查失败 path=%s error=%s", path, exc)
+            referenced = False
+        if not referenced:
+            return self._reply(404, "not_found")
+        try:
+            descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as source:
+                body = source.read(MAX_CLUB_IMAGE_OUTPUT_BYTES + 1)
+        except OSError:
+            return self._reply(404, "not_found")
+        if len(body) > MAX_CLUB_IMAGE_OUTPUT_BYTES:
+            return self._reply(404, "not_found")
+        self._send(200, body, ctype=content_type,
+                   extra=[("Cache-Control", "public, max-age=31536000, immutable")])
+
+    # ======================================================================
+    # 公共端点
+    # ======================================================================
     def _h_health(self, sess):
         try:
             with DB_POOL.connection() as conn:
@@ -3465,6 +3680,206 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(409, {"success": False, "message": "重复的更新请求或社团名称冲突"})
         finally:
             release_seat_locks(held)
+
+    def _h_upload_club_image(self, sess, raw):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            club_id = int((qs.get("club_id") or [None])[0])
+            expected_revision = int((qs.get("expected_revision") or [None])[0])
+        except (TypeError, ValueError):
+            return self._json(400, {"success": False, "message": "club_id 或 expected_revision 格式错误"})
+        request_id = (qs.get("request_id") or [None])[0]
+        reason = clean_text((qs.get("reason") or [None])[0], maxlen=400)
+        if (not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", request_id)
+                or not reason or club_id <= 0 or expected_revision < 0):
+            return self._json(400, {"success": False, "message": "上传参数格式错误"})
+        actor = sess.get("username", "admin")
+        # A network retry must not spend another Pillow decode/write slot or
+        # create a second immutable object.  Bind the idempotency key to this
+        # club so a client bug cannot replay a prior image into another card.
+        with DB_POOL.connection() as conn:
+            replay = conn.execute(
+                "SELECT target_id, after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                "AND action='club.image_uploaded' AND request_id=?",
+                (actor, request_id),
+            ).fetchone()
+        if replay:
+            if str(replay[0]) != str(club_id):
+                return self._json(409, {"success": False,
+                                        "message": "request_id 已用于其他社团图片操作"})
+            return self._json(200, {"success": True, "replayed": True, "request_id": request_id,
+                                    "club": json.loads(replay[1]) if replay[1] else None})
+        if not IMAGE_PROCESS_SLOTS.acquire(timeout=1.0):
+            return self._json(503, {"success": False, "message": "图片处理繁忙，请稍后重试"})
+        try:
+            normalized, extension, content_type, width, height, frames, duration_ms = _sanitize_club_image(
+                raw, self.headers.get("Content-Type")
+            )
+        except ClubImageFeatureUnavailable as e:
+            return self._json(503, {"success": False, "message": str(e)},
+                              extra=[("Retry-After", "60")])
+        except ClubImageError as e:
+            return self._json(400, {"success": False, "message": str(e)})
+        finally:
+            IMAGE_PROCESS_SLOTS.release()
+
+        digest = hashlib.sha256(normalized).hexdigest()
+        # Never share a final object path across mutations.  Content-addressed
+        # names plus "delete on failed transaction" can otherwise let one
+        # version-conflicted upload unlink a file another request just
+        # committed.  The digest remains audit metadata, not an ownership key.
+        image_name = "{}-{}.{}".format(club_id, secrets.token_hex(16), extension)
+        image_path = "/club-images/" + image_name
+        os.makedirs(CLUB_IMAGE_DIR, mode=0o700, exist_ok=True)
+        target = _club_image_disk_path(image_path)
+        if target is None:
+            return self._json(500, {"success": False, "message": "图片存储路径异常"})
+        created_file = False
+        if not os.path.exists(target):
+            temp_path = target + "." + secrets.token_urlsafe(8) + ".tmp"
+            try:
+                with open(temp_path, "xb") as output:
+                    output.write(normalized)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temp_path, target)
+                created_file = True
+            except OSError:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                return self._json(503, {"success": False, "message": "图片保存失败，请稍后重试"})
+
+        event_id = "club-image-" + secrets.token_urlsafe(18)
+        old_image_path = None
+        db_committed = False
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                club = cur.execute(
+                    "SELECT name, max_students, description, advisor_name, meeting_time, location, "
+                    "allowed_grades, allowed_classes, enabled, image_path, revision, seat_sync_pending "
+                    "FROM clubs WHERE id=?", (club_id,)
+                ).fetchone()
+                if not club:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "社团不存在"})
+                old_image_path, revision = club[9], club[10]
+                if revision != expected_revision:
+                    conn.rollback()
+                    return self._json(409, {"success": False, "message": "社团已被其他管理员修改", "revision": revision})
+                new_revision = revision + 1
+                cur.execute("UPDATE clubs SET image_path=?, revision=? WHERE id=?", (image_path, new_revision, club_id))
+                used = cur.execute(
+                    "SELECT COUNT(*) FROM registrations WHERE club_id=?", (club_id,)
+                ).fetchone()[0]
+                after = {
+                    "id": club_id, "name": club[0], "max_students": club[1],
+                    "current_students": used, "description": club[2], "advisor_name": club[3],
+                    "meeting_time": club[4], "location": club[5], "image_path": image_path,
+                    "allowed_grades": stored_text_list(club[6]),
+                    "allowed_classes": stored_text_list(club[7]), "enabled": bool(club[8]),
+                    "revision": new_revision, "seat_sync_pending": bool(club[11]),
+                }
+                append_audit_event(
+                    cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                    action="club.image_uploaded", target_type="club", target_id=club_id,
+                    request_id=request_id, reason=reason,
+                    before={"image_path": old_image_path, "revision": revision}, after=after,
+                    metadata={"content_type": content_type, "width": width, "height": height,
+                              "frames": frames, "duration_ms": duration_ms,
+                              "sha256": digest},
+                )
+                conn.commit()
+                db_committed = True
+            CATALOG_CACHE.invalidate()
+            if old_image_path and old_image_path != image_path:
+                _remove_managed_club_image(old_image_path)
+            self._json(200, {"success": True, "event_id": event_id, "request_id": request_id,
+                             "club": after})
+        except sqlite3.IntegrityError:
+            # Concurrent delivery of the same idempotency key can race past
+            # the cheap precheck.  Read the committed immutable result before
+            # declaring a conflict; the losing request owns a unique orphan
+            # object and its finally block will safely remove it.
+            with DB_POOL.connection() as conn:
+                replay = conn.execute(
+                    "SELECT target_id, after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                    "AND action='club.image_uploaded' AND request_id=?", (actor, request_id)
+                ).fetchone()
+            if replay and str(replay[0]) == str(club_id):
+                return self._json(200, {"success": True, "replayed": True,
+                                        "request_id": request_id,
+                                        "club": json.loads(replay[1]) if replay[1] else None})
+            return self._json(409, {"success": False, "message": "重复的图片上传请求"})
+        finally:
+            if created_file and not db_committed:
+                _remove_managed_club_image(image_path)
+
+    def _h_remove_club_image(self, sess, data):
+        try:
+            club_id = int(data.get("club_id"))
+            expected_revision = int(data.get("expected_revision"))
+        except (TypeError, ValueError):
+            return self._json(400, {"success": False, "message": "club_id 或 expected_revision 格式错误"})
+        request_id = admin_request_id(data)
+        reason = clean_text(data.get("reason"), maxlen=400)
+        if request_id is None or not reason:
+            return self._json(400, {"success": False, "message": "移除参数格式错误"})
+        actor = sess.get("username", "admin")
+        with DB_POOL.connection() as conn:
+            cur = conn.cursor()
+            conn.execute("BEGIN IMMEDIATE")
+            replay = cur.execute(
+                "SELECT target_id, after_json FROM audit_events WHERE actor_role='admin' AND actor_id=? "
+                "AND action='club.image_removed' AND request_id=?", (actor, request_id)
+            ).fetchone()
+            if replay:
+                conn.rollback()
+                if str(replay[0]) != str(club_id):
+                    return self._json(409, {"success": False,
+                                            "message": "request_id 已用于其他社团图片操作"})
+                return self._json(200, {"success": True, "replayed": True, "request_id": request_id,
+                                        "club": json.loads(replay[1]) if replay[1] else None})
+            club = cur.execute(
+                "SELECT name, max_students, description, advisor_name, meeting_time, location, "
+                "allowed_grades, allowed_classes, enabled, image_path, revision, seat_sync_pending "
+                "FROM clubs WHERE id=?", (club_id,)
+            ).fetchone()
+            if not club:
+                conn.rollback()
+                return self._json(404, {"success": False, "message": "社团不存在"})
+            old_image_path, revision = club[9], club[10]
+            if revision != expected_revision:
+                conn.rollback()
+                return self._json(409, {"success": False, "message": "社团已被其他管理员修改", "revision": revision})
+            new_revision = revision + 1
+            cur.execute("UPDATE clubs SET image_path=NULL, revision=? WHERE id=?", (new_revision, club_id))
+            event_id = "club-image-remove-" + secrets.token_urlsafe(18)
+            used = cur.execute(
+                "SELECT COUNT(*) FROM registrations WHERE club_id=?", (club_id,)
+            ).fetchone()[0]
+            after = {
+                "id": club_id, "name": club[0], "max_students": club[1],
+                "current_students": used, "description": club[2], "advisor_name": club[3],
+                "meeting_time": club[4], "location": club[5], "image_path": None,
+                "allowed_grades": stored_text_list(club[6]),
+                "allowed_classes": stored_text_list(club[7]), "enabled": bool(club[8]),
+                "revision": new_revision, "seat_sync_pending": bool(club[11]),
+            }
+            append_audit_event(
+                cur, event_id=event_id, actor_role="admin", actor_id=actor,
+                action="club.image_removed", target_type="club", target_id=club_id,
+                request_id=request_id, reason=reason,
+                before={"image_path": old_image_path, "revision": revision}, after=after,
+            )
+            conn.commit()
+        _remove_managed_club_image(old_image_path)
+        CATALOG_CACHE.invalidate()
+        self._json(200, {"success": True, "event_id": event_id, "request_id": request_id,
+                         "club": after})
 
     def _admin_registration_input(self, data, *, needs_club=True):
         student_id = data.get("student_id")
@@ -4466,7 +4881,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 cur = conn.cursor()
                 try:
                     conn.execute("BEGIN IMMEDIATE")
-                    name_row = cur.execute("SELECT name FROM clubs WHERE id=?", (club_id,)).fetchone()
+                    name_row = cur.execute("SELECT name, image_path FROM clubs WHERE id=?", (club_id,)).fetchone()
                     if cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id = ?",
                                    (club_id,)).fetchone()[0] > 0:
                         conn.rollback()
@@ -4479,7 +4894,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         cur, event_id="club-delete-" + secrets.token_urlsafe(18),
                         actor_role="admin", actor_id=sess.get("username", "admin"),
                         action="club.deleted", target_type="club", target_id=club_id,
-                        before={"name": name_row[0] if name_row else None},
+                        before={"name": name_row[0] if name_row else None,
+                                "image_path": name_row[1] if name_row else None},
                         after={"deleted": True},
                     )
                     conn.commit()
@@ -4487,6 +4903,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     conn.rollback()
                     log.error("删除社团失败: %s", e)
                     return self._json(500, {"success": False, "message": "删除失败"})
+            if name_row and name_row[1]:
+                _remove_managed_club_image(name_row[1])
             CATALOG_CACHE.invalidate()
             SEATS_CACHE.invalidate()
             if not publish_seat_locks(held):
@@ -4509,6 +4927,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     cur = conn.cursor()
                     club_count = cur.execute("SELECT COUNT(*) FROM clubs").fetchone()[0]
                     registration_count = cur.execute("SELECT COUNT(*) FROM registrations").fetchone()[0]
+                    image_paths = [row[0] for row in cur.execute(
+                        "SELECT image_path FROM clubs WHERE image_path IS NOT NULL").fetchall()]
                     conn.execute("DELETE FROM registrations")
                     conn.execute("DELETE FROM clubs")
                     append_audit_event(
@@ -4523,6 +4943,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     conn.rollback()
                     log.error("清空社团失败: %s", e)
                     return self._json(500, {"success": False, "message": "删除失败"})
+            for image_path in image_paths:
+                _remove_managed_club_image(image_path)
             if not rebuild_all(maintenance):
                 RECONCILE_REQUESTED.set()
                 return self._json(503, {"success": False, "message": "社团已删除，名额稍后自动发布"})
