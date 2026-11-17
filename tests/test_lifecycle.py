@@ -469,7 +469,7 @@ class MaintenanceTests(unittest.TestCase):
         roster = "序号,姓名,班级\n1,学生1,高一1班\n2,新同学,高一（2）班\n,合计,\n".encode("gb18030")
         status, parsed = upload(app.http_port, "/api/admin/import/parse", self.admin, roster, "名单.csv")
         self.assertEqual(200, status, parsed)
-        self.assertEqual([("学生1", "高一1班", ["已导入"]), ("新同学", "高一2班", [])],
+        self.assertEqual([("学生1", "高一1班", ["姓名有误", "已导入"]), ("新同学", "高一2班", [])],
                          [(row["name"], row["class"], row["notes"]) for row in parsed["rows"]])
         self.assertEqual(3, len(app.sql("SELECT id FROM students")))
         status, body = upload(app.http_port, "/api/admin/import/parse", self.admin, b"\x00\x01", "x.xlsx")

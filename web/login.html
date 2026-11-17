@@ -9,13 +9,15 @@
 <meta name="theme-color" content="#F4EFE6">
 <title>登录 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=23">
-<script src="/js/legacy.js?v=18" defer></script>
-<script src="/js/common.js?v=19" defer></script>
-<script src="/js/login.js?v=20" defer></script>
+<link rel="stylesheet" href="/app-fallback.css?v=1">
+<link rel="stylesheet" href="/app.css?v=24">
+<script src="/js/legacy.js?v=19" defer></script>
+<script src="/js/common.js?v=20" defer></script>
+<script src="/js/login.js?v=21" defer></script>
+<script src="/easter-egg.js?v=1" defer></script>
 </head>
 <body class="login-body">
-<div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
+<div class="legacy-note" id="legacy" hidden>请使用 IE11、Edge 或 Chrome，或将浏览器切换到极速模式。</div>
 <main class="card login-card">
   <div class="login-head">
     <img src="/img/school-emblem.webp" alt="鄂尔多斯市实验中学校徽" width="56" height="56">
@@ -23,24 +25,23 @@
     <p>鄂尔多斯市实验中学</p>
     <p class="login-schedule" id="login-schedule" hidden></p>
   </div>
-  <div class="seg" role="group" aria-label="登录身份">
+  <div class="segmented" role="group" aria-label="登录身份">
     <button type="button" data-role="student" aria-pressed="true">学生</button>
     <button type="button" data-role="admin" aria-pressed="false">管理员</button>
   </div>
   <form id="login-form" novalidate>
     <div class="field">
-      <label for="username">用户名</label>
-      <input class="input" id="username" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+      <label for="username">账号</label>
+      <input class="input" id="username" name="username" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false">
     </div>
     <div class="field">
       <label for="password">密码</label>
-      <input class="input" id="password" name="password" type="password" autocomplete="current-password" required>
+      <input class="input" id="password" name="password" type="password" autocomplete="current-password">
     </div>
     <p class="error" id="login-error" role="alert"></p>
-    <p class="hint queue-note" id="login-wait" role="status" hidden></p>
     <button class="btn btn-primary btn-block" id="login-submit" type="submit">登录</button>
+    <p class="hint queue-note" id="login-wait" role="status" hidden></p>
   </form>
-  <p class="login-foot">请在开放前登录。忘记密码请联系班主任。</p>
 </main>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 </body>

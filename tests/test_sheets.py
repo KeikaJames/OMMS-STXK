@@ -315,6 +315,13 @@ class TextTableTests(unittest.TestCase):
         with self.assertRaises(sheets.TableError):
             sheets.parse_roster("a.xlsx", b"\x00\x01\x02 not a workbook")
 
+    def test_summary_rows_and_names_with_digits(self) -> None:
+        text = "序号,姓名,班级\n1,张伟123,高一1班\n2,O'Neil,高一1班\n3,Батбаяр,高一1班\n合计,3 人,\n".encode("utf-8")
+        parsed = sheets.parse_roster("a.csv", text)
+        self.assertEqual([("张伟123", "高一1班", ("姓名有误",)), ("O'Neil", "高一1班", ()), ("Батбаяр", "高一1班", ())],
+                         rows_of(parsed))
+        self.assertEqual(1, parsed["skipped"])
+
     def test_names_and_classes_are_normalized(self) -> None:
         self.assertEqual("张三", sheets.clean_name(" 张　三​ "))
         self.assertEqual("巴特尔·乌兰", sheets.clean_name("巴特尔・乌兰"))

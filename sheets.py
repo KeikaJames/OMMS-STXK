@@ -623,10 +623,14 @@ CLASS_HEADERS = {"班级", "班别", "行政班", "所在班级", "班级名称"
 GRADE_HEADERS = {"年级", "grade"}
 NUMBER_HEADERS = {"班号", "班级号", "班序号", "班级序号", "班"}
 SUMMARY_NAMES = {"合计", "小计", "总计", "共计", "总人数", "人数"}
+_SUMMARY_ROW = re.compile(r"^(?:合计|小计|总计|共计|总人数)")
 _INVISIBLE = re.compile("[\u0000-\u001f\u007f­​-‏ - ⁠-⁯﻿]")
 _DOTS = re.compile("[•‧・·ˑ·∙⋅⸱]")
 _CJK = "㐀-鿿豈-﫿"
 _CLASS_TITLE = re.compile(r"^(?:高|初|小)?[一二三四五六七八九\d]*(?:年级)?\(?\d+\)?班$")
+# 姓名可用汉字、拉丁字母、蒙古文、西里尔字母、间隔号、空格、撇号和连字符。
+_NAME_LETTERS = _CJK + "A-Za-z᠀-᢯Ѐ-ӿ"
+_NAME_OK = re.compile("^[{}· '-]+$".format(_NAME_LETTERS))
 
 
 def header_key(text):
@@ -725,6 +729,9 @@ def parse_roster(filename, data):
             if len(values) == 1 and _CLASS_TITLE.match(clean_class(values[0])):
                 context = clean_class(values[0])
                 continue
+            if any(_SUMMARY_ROW.match(header_key(value)) for value in values):
+                skipped += 1
+                continue
             name = clean_name(raw_name)
             if not name or name in SUMMARY_NAMES or name.startswith(("注", "备注", "说明")):
                 skipped += 1
@@ -750,7 +757,7 @@ def parse_roster(filename, data):
                 notes.append("班级沿用上一行")
             if not klass:
                 notes.append("缺少班级")
-            if not re.search("[{}A-Za-z]".format(_CJK), name) or re.fullmatch(r"[\d\s.]+", name):
+            if not _NAME_OK.match(name) or not re.search("[{}]".format(_NAME_LETTERS), name):
                 notes.append("姓名有误")
             previous = klass or previous
             result.append({"sheet": sheet.name, "line": index + 1, "name": name, "class": klass, "notes": notes})

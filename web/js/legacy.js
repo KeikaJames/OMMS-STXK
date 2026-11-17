@@ -1,31 +1,16 @@
-// 只用 ES3 语法：浏览器跑不了本站脚本时显示换浏览器的提示，并检测 flex 布局是否支持 gap。
+// 浏览器缺少本站脚本所需的能力时（IE10 及更早版本）显示提示。只用 ES3 语法。
 (function () {
   var root = document.documentElement;
-  var modern = typeof window.fetch === 'function' && typeof window.Promise === 'function' &&
-    typeof String.prototype.padStart === 'function' &&
-    !!(window.CSS && window.CSS.supports && window.CSS.supports('--a', '0'));
+  var capable = !!(window.JSON && window.XMLHttpRequest && document.querySelector && root.addEventListener &&
+    ('classList' in root) && ('dataset' in root) && window.Uint8Array);
 
-  function ready(callback) {
-    if (document.readyState !== 'loading') callback();
-    else if (document.addEventListener) document.addEventListener('DOMContentLoaded', callback);
-    else window.attachEvent('onload', callback);
+  function show() {
+    var note = document.getElementById('legacy');
+    if (note) note.removeAttribute('hidden');
   }
 
-  ready(function () {
-    if (!modern) {
-      root.className += ' legacy';
-      var note = document.getElementById('legacy');
-      if (note) note.removeAttribute('hidden');
-      return;
-    }
-    var probe = document.createElement('div');
-    probe.style.display = 'flex';
-    probe.style.flexDirection = 'column';
-    probe.style.rowGap = '1px';
-    probe.appendChild(document.createElement('div'));
-    probe.appendChild(document.createElement('div'));
-    document.body.appendChild(probe);
-    if (probe.scrollHeight !== 1) root.className += ' no-flex-gap';
-    document.body.removeChild(probe);
-  });
+  if (capable) return;
+  if (document.readyState === 'complete' || document.readyState === 'interactive') show();
+  else if (document.addEventListener) document.addEventListener('DOMContentLoaded', show, false);
+  else if (window.attachEvent) window.attachEvent('onload', show);
 })();

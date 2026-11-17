@@ -3252,7 +3252,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 "success": True, "event_id": event_id, "request_id": request_id,
                 "student_id": student_id, "username": student[1],
                 "temporary_password": temporary_password,
-                "message": "临时密码仅显示一次，请立即安全交付给学生",
+                "message": "临时密码仅显示一次",
             }, extra=[("Cache-Control", "no-store")])
         except sqlite3.IntegrityError:
             return self._json(409, {"success": False, "message": "重复的重置请求"})
@@ -3475,7 +3475,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 used = cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id=?", (club_id,)).fetchone()[0]
                 if max_students < used:
                     conn.rollback()
-                    return self._json(400, {"success": False, "message": "新容量不能小于当前已报名人数"})
+                    return self._json(400, {"success": False, "message": "人数上限至少为已报名人数"})
                 previous_max = int(current[1])
                 capacity_changed = max_students != previous_max
                 new_revision = int(current[10]) + 1
