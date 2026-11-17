@@ -1,30 +1,55 @@
 # 贡献指南
 
-感谢参与!提交前请读完本页 —— 不符合约定的 PR 会被退回。
+感谢参与。提交前请读完本页。
 
 ## 提交方式
 
-只接受 **Pull Request**;`main` 已开启分支保护,**直接 push 会被拒绝**。
+改动通过 Pull Request 合并到 `main`。
 
-1. Fork 仓库,或新建分支(`fix/xxx`、`feat/xxx`)。
-2. 提交改动,信息写清"做了什么、为什么"。
-3. 发起 PR,目标分支 `main`,等维护者 review 后由维护者合并。
+1. Fork 仓库或新建分支，例如 `fix/seat-repair`、`feat/export-roster`。
+2. 一个 PR 完成一件事，描述里写清做了什么、为什么、怎样验证。
+3. 维护者审阅后合并。
 
-## 代码风格
+## 代码约定
 
-以原始版本(git `baseline` 提交)为准,保持一致,不擅自引入新范式或工具链:
+**后端**
 
-- **后端只用 Python 标准库**,不引 Web 框架(Flask / FastAPI / Django);可选依赖需有 fallback。
-- **单文件后端 + 纯 HTML 前端**,无构建步骤(不引 npm / 打包器 / TypeScript)。
-- 4 空格缩进,`snake_case`,内联 SQL(不引 ORM)。
-- 注释精简,用中文说清"为什么",不逐行翻译代码。
-- 不提交数据文件、密码或任何运行产物。
+- Python 服务使用标准库与内联 SQL。`pypinyin`、`Pillow` 为可选依赖，代码保留降级路径。
+- Rust 服务通过 `cargo fmt` 与 `cargo clippy -- -D warnings`。
+- 4 空格缩进，`snake_case`。注释精简，说明原因。
 
-## 提交前自检
+**共享协议**
 
-- [ ] 符合上述风格,未引入新框架 / 构建步骤,可选依赖有 fallback。
-- [ ] 本地 `python3 main.py` 能启动、功能正常。
-- [ ] 未提交任何数据 / 密码 / 运行产物。
-- [ ] 一个 PR 只做一件相对完整的事。
+- Redis 写操作写成 `shared/lua/` 里的脚本，Python 与 Rust 调用同一份文件。
+- 返回码与提示文案写在 `shared/messages.json`，两个服务都从这里读取。
+- 新增 Redis 键、返回码或会话字段时，同时修改两个服务并补测试。
 
-提交贡献即表示同意你的贡献以 [Apache License 2.0](LICENSE) 发布。
+**前端**
+
+- 页面在 `web/*.html`，脚本在 `web/js/`，样式在 `web/app.css`。
+- 脚本和样式写在独立文件里，页面的 CSP 为 `script-src 'self'; style-src 'self'`。
+- 颜色、圆角、阴影使用 `:root` 中的变量，并在深色模式下同步定义。
+- 修改静态资源后，更新页面里对应的 `?v=` 版本号。
+- 界面文案直接写用户能做什么、结果是什么。
+
+## 提交前检查
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+cargo test --manifest-path club-hot/Cargo.toml
+cargo clippy --manifest-path club-hot/Cargo.toml --all-targets -- -D warnings
+cargo fmt --manifest-path club-hot/Cargo.toml --check
+ruff check main.py tests
+node --check web/js/*.js
+shellcheck run.sh
+```
+
+改动涉及报名路径时，再运行一次压测：
+
+```bash
+python3 tests/stress_registration.py --seats 100 --users 1000 --concurrency 1000
+```
+
+数据库、学生名单、密码和 `run/` 目录保留在本地。
+
+提交贡献即表示同意以 [Apache License 2.0](LICENSE) 发布。

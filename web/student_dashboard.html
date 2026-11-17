@@ -3,85 +3,70 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#F5F5F7">
-<title>选课主页 · 鄂尔多斯市实验中学社团选课</title>
+<meta name="theme-color" content="#F4EFE6">
+<title>选课 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="preload" href="/img/editorial-grassland.jpg" as="image" fetchpriority="high">
-<link rel="stylesheet" href="/app.css?v=8">
-<link rel="stylesheet" href="/motion.css">
-<script>(function(){if(!matchMedia('(prefers-reduced-motion: reduce)').matches){var h=document.documentElement;h.classList.add('motion');setTimeout(function(){h.classList.remove('motion')},1600)}})();</script>
-<script src="/vendor/gsap.min.js" defer></script>
-<script src="/vendor/confetti.min.js" defer></script>
-<script src="/motion.js" defer></script>
-<script src="/easter-egg.js" defer></script>
-<script src="/student-dashboard.js?v=8" defer></script>
+<link rel="stylesheet" href="/app.css?v=17">
+<script src="/js/common.js?v=17" defer></script>
+<script src="/js/student.js?v=15" defer></script>
 </head>
-<body class="page-student">
+<body>
 <a class="skip" href="#main">跳到主内容</a>
-
 <header class="topbar">
-  <div class="brand">
-    <img class="mark" src="/img/school-emblem.jpg" alt="鄂尔多斯市实验中学校徽" width="42" height="42">
-    <span class="t"><b>鄂尔多斯市实验中学</b><small>社团选课</small></span>
-  </div>
+  <a class="brand" href="/student/dashboard"><img src="/img/school-emblem.webp" alt="" width="34" height="34"><span><b>社团选课</b><small>鄂尔多斯市实验中学</small></span></a>
   <nav class="topnav" aria-label="主导航">
-    <a href="/student/dashboard" class="active" aria-current="page">选课</a>
-    <a href="/student/profile">个人信息</a>
+    <a href="/student/dashboard" aria-current="page">选课</a>
+    <a href="/student/profile">我的</a>
     <button id="logout" type="button">退出</button>
   </nav>
 </header>
 
-<main class="student-store" id="main">
-  <section class="store-hero" aria-labelledby="page-title">
-    <div class="hero-copy">
-      <h1 id="page-title">every choice matters</h1>
-      <p>Our choices are the hinges of destiny</p>
+<main class="page" id="main">
+  <section class="intro">
+    <div>
+      <p class="eyebrow" id="greeting">本学期社团</p>
+      <h1>选一个想去的社团</h1>
+      <p class="lede">每人可以报名一个社团，退选后可以重新选择。</p>
     </div>
-    <div class="state-media" id="state-media" data-state="loading" aria-hidden="true">
-      <img id="state-image" src="/img/editorial-desk.jpg" alt="" width="1400" height="787" fetchpriority="high" decoding="async">
-    </div>
+    <img class="intro-art" src="/img/hero-grassland.webp" alt="" width="960" height="541" decoding="async">
   </section>
 
-  <section class="status-section" aria-labelledby="status-h">
-    <h2 id="status-h" class="sr-only">选课状态</h2>
-    <div class="status" id="statusbar">
-      <div class="status-lead">
-        <span class="status-kicker">报名状态</span>
-        <span class="lab"><span class="dot" aria-hidden="true"></span><strong id="status-text">正在载入</strong></span>
-        <p id="status-detail">正在读取开放时间与报名信息</p>
-      </div>
-      <div class="status-time">
-        <span class="status-kicker" id="clock-label">当前时间</span>
-        <span class="clock num" id="clock" aria-live="off"></span>
-      </div>
-      <div class="status-rule-block">
-        <span class="status-kicker">选课规则</span>
-        <p class="rule">每人 <b>限选 1 个</b> 项目<br>退选后可以重新选择</p>
-      </div>
+  <section class="status" id="status" data-phase="loading" aria-live="polite">
+    <div class="status-main">
+      <strong><span class="dot" aria-hidden="true"></span><span id="status-title">正在读取</span></strong>
+      <span id="status-detail">正在同步开放时间与名额</span>
     </div>
-    <div class="sync-state" id="sync-state" role="status" aria-live="polite" hidden>
-      <span class="sync-spinner" aria-hidden="true"></span>
-      <span>请求已经提交，正在确认服务端最终结果。请不要重复操作。</span>
-    </div>
+    <div class="status-clock"><small id="clock-label">当前时间</small><span class="clock" id="clock">--:--:--</span></div>
   </section>
 
-  <section class="offerings" aria-labelledby="clubs-h">
-    <div class="section-h store-section-h">
-      <div>
-        <h2 id="clubs-h">本学期选修项目</h2>
-        <p id="hint">每人可选择 1 个项目</p>
-      </div>
-      <span id="updated-at" class="updated-at num" aria-live="off"></span>
+  <section class="card mine" id="mine" hidden>
+    <div>
+      <p class="eyebrow">我的社团</p>
+      <h2 id="mine-name"></h2>
+      <p id="mine-meta"></p>
     </div>
-    <div class="clubs" id="clubs" aria-busy="true">
-      <div class="sk sk-club"></div>
-      <div class="sk sk-club"></div>
-      <div class="sk sk-club"></div>
-    </div>
+    <div class="mine-actions" id="mine-actions"></div>
   </section>
 
-  <div class="toast-wrap" id="toasts" aria-live="polite" aria-atomic="false"></div>
-  <p class="foot">Designed By Gabira</p>
+  <section aria-labelledby="catalog-title">
+    <div class="section-title"><h2 id="catalog-title">全部社团</h2><p id="updated-at"></p></div>
+    <div class="toolbar">
+      <label class="sr-only" for="search">搜索社团</label>
+      <input class="input" id="search" type="search" placeholder="搜索社团、老师或地点" autocomplete="off">
+      <div class="chips" role="group" aria-label="筛选">
+        <button class="chip" type="button" data-filter="all" aria-pressed="true">全部</button>
+        <button class="chip" type="button" data-filter="eligible" aria-pressed="false">我能报名</button>
+        <button class="chip" type="button" data-filter="open" aria-pressed="false">还有名额</button>
+        <button class="chip" type="button" data-filter="fav" aria-pressed="false">收藏</button>
+      </div>
+    </div>
+    <div class="club-grid" id="clubs" aria-busy="true">
+      <div class="sk"></div><div class="sk"></div><div class="sk"></div>
+    </div>
+  </section>
 </main>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<footer class="foot">Designed by Gabiri · © Weilesi</footer>
 </body>
 </html>

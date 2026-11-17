@@ -1,72 +1,71 @@
-# Isolated concurrency tests
+# 测试
 
-`stress_registration.py` validates the Rust `/api/register_club` hot path with
-one independent session and one request per virtual student. It reports the
-business outcomes, HTTP/transport errors, p50/p95/p99 latency, SQLite counters,
-Redis stock, confirmed-registration mirrors (including the exact
-`<club_id>|<operation_id>` value), remaining reservations, and `seat:op` leases. Any correctness
-or availability invariant failure exits with status 1; environment setup
-failures exit with status 2.
+每个测试都在临时 SQLite 和随机回环端口上的独立 Redis 里运行，结束后清理进程、数据库和日志。仓库数据库和 6379 端口保持原样。
 
-The test does **not** use the repository database or Redis port 6379. Every run:
-
-1. creates a temporary SQLite database with one club, the requested users, the
-   `operation_id` column/index, and the final capacity trigger;
-2. starts a private `redis-server` on an OS-selected loopback port other than
-   6379, with persistence disabled and its directory under the same temporary
-   folder;
-3. writes a distinct `sess:{token}` value for every virtual student;
-4. starts the selected Rust release on another ephemeral loopback port;
-5. removes the processes, database, Redis files, and logs on exit.
-
-Prerequisites:
+## 准备
 
 ```bash
+pip install redis argon2-cffi pypinyin Pillow
 cargo build --release --manifest-path club-hot/Cargo.toml
 redis-server --version
+nginx -v
 ```
 
-Small smoke test:
+`test_edge_security.py` 需要 Rust release 构建、`redis-server` 和 `nginx`；其余 Python 测试需要 `redis-server`。
+
+## 回归测试
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+cargo test --manifest-path club-hot/Cargo.toml
+```
+
+| 文件 | 覆盖内容 |
+|---|---|
+| `test_python_races.py` | Python 服务：同一请求幂等、失效租约按社团修复、旧报名镜像清理、受信设备登录、名额快照 ETag、学校时区、100 个并发退选只归还一次、SQLite 容量触发器、会话吊销、管理端调剂、重置密码、社团编辑与图片、操作记录 |
+| `test_redis_recovery.py` | Lua 脚本：写入前开启效果复制、租约回滚与吸收模式、Redis 晚于服务启动、提交后故障保持名额占用 |
+| `test_edge_security.py` | nginx + Python + Rust：响应头、Cookie 轮换限额、图片代理、栅栏只暂停对应社团、后台修复、登录失败计数隔离、两个服务的准入规则与会话格式一致、请求 ID 幂等 |
+| `club-hot` 单元测试 | Cookie 解析、口令哈希与 Python 互通、学校时区、ETag、提示文案覆盖全部返回码、报名镜像格式、令牌字符集 |
+
+## 压测
+
+`stress_registration.py` 启动独立的 Redis、SQLite 和 Rust 服务，为每名虚拟学生建立会话，然后同时发起一次报名。
 
 ```bash
 python3 tests/stress_registration.py --seats 3 --users 12 --concurrency 6
+python3 tests/stress_registration.py --seats 100 --users 1000 --concurrency 1000
+python3 tests/stress_registration.py --seats 1000 --users 1000 --concurrency 1000
 ```
 
-Larger synchronized contest:
+结束时输出结果分布、p50/p95/p99 延迟、SQLite 与 Redis 状态，并检查 16 项一致性条件：
 
-```bash
-python3 tests/stress_registration.py \
-  --seats 30 \
-  --users 1000 \
-  --concurrency 300
-```
+- 每名学生得到一个最终结果，成功数等于名额，其余学生得到满员结果；
+- 业务响应、HTTP 和传输层全部符合预期；
+- 每名学生最多一条报名，报名数在容量以内，`current_students` 等于实际行数；
+- Redis 库存等于容量减去报名数；
+- 每条报名带操作代际，Redis 报名镜像与 SQLite 逐人一致；
+- 成功响应的学生与 SQLite 中的学生一致；
+- 全部响应结束后，在途成员和学生租约清空。
 
-To validate a particular release artifact:
+全部通过时退出码为 0，一致性条件失败为 1，环境准备失败为 2。
 
-```bash
-python3 tests/stress_registration.py \
-  --rust-bin /absolute/path/to/club-hot \
-  --seats 30 --users 300 --concurrency 100
-```
+常用参数：
 
-Use `--help` for client/server timeouts and the Rust
-`MAX_CONCURRENCY`/reservation-TTL controls. The test default for `RESV_TTL` is
-60 seconds and its default `MAX_CONCURRENCY` is 1024, matching the service. This tool deliberately tests the
-Rust service directly. It does not measure Nginx's per-session limiter, TLS, or
-the Python fallback; those need separate edge scenarios so an edge policy is not
-misreported as Rust capacity.
+| 参数 | 说明 |
+|---|---|
+| `--rust-bin` | 指定要测的 Rust 可执行文件 |
+| `--server-max-concurrency` | 传给服务的 `MAX_CONCURRENCY` |
+| `--server-request-timeout` | 传给服务的 `REQUEST_TIMEOUT_SECS` |
+| `--reservation-ttl` | 传给服务的 `SEAT_OP_TTL` |
+| `--request-timeout` | 客户端单次请求超时 |
 
-The Python race regression suite launches the same kind of isolated Redis and
-temporary database, then exercises the fallback HTTP service:
+压测直接访问 Rust 服务，测量的是热路径本身。nginx 限流、TLS 和校园网络在目标服务器上另行测试。
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 \
-python3 -m unittest discover -s tests -p 'test_python_races.py' -v
-```
+## 实测结果
 
-It covers 100 concurrent cancels of one registration, an intentionally inflated
-Redis stock value versus the SQLite capacity trigger, and exact
-`club_id|operation_id` confirmation mirroring. It also replays a completed
-same-club request and requires an idempotent success without a second DB row or
-stock decrement. A fourth case proves that understock makes `/readyz` fail and
-wakes the maintenance-fenced background reconciler.
+Apple Silicon 笔记本，回环网络，每组 1000 名学生同时报名：
+
+| 场景 | 吞吐 | p99 |
+|---|---|---|
+| 100 个名额，900 人得到满员 | 5828 次/秒 | 109 ms |
+| 1000 个名额，全部写库 | 3369 次/秒 | 198 ms |

@@ -1030,6 +1030,9 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertEqual(200, transfer_status, transferred)
         self.assertEqual("2", redis_command(self.redis_port, "GET", key("stock", 1)))
         self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 2)))
+        list_status, students = self._request_json("GET", "/api/get_all_students", token=admin_token)
+        self.assertEqual(200, list_status)
+        self.assertEqual({1: 2, 2: None}, {row["id"]: row["club_id"] for row in students})
         remove_status, removed = self._request_json(
             "POST", "/api/admin/remove_registration", token=admin_token,
             body={"student_id": 1, "request_id": "remove-0001", "reason": "学生退出"},
@@ -1040,6 +1043,12 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertEqual(200, audit_status)
         actions = {event["action"] for event in audit["events"]}
         self.assertTrue({"registration.admin_assigned", "registration.admin_transferred", "registration.admin_removed"} <= actions)
+        role_status, admin_events = self._request_json("GET", "/api/admin/audit_events?role=admin", token=admin_token)
+        self.assertEqual(200, role_status)
+        self.assertTrue(admin_events["events"])
+        self.assertEqual({"admin"}, {event["actor_role"] for event in admin_events["events"]})
+        bad_status, _ = self._request_json("GET", "/api/admin/audit_events?role=root", token=admin_token)
+        self.assertEqual(400, bad_status)
         metrics_status, metrics = self._request_json("GET", "/api/admin/operations_snapshot", token=admin_token)
         self.assertEqual(200, metrics_status)
         self.assertEqual(60, metrics["window_seconds"])
