@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "web" / "app.css"
 TARGET = ROOT / "web" / "app-fallback.css"
-HEADER = "/* 由 tools/css_fallbacks.py 根据 app.css 生成，供不支持 CSS 变量的浏览器使用。 */\n"
+HEADER = "/* 由 tools/css_fallbacks.py 根据 app.css 生成，为每条使用颜色变量的声明提供固定颜色，旧浏览器按它显示。 */\n"
 
 
 def strip_comments(text):

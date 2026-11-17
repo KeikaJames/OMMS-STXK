@@ -59,21 +59,21 @@ LOG_FILES = {
 INSTRUCTIONS = (
     "本服务用于运行和管理鄂尔多斯市实验中学的社团选课系统，使用者是学校的管理员。"
     "所有操作通过本服务的工具完成；仓库中的程序、页面和配置模板保持只读，运行参数用 get_settings 与 update_settings 调整。"
-    "删除、清空、恢复、重置密码、调剂、锁定和停止服务会改变数据或中断报名：先向管理员说明影响并取得同意，再带 confirm: true 调用。"
+    "删除、清空、恢复、重置密码、调剂、锁定和停止服务会改变数据或暂停报名：先向管理员说明影响并取得同意，再带 confirm: true 调用。"
     "学生名单、账号密码和导出文件只交给管理员本人。"
     "开始工作前调用 service_status 了解现状；完整的运行指南在资源 omms://guide。"
 )
 
 # 键、默认值、取值规则、说明。run.sh 只从 deploy/omms.env 读取这些键。
 SETTINGS = (
-    ("HTTP_PORT", "8080", ("port",), "学生与管理员访问的端口。设为 80 时访问地址里不用写端口。"),
+    ("HTTP_PORT", "8080", ("port",), "学生与管理员访问的端口。设为 80 时访问地址只写 IP。"),
     ("TLS_CERT", "", ("file",), "HTTPS 证书文件的绝对路径，与 TLS_KEY 一起设置后改用 HTTPS。"),
     ("TLS_KEY", "", ("file",), "HTTPS 私钥文件的绝对路径。"),
     ("TLS_PORT", "8443", ("port",), "HTTPS 端口；启用 HTTPS 后，HTTP 端口的请求跳转到这里。"),
     ("REAL_IP_FROM", "", ("networks",), "内网穿透或反向代理所在的地址（IP 或网段，逗号分隔）。设置后按学生的真实地址限流。"),
     ("REAL_IP_HEADER", "X-Forwarded-For", ("header",), "学生真实地址所在的请求头；Cloudflare Tunnel 为 CF-Connecting-IP。"),
     ("APP_UTC_OFFSET", "+08:00", ("offset",), "学校所在时区，开放与截止时间按它解释。"),
-    ("OMMS_PYTHON_ONLY", "0", ("bool",), "1：只运行 Python 服务，跳过 Rust 编译；没有 Rust 环境时自动采用。"),
+    ("OMMS_PYTHON_ONLY", "0", ("bool",), "1：只运行 Python 服务，跳过 Rust 编译。"),
     ("OMMS_OPEN_BROWSER", "1", ("bool",), "1：双击启动后在本机浏览器打开控制台。"),
     ("PYTHON", "python3", ("command",), "运行服务所用的 Python 命令或绝对路径。"),
     ("BACKUP_KEEP", "30", ("int", 1, 1000), "保留的自动快照份数。"),
@@ -104,11 +104,11 @@ ACTION_LABELS = {
 
 
 class ToolError(Exception):
-    """工具无法完成时的说明，原样返回给代理。"""
+    """返回给代理的提示，说明下一步。"""
 
 
 class NeedsConfirm(ToolError):
-    """会改变数据或中断报名的操作：说明影响，等管理员同意后带 confirm: true 再调用。"""
+    """会改变数据或暂停报名的操作：说明影响，等管理员同意后带 confirm: true 再调用。"""
 
     def __init__(self, action: str, details: dict | None = None) -> None:
         text = "待确认：{}。向管理员说明并取得同意后，带 \"confirm\": true 再次调用。".format(action)
@@ -209,7 +209,7 @@ def parse_time(text, field: str) -> str:
     try:
         moment = dt.datetime(*parts)
     except ValueError as exc:
-        raise ToolError("{} 不是有效的日期时间：{}".format(field, text)) from exc
+        raise ToolError("{} 应为有效的日期时间：{}".format(field, text)) from exc
     return moment.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -309,7 +309,7 @@ def open_target(target: str, reveal: bool = False) -> None:
 # 管理员身份与管理接口
 # ---------------------------------------------------------------------------
 def run_admin_login() -> dict:
-    """调用 main.py admin-login：核对密码文件与数据库（不一致时生成新密码），并签发一次性登录链接。"""
+    """调用 main.py admin-login：核对密码文件与数据库（需要时生成新密码），并签发一次性登录链接。"""
     base = web_base("127.0.0.1") if port_open(web_scheme_port()[1]) else backend_url()
     command = [python_command(), str(MAIN_PY), "admin-login", base]
     env = child_env()
@@ -317,16 +317,16 @@ def run_admin_login() -> dict:
     try:
         result = subprocess.run(command, cwd=str(APP_DIR), env=env, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ToolError("无法运行 {}：{}".format(" ".join(command[:2]), exc)) from exc
+        raise ToolError("请检查 Python 环境（运行 {}：{}）".format(" ".join(command[:2]), exc)) from exc
     values = {}
     for line in result.stdout.splitlines():
         key, sep, value = line.partition("=")
         if sep and re.fullmatch(r"[A-Z_]+", key):
             values[key] = value
     if values.get("ERROR"):
-        raise ToolError("读取管理员账号失败：" + values["ERROR"])
+        raise ToolError("请检查数据库与 Python 依赖（读取管理员账号）：" + values["ERROR"])
     if not values.get("ADMIN_PASSWORD"):
-        raise ToolError("读取管理员账号失败：" + tail(result.stderr or result.stdout, 6))
+        raise ToolError("请检查数据库与 Python 依赖（读取管理员账号）：" + tail(result.stderr or result.stdout, 6))
     return values
 
 
@@ -376,7 +376,7 @@ class Reply:
 
 
 class Backend:
-    """以管理员身份调用 main.py 的管理接口；会话失效时自动重新登录。"""
+    """以管理员身份调用 main.py 的管理接口；会话到期时自动重新登录。"""
 
     def __init__(self) -> None:
         self.cookie = ""
@@ -398,9 +398,9 @@ class Backend:
             response = conn.getresponse()
             return Reply(response.status, response.getheaders(), response.read())
         except ConnectionRefusedError as exc:
-            raise ToolError("管理服务未运行（{}）。用 service_status 查看状态，用 start_service 启动。".format(backend_url())) from exc
+            raise ToolError("管理服务需要启动（{}）：调用 start_service。".format(backend_url())) from exc
         except (OSError, http.client.HTTPException) as exc:
-            raise ToolError("连接管理服务出错：{}".format(exc)) from exc
+            raise ToolError("请稍后重试（连接管理服务：{}）".format(exc)) from exc
         finally:
             conn.close()
 
@@ -422,7 +422,7 @@ class Backend:
             return None
         if reply.status == 401 and not heal:
             return self.login(heal=True)
-        raise ToolError("管理员登录失败：{}".format(data.get("message") or "HTTP {}".format(reply.status)))
+        raise ToolError("管理员登录：{}".format(data.get("message") or "HTTP {}".format(reply.status)))
 
     def api(self, method: str, path: str, payload=None, *, raw: bytes | None = None, filename: str = "",
             content_type: str = "application/octet-stream", binary: bool = False, retry: bool = True,
@@ -455,7 +455,7 @@ class Backend:
         failed = not 200 <= reply.status < 300 or (isinstance(data, dict) and data.get("success") is False)
         if failed:
             text = data.get("message") if isinstance(data, dict) else ""
-            raise ToolError(text or "请求失败（HTTP {}）".format(reply.status))
+            raise ToolError(text or "请重试（HTTP {}）".format(reply.status))
         return data
 
 
@@ -607,9 +607,9 @@ def read_input(path_text, limit: int) -> tuple[Path, bytes]:
     if not str(path_text or "").strip() or not path.is_absolute():
         raise ToolError("请给出文件的完整路径，例如 /Users/名字/Desktop/名单.xlsx")
     if not path.is_file():
-        raise ToolError("找不到文件：{}".format(path))
+        raise ToolError("请确认文件路径：{}".format(path))
     if path.stat().st_size > limit:
-        raise ToolError("文件超过 {} MB：{}".format(limit // 1048576, path))
+        raise ToolError("请选择 {} MB 以内的文件：{}".format(limit // 1048576, path))
     return path, path.read_bytes()
 
 
@@ -642,9 +642,9 @@ def flow_steps(summary: dict, info: dict) -> list:
         {"步骤": "导入学生", "状态": status(students > 0), "说明": "{} 名学生".format(students)},
         {"步骤": "添加社团", "状态": status(summary.get("clubs", 0) > 0, students > capacity),
          "说明": "{} 个社团，开放报名的名额合计 {}{}".format(summary.get("clubs", 0), capacity,
-                                                  "，比学生少 {}".format(students - capacity) if students > capacity else "")},
+                                                  "，学生 {} 名".format(students) if students > capacity else "")},
         {"步骤": "开放时间", "状态": status(bool(info.get("start_time"))),
-         "说明": "开放 {}；截止 {}".format(info.get("start_time") or "待定", info.get("end_time") or "未设置")},
+         "说明": "开放 {}；截止 {}".format(info.get("start_time") or "待定", info.get("end_time") or "手动锁定")},
         {"步骤": "报名", "状态": status(locked), "说明": "{}，已报名 {} / {}".format(phase_text(info), registered, students)},
         {"步骤": "调剂", "状态": status(locked and registered >= students),
          "说明": "未报名 {} 名".format(students - registered) if locked else "名单锁定后安排未报名的学生"},
@@ -687,7 +687,7 @@ def tool_service_status(args: dict) -> dict:
         "网页入口（nginx :{}）".format(web_port): port_open(web_port),
         "Redis（:{}）".format(redis_port()): port_open(redis_port()),
     }
-    result = {"服务": {name: "运行中" if up else "未运行" for name, up in components.items()}}
+    result = {"服务": {name: "运行中" if up else "已停止" for name, up in components.items()}}
     if not port_open(2002) and port_open(backend_port()):
         result["运行模式"] = "只运行 Python 服务"
     if start_in_progress():
@@ -697,21 +697,21 @@ def tool_service_status(args: dict) -> dict:
     if info:
         result["报名状态"] = phase_text(info)
         result["开放时间"] = info.get("start_time") or "待定"
-        result["截止时间"] = info.get("end_time") or "未设置"
+        result["截止时间"] = info.get("end_time") or "手动锁定"
         result["服务器当前时间（学校时间）"] = school_time(info.get("server_now"))
     tools = {name: bool(shutil.which(name, path=child_env()["PATH"])) for name in ("redis-server", "nginx", "cargo")}
     probe = ("import importlib.util as u; print(' '.join(n for m, n in (('redis', 'redis'), ('argon2', 'argon2-cffi'), "
              "('pypinyin', 'pypinyin'), ('PIL', 'Pillow')) if u.find_spec(m) is None))")
-    missing = "Python 不可用"
+    missing = "需要安装 Python"
     if shutil.which(python_command()):
         check = subprocess.run([python_command(), "-c", probe], env=child_env(), capture_output=True, text=True, timeout=30)
-        missing = check.stdout.strip() if check.returncode == 0 else "Python 不可用"
+        missing = check.stdout.strip() if check.returncode == 0 else "需要安装 Python"
     result["环境"] = {
         "Python": python_command(),
-        "Python 依赖": "齐全" if not missing else "缺少：" + missing,
-        "redis-server": "已安装" if tools["redis-server"] else "未安装",
-        "nginx": "已安装" if tools["nginx"] else "未安装",
-        "Rust（cargo，可选）": "已安装" if tools["cargo"] else "未安装，启动时只运行 Python 服务",
+        "Python 依赖": "齐全" if not missing else "需要安装：" + missing,
+        "redis-server": "已安装" if tools["redis-server"] else "需要安装",
+        "nginx": "已安装" if tools["nginx"] else "需要安装",
+        "Rust（cargo，可选）": "已安装" if tools["cargo"] else "可选，装好后同时运行 Rust 热服务",
     }
     result["文件"] = {"程序目录": str(APP_DIR), "数据库": str(db_path()), "管理员密码文件": str(secret_file()),
                     "运行参数": str(settings_path()), "导出目录": str(export_dir()), "运行日志": str(run_dir())}
@@ -721,7 +721,7 @@ def tool_service_status(args: dict) -> dict:
         result["自定义运行参数"] = custom
     hints = []
     if not all(components.values()):
-        hints.append("服务未完全运行：用 start_service 启动")
+        hints.append("调用 start_service 启动全部服务")
     if missing:
         hints.append("安装 Python 依赖：{} -m pip install redis argon2-cffi pypinyin Pillow".format(python_command()))
     if not tools["redis-server"] or not tools["nginx"]:
@@ -766,7 +766,7 @@ def tool_start_service(args: dict) -> dict:
         for label in labels:
             if line.startswith(label):
                 summary[label] = line[len(label):].strip()
-    result = {"状态": "已启动" if process.returncode == 0 else "启动失败", "退出码": process.returncode}
+    result = {"状态": "已启动" if process.returncode == 0 else "需要处理", "退出码": process.returncode}
     result.update(summary)
     result["输出"] = tail(output, 25)
     if process.returncode != 0:
@@ -777,12 +777,12 @@ def tool_start_service(args: dict) -> dict:
 def tool_stop_service(args: dict) -> dict:
     info = registration_running()
     if info and opening_soon(info) and not args.get("confirm"):
-        raise NeedsConfirm("停止服务；报名进行中或一小时内开放，学生将无法访问",
+        raise NeedsConfirm("停止服务；报名进行中或一小时内开放，学生访问随之暂停",
                            {"报名状态": phase_text(info), "开放时间": info.get("start_time")})
     result = subprocess.run(["bash", str(RUN_SH), "stop"], cwd=str(APP_DIR), env=child_env(),
                             capture_output=True, text=True, timeout=180)
     BACKEND.cookie = ""
-    return {"状态": "已停止" if result.returncode == 0 else "停止时出错", "输出": tail(result.stdout + result.stderr, 10)}
+    return {"状态": "已停止" if result.returncode == 0 else "需要处理", "输出": tail(result.stdout + result.stderr, 10)}
 
 
 def tool_service_logs(args: dict) -> dict:
@@ -797,7 +797,7 @@ def tool_service_logs(args: dict) -> dict:
             handle.seek(max(0, handle.tell() - 256 * 1024))
             text = handle.read().decode("utf-8", "replace")
     except OSError:
-        return {"文件": str(path), "内容": "（文件不存在）"}
+        return {"文件": str(path), "内容": "（日志尚未生成）"}
     return {"文件": str(path), "内容": tail(text, lines)}
 
 
@@ -806,7 +806,7 @@ def tool_open_console(args: dict) -> dict:
     link = values.get("LOGIN_URL") or ""
     if link and args.get("open_browser", True):
         open_target(link)
-    return {"管理控制台": addresses()["管理控制台"], "本机登录链接（2 分钟内有效，只能使用一次）": link or "（Redis 未运行，链接未生成）",
+    return {"管理控制台": addresses()["管理控制台"], "本机登录链接（2 分钟内有效，只能使用一次）": link or "（启动 Redis 后生成）",
             "管理员账号": values.get("ADMIN_USER") or "admin", "管理员密码": values["ADMIN_PASSWORD"],
             "已在浏览器打开": bool(link and args.get("open_browser", True))}
 
@@ -857,7 +857,7 @@ def validate_setting(key: str, value) -> str:
         return mapping[text.lower()]
     if kind == "command":
         if not (shutil.which(text, path=child_env()["PATH"]) or (Path(text).is_file() and os.access(text, os.X_OK))):
-            raise ToolError("{} 找不到可执行的命令：{}".format(key, text))
+            raise ToolError("{} 应为可执行的命令或完整路径：{}".format(key, text))
         return text
     if kind == "int":
         if not re.fullmatch(r"\d+", text) or not rule[1] <= int(text) <= rule[2]:
@@ -887,7 +887,7 @@ def tool_update_settings(args: dict) -> dict:
         raise ToolError("values 应为 {键: 值} 对象；值为 null 或空字符串时恢复默认")
     unknown = [key for key in updates if key not in SETTING_KEYS]
     if unknown:
-        raise ToolError("可调整的键：{}；不认识：{}".format("、".join(SETTING_KEYS), "、".join(unknown)))
+        raise ToolError("可调整的键：{}（收到：{}）".format("、".join(SETTING_KEYS), "、".join(unknown)))
     cleaned = {}
     for key, value in updates.items():
         cleaned[key] = None if value is None or str(value).strip() == "" else validate_setting(key, value)
@@ -939,7 +939,7 @@ def tool_admin_credentials(args: dict) -> dict:
     except ToolError as exc:
         username, password = file_credentials()
         if not password:
-            raise ToolError("读取管理员密码失败：{}".format(exc)) from exc
+            raise ToolError("请检查数据库与密码文件：{}".format(exc)) from exc
     BACKEND.username, BACKEND.password = username, password
     return {"管理员账号": username, "管理员密码": password, "密码文件": str(secret_file()), **addresses()}
 
@@ -950,7 +950,7 @@ def tool_change_admin_password(args: dict) -> dict:
         new = "".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(12))
     new = str(new)
     if not 8 <= len(new) <= 64 or re.search(r"\s", new):
-        raise ToolError("新密码为 8–64 位，不含空格")
+        raise ToolError("新密码为 8–64 位，由字母、数字和符号连续组成")
     if not BACKEND.password:
         BACKEND.username, BACKEND.password = file_credentials()
     if not BACKEND.cookie:
@@ -974,7 +974,7 @@ def tool_get_overview(args: dict) -> dict:
     return {
         "报名状态": phase_text(info),
         "开放时间": info.get("start_time") or "待定",
-        "截止时间": info.get("end_time") or "未设置",
+        "截止时间": info.get("end_time") or "手动锁定",
         "服务器当前时间（学校时间）": school_time(info.get("server_now")),
         "学生": students, "已报名": registered, "未报名": students - registered,
         "社团": len(clubs), "开放报名的名额合计": summary.get("capacity", 0),
@@ -1001,11 +1001,11 @@ def tool_set_schedule(args: dict) -> dict:
     after = get("/api/check_registration_time")
     notes = []
     if payload.get("start_time") and payload["start_time"] <= now_text:
-        notes.append("开放时间不晚于当前时间，报名即刻开放")
+        notes.append("开放时间已到，报名即刻开放")
     if after.get("registration_locked"):
         notes.append("名单目前处于锁定状态，开放前用 set_lock 解除锁定")
     result = {"报名状态": phase_text(after), "开放时间": after.get("start_time") or "待定",
-              "截止时间": after.get("end_time") or "未设置", "服务器当前时间（学校时间）": school_time(after.get("server_now"))}
+              "截止时间": after.get("end_time") or "手动锁定", "服务器当前时间（学校时间）": school_time(after.get("server_now"))}
     if notes:
         result["说明"] = notes
     return result
@@ -1017,7 +1017,7 @@ def tool_clear_schedule(args: dict) -> dict:
         raise NeedsConfirm("清除开放时间；报名正在进行，清除后报名立即暂停，学生页显示“开放时间待定”")
     post("/api/update_registration_time", {"start_time": ""})
     after = get("/api/check_registration_time")
-    return {"报名状态": phase_text(after), "开放时间": after.get("start_time") or "待定", "截止时间": after.get("end_time") or "未设置"}
+    return {"报名状态": phase_text(after), "开放时间": after.get("start_time") or "待定", "截止时间": after.get("end_time") or "手动锁定"}
 
 
 def tool_set_lock(args: dict) -> dict:
@@ -1055,7 +1055,7 @@ def row_view(row: dict) -> dict:
 def class_counts(rows: list, key: str = "class") -> dict:
     counts = {}
     for row in rows:
-        label = row.get(key) or "（缺少班级）"
+        label = row.get(key) or "（待补班级）"
         counts[label] = counts.get(label, 0) + 1
     return {label: counts[label] for label in sorted(counts, key=natural_key)}
 
@@ -1083,7 +1083,7 @@ def tool_import_roster(args: dict) -> dict:
     for fix in args.get("fixes") or []:
         position = str((fix or {}).get("position") or "")
         if position not in by_position:
-            raise ToolError("fixes 中的位置不存在：{}".format(position))
+            raise ToolError("fixes 的位置请从 preview_roster 的结果中选择（收到：{}）".format(position))
         if fix.get("name") is not None:
             by_position[position]["name"] = str(fix["name"]).strip()
         if fix.get("class") is not None:
@@ -1092,7 +1092,7 @@ def tool_import_roster(args: dict) -> dict:
     skip = {str(item) for item in args.get("skip") or []}
     unknown = sorted(skip - set(by_position))
     if unknown:
-        raise ToolError("skip 中的位置不存在：{}".format("、".join(unknown)))
+        raise ToolError("skip 的位置请从 preview_roster 的结果中选择（收到：{}）".format("、".join(unknown)))
     include_existing = bool(args.get("include_imported"))
     # 按改正后的姓名和班级对照现有学生，补全班级后再次导入同一份表格时同样跳过。
     present = {(student["name"], student["class"]) for student in all_students()}
@@ -1113,7 +1113,7 @@ def tool_import_roster(args: dict) -> dict:
     if problems:
         raise ToolError("以下行需要用 fixes 改正或用 skip 跳过：\n" + dumps(problems[:80]))
     if not chosen:
-        raise ToolError("可导入的行数为 0（系统中已有的同名同班学生 {} 行已跳过）".format(existing))
+        raise ToolError("表格中的学生都已在系统中（同名同班 {} 行已跳过）".format(existing))
     flagged = [row_view(row) for row in chosen if row["notes"] and not row.get("fixed")]
     if not args.get("confirm"):
         raise NeedsConfirm("导入 {} 名学生".format(len(chosen)), {
@@ -1128,7 +1128,7 @@ def tool_import_roster(args: dict) -> dict:
                           {"students": [{"name": row["name"], "class": row["class"]} for row in part]},
                           retry=False, timeout=600)
         except ToolError as exc:
-            stopped = "第 {} 名起中断：{}".format(start + 1, exc)
+            stopped = "第 {} 名起暂停：{}".format(start + 1, exc)
             break
         created += int(result.get("success") or 0)
         refused += int(result.get("failed") or 0)
@@ -1136,10 +1136,10 @@ def tool_import_roster(args: dict) -> dict:
     files = save_accounts(credentials, args.get("output_dir")) if credentials else []
     if files and args.get("reveal"):
         open_target(files[0], reveal=True)
-    out = {"已导入": created, "未导入（账号重复等）": refused, "系统中已有而跳过": existing, "账号表": files,
+    out = {"已导入": created, "跳过（账号重复等）": refused, "系统中已有而跳过": existing, "账号表": files,
            "各班人数": class_counts(chosen)}
     if stopped:
-        out["中断"] = stopped + "。已导入的学生在账号表里；再次调用 import_roster 时，已导入的行自动跳过。"
+        out["暂停"] = stopped + "。已导入的学生在账号表里；再次调用 import_roster 时，已导入的行自动跳过。"
     return out
 
 
@@ -1216,7 +1216,7 @@ def tool_reset_passwords(args: dict) -> dict:
     if reference:
         student = find_student(reference)
         if not args.get("confirm"):
-            raise NeedsConfirm("重置 {}（{}）的密码，原密码随即失效".format(student["name"], student["class"]))
+            raise NeedsConfirm("重置 {}（{}）的密码，新密码随即生效".format(student["name"], student["class"]))
         result = post("/api/admin/reset_student_password",
                       {"student_id": student["id"], "request_id": rid(), "reason": reason})
         password = result.get("temporary_password")
@@ -1228,9 +1228,9 @@ def tool_reset_passwords(args: dict) -> dict:
         return out
     members = [student for student in all_students() if student["class"] == klass]
     if not members:
-        raise ToolError("班级“{}”下没有学生。现有班级：{}".format(klass, "、".join(class_counts(all_students()))))
+        raise ToolError("班级可选：{}（收到“{}”）".format("、".join(class_counts(all_students())), klass))
     if not args.get("confirm"):
-        raise NeedsConfirm("重置 {} 全部 {} 名学生的密码，原密码随即失效".format(klass, len(members)))
+        raise NeedsConfirm("重置 {} 全部 {} 名学生的密码，新密码随即生效".format(klass, len(members)))
     result = post("/api/admin/reset_class_passwords", {"class": klass, "reason": reason, "request_id": rid()})
     credentials = result.get("credentials") or []
     files = save_accounts(credentials, args.get("output_dir")) if credentials else []
@@ -1365,17 +1365,17 @@ def tool_adjustment(args: dict) -> dict:
             "各社团": [{"社团": club.get("name"), "空余": club.get("remaining"), "将安排": club.get("assign")}
                      for club in plan.get("clubs") or []]}
     if plan.get("assignable", 0) < plan.get("unregistered", 0):
-        view["名额缺口"] = plan["unregistered"] - plan["assignable"]
+        view["还需名额"] = plan["unregistered"] - plan["assignable"]
     if not args.get("run"):
         return view
     if not plan.get("locked"):
         raise ToolError("调剂在名单锁定后进行：先调用 set_lock(locked=true)")
     if not plan.get("assignable"):
-        return {**view, "结果": "可安排的学生为 0"}
+        return {**view, "结果": "暂无可安排的学生"}
     if not args.get("confirm"):
         raise NeedsConfirm("把 {} 名未报名的学生随机安排到有空余名额的社团（遵守年级和班级范围）".format(plan["assignable"]), view)
     result = post("/api/admin/adjust_registrations", {"request_id": rid()}, timeout=300)
-    return {"已安排": result.get("assigned"), "仍未安排": result.get("unassigned", 0), "快照": result.get("backup")}
+    return {"已安排": result.get("assigned"), "待安排": result.get("unassigned", 0), "快照": result.get("backup")}
 
 
 EXPORTS = {
@@ -1455,7 +1455,7 @@ def tool_restore(args: dict) -> dict:
     if snapshot:
         names = {item["name"]: item for item in get("/api/admin/backups").get("backups") or []}
         if snapshot not in names:
-            raise ToolError("快照不存在：{}。可用 list_snapshots 查看。".format(snapshot))
+            raise ToolError("快照名称请从 list_snapshots 中选择（收到：{}）".format(snapshot))
         target = "{} · {}".format(names[snapshot]["label"], names[snapshot]["time"])
     else:
         path, data = read_input(file_path, MAX_RESTORE_BYTES)
@@ -1535,7 +1535,7 @@ TOOLS = [
              "confirm": CONFIRM}), tool_start_service, WRITE),
     ("stop_service", "停止服务", "执行 run.sh stop 停止全部服务，数据保留。报名进行中或一小时内开放时需要 confirm。",
      schema({"confirm": CONFIRM}), tool_stop_service, DANGER),
-    ("service_logs", "查看日志", "读取运行日志的末尾：python、rust、nginx（错误日志）、access（访问日志）、redis、build（Rust 编译）、start（最近一次 start_service）。",
+    ("service_logs", "查看日志", "读取运行日志的末尾：python、rust、nginx（nginx-error.log）、access（访问日志）、redis、build（Rust 编译）、start（最近一次 start_service）。",
      schema({"source": {"type": "string", "enum": list(LOG_FILES)}, "lines": {"type": "integer", "description": "行数，默认 60，最大 400"}}),
      tool_service_logs, READ),
     ("open_console", "打开控制台", "在本机浏览器打开管理控制台并自动登录（一次性链接，2 分钟内有效），同时返回管理员账号密码。",
@@ -1546,10 +1546,10 @@ TOOLS = [
      schema({"values": {"type": "object", "description": "{键: 值}，键见 get_settings"},
              "restart": {"type": "boolean", "description": "写入后立即重启服务"},
              "wait_seconds": {"type": "integer"}, "confirm": CONFIRM}, ["values"]), tool_update_settings, WRITE),
-    ("admin_credentials", "管理员账号密码", "返回管理员账号、当前密码和控制台地址。密码文件与数据库不一致时自动生成新密码。",
+    ("admin_credentials", "管理员账号密码", "返回管理员账号、当前密码和控制台地址。需要时自动生成新密码。",
      schema(), tool_admin_credentials, WRITE),
     ("change_admin_password", "修改管理员密码", "修改管理员密码并写入密码文件；不给 new_password 时随机生成 12 位。",
-     schema({"new_password": {"type": "string", "description": "8–64 位，不含空格"}}), tool_change_admin_password, WRITE),
+     schema({"new_password": {"type": "string", "description": "8–64 位，由字母、数字和符号连续组成"}}), tool_change_admin_password, WRITE),
     ("get_overview", "报名概览", "报名状态、开放与截止时间、学生和报名人数、各社团名额、使用流程各步骤的状态。",
      schema(), tool_get_overview, READ),
     ("set_schedule", "设置开放与截止时间", "按学校时间设置开放时间和截止时间；到开放时间自动开放，到截止时间自动锁定名单。",
@@ -1598,7 +1598,7 @@ TOOLS = [
      tool_delete_club, DANGER),
     ("adjustment", "调剂", "查看调剂预览：未报名人数、各社团空余和将安排人数。run=true 且名单已锁定时执行调剂。",
      schema({"run": {"type": "boolean"}, "confirm": CONFIRM}), tool_adjustment, DANGER),
-    ("export_data", "导出", "导出并保存文件：workbook（Excel 报名表：总表、各社团、未报名）、all（报名总表 CSV）、unregistered（未报名名单）、students（学生账号 CSV，不含密码）、club（单个社团名单，需 club）。",
+    ("export_data", "导出", "导出并保存文件：workbook（Excel 报名表：总表、各社团、未报名）、all（报名总表 CSV）、unregistered（未报名名单）、students（学生账号 CSV：姓名、班级、账号）、club（单个社团名单，需 club）。",
      schema({"kind": {"type": "string", "enum": ["workbook", "all", "unregistered", "students", "club"]}, "club": CLUB,
              "output_dir": OUTPUT_DIR, "reveal": REVEAL}), tool_export_data, WRITE),
     ("audit_log", "操作记录", "查看最近的操作记录：admin（管理操作）、student（学生报名与退选）、all。",
@@ -1619,7 +1619,7 @@ TOOL_INDEX = {item[0]: item for item in TOOLS}
 
 def run_tool(name: str, arguments: dict) -> tuple[str, bool]:
     if name not in TOOL_INDEX:
-        return "没有名为 {} 的工具".format(name), True
+        return "工具名称请从 tools/list 中选择（收到：{}）".format(name), True
     if not isinstance(arguments, dict):
         return "参数应为对象", True
     try:
@@ -1629,9 +1629,9 @@ def run_tool(name: str, arguments: dict) -> tuple[str, bool]:
         return str(exc), True
     except subprocess.TimeoutExpired as exc:
         return "命令超时：{}".format(exc), True
-    except Exception as exc:  # noqa: BLE001 - 工具出错时返回说明，服务继续运行
+    except Exception as exc:  # noqa: BLE001 - 返回说明，服务继续运行
         traceback.print_exc(file=sys.stderr)
-        return "工具执行出错：{}: {}".format(type(exc).__name__, exc), True
+        return "请重试；详情 {}: {}".format(type(exc).__name__, exc), True
 
 
 # ---------------------------------------------------------------------------
@@ -1731,7 +1731,7 @@ def register(target: str) -> int:
             try:
                 data = json.loads(config.read_text(encoding="utf-8") or "{}")
             except ValueError:
-                print("{} 不是有效的 JSON，未修改".format(config))
+                print("{} 需为有效的 JSON，配置保持原样".format(config))
                 return 1
             shutil.copy2(str(config), str(config) + ".bak")
         data.setdefault("mcpServers", {})["omms"] = {"command": python, "args": [script]}

@@ -151,7 +151,7 @@ class AgentTests(unittest.TestCase):
         preview = client.ok("preview_roster", file_path=str(roster))
         self.assertEqual((3, 1), (preview["识别到的学生行"], preview["略过的行（合计、说明、空姓名等）"]))
         flagged = {row["姓名"]: row for row in preview["需核对的行"]}
-        self.assertEqual(["缺少班级"], flagged["李四"]["标注"])
+        self.assertEqual(["待补班级"], flagged["李四"]["标注"])
         position = flagged["李四"]["位置"]
 
         failed, text = client.call("import_roster", file_path=str(roster), confirm=True)
@@ -170,7 +170,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual({"李四", "张三", "王五"}, {row[0] for row in rows[1:] if row and row[0]})
         failed, text = client.call("import_roster", file_path=str(roster), fixes=fixes, confirm=True)
         self.assertTrue(failed)
-        self.assertIn("可导入的行数为 0", text)
+        self.assertIn("都已在系统中", text)
 
         listing = client.ok("list_students")
         self.assertEqual((3, {"高一1班": 2, "高一2班": 1}), (listing["学生总数"], listing["各班人数"]))

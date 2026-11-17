@@ -1,4 +1,4 @@
-/* 由 tools/css_fallbacks.py 根据 app.css 生成，供不支持 CSS 变量的浏览器使用。 */
+/* 由 tools/css_fallbacks.py 根据 app.css 生成，为每条使用颜色变量的声明提供固定颜色，旧浏览器按它显示。 */
 body { background: #F4EFE6; color: #1F1D1A; }
 a { color: #355F78; }
 .muted { color: #776F62; }

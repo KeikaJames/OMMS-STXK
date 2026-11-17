@@ -4344,14 +4344,14 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         """解析上传的名单表格，逐行返回供管理员核对，不写数据库。"""
         filename = urllib.parse.unquote(self.headers.get("X-File-Name") or "")[:200]
         if not raw:
-            return self._json(400, {"success": False, "message": "文件为空"})
+            return self._json(400, {"success": False, "message": "请选择有内容的表格"})
         try:
             parsed = tables.parse_roster(filename, raw)
         except tables.TableError as exc:
             return self._json(400, {"success": False, "message": str(exc)})
         except Exception as exc:  # noqa: BLE001
             log.warning("名单解析失败 file=%s error=%r", filename, exc)
-            return self._json(400, {"success": False, "message": "表格格式无法识别"})
+            return self._json(400, {"success": False, "message": "请上传 xlsx、xls、csv 或网页表格"})
         with DB_POOL.connection() as conn:
             existing = set(conn.execute("SELECT name, class FROM students").fetchall())
         for row in parsed["rows"]:
@@ -4363,13 +4363,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         """把本页的新账号写成 Excel：姓名、班级、账号、密码。"""
         accounts = data.get("accounts")
         if not isinstance(accounts, list) or not 0 < len(accounts) <= MAX_ACCOUNT_ROWS:
-            return self._json(400, {"success": False, "message": "账号列表无效"})
+            return self._json(400, {"success": False, "message": "账号列表应为姓名、班级、账号、密码"})
         keys = ("name", "class", "username", "password")
         rows = []
         for item in accounts:
             values = [item.get(key) for key in keys] if isinstance(item, dict) else []
             if len(values) != 4 or not all(isinstance(value, str) and 0 < len(value) <= 80 for value in values):
-                return self._json(400, {"success": False, "message": "账号列表无效"})
+                return self._json(400, {"success": False, "message": "账号列表应为姓名、班级、账号、密码"})
             rows.append(dict(zip(keys, values)))
         stamp = export_stamp()
         self._record_download(sess, "students.exported", {"kind": "accounts_xlsx", "count": len(rows)})
@@ -4380,10 +4380,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_restore(self, sess, data):
         name = data.get("name")
         if not isinstance(name, str) or not BACKUP_NAME_RE.fullmatch(name):
-            return self._json(400, {"success": False, "message": "备份无效"})
+            return self._json(400, {"success": False, "message": "请选择本系统的备份文件（zip 或 .db）"})
         path = os.path.join(BACKUP_DIR, name)
         if not os.path.isfile(path):
-            return self._json(404, {"success": False, "message": "备份不存在"})
+            return self._json(404, {"success": False, "message": "请刷新快照列表后重试"})
         with tempfile.TemporaryDirectory(prefix="omms-restore-") as tmp:
             source = os.path.join(tmp, BACKUP_DB_NAME)
             copy_database(path, source)
@@ -4413,7 +4413,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     raise ValueError("unknown format")
             except (KeyError, ValueError, OSError, zipfile.BadZipFile):
-                return self._json(400, {"success": False, "message": "备份无效"})
+                return self._json(400, {"success": False, "message": "请选择本系统的备份文件（zip 或 .db）"})
             self._restore_from(sess, source, label, images)
 
     def _restore_from(self, sess, source, label, images=None):
@@ -4421,7 +4421,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         try:
             students, clubs, registrations = database_counts(source)
         except (ValueError, sqlite3.Error):
-            return self._json(400, {"success": False, "message": "备份无效"})
+            return self._json(400, {"success": False, "message": "请选择本系统的备份文件（zip 或 .db）"})
         maintenance = RG.maintenance_begin()
         if not maintenance:
             return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
@@ -4485,7 +4485,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 with open(os.path.join(BACKUP_DIR, name), "rb") as source:
                     body = source.read()
             except OSError:
-                return self._json(404, {"success": False, "message": "备份不存在"})
+                return self._json(404, {"success": False, "message": "请刷新快照列表后重试"})
             self._record_download(sess, "backup.downloaded", {"kind": "snapshot", "name": name})
             return self._send(200, body, ctype="application/vnd.sqlite3",
                               extra=[attachment_header(name, name), ("Cache-Control", "no-store")])

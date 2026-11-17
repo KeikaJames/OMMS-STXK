@@ -318,7 +318,7 @@ class TextTableTests(unittest.TestCase):
     def test_summary_rows_and_names_with_digits(self) -> None:
         text = "序号,姓名,班级\n1,张伟123,高一1班\n2,O'Neil,高一1班\n3,Батбаяр,高一1班\n合计,3 人,\n".encode("utf-8")
         parsed = sheets.parse_roster("a.csv", text)
-        self.assertEqual([("张伟123", "高一1班", ("姓名有误",)), ("O'Neil", "高一1班", ()), ("Батбаяр", "高一1班", ())],
+        self.assertEqual([("张伟123", "高一1班", ("待核对姓名",)), ("O'Neil", "高一1班", ()), ("Батбаяр", "高一1班", ())],
                          rows_of(parsed))
         self.assertEqual(1, parsed["skipped"])
 

@@ -5,9 +5,9 @@
 #   OMMS_PYTHON_ONLY=1 bash run.sh   不编译 Rust，由 Python 服务全部接口
 #   TLS_CERT=证书 TLS_KEY=私钥 bash run.sh      在 TLS_PORT（默认 8443）上提供 HTTPS，8080 跳转到 HTTPS
 #   REAL_IP_FROM=127.0.0.1 bash run.sh         经内网穿透或反向代理访问时，按 REAL_IP_HEADER 取学生的真实地址
-#   HTTP_PORT=80 bash run.sh         改用 80 端口，学生访问地址里不用写端口
+#   HTTP_PORT=80 bash run.sh         改用 80 端口，学生访问地址只写 IP
 # 上述参数也可以写在 deploy/omms.env（每行 键=值）；启动命令里给出的同名变量优先。
-# 没有 cargo、Rust 版本过旧或首次编译失败时，自动改用只运行 Python 的模式。
+# cargo 可用且编译成功时同时运行 Rust 热服务，其余情况只运行 Python 服务。
 set -o pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
