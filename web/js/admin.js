@@ -817,7 +817,7 @@
       if (!groups.has(klass)) groups.set(klass, []);
       groups.get(klass).push(item);
     });
-    const row = (label, value) => { const line = el('div', 'slip-row'); line.append(el('small', '', label), el('span', '', value)); return line; };
+    const row = (label, value, wide) => { const line = el('div', wide ? 'slip-row wide' : 'slip-row'); line.append(el('small', '', label), el('span', '', value)); return line; };
     const sheet = el('div', 'print-sheet');
     sheet.id = 'print-sheet';
     Array.from(groups.keys()).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN', { numeric: true })).forEach(klass => {
@@ -826,7 +826,7 @@
       const slips = el('div', 'slips');
       groups.get(klass).forEach(item => {
         const slip = el('div', 'slip');
-        slip.append(el('b', '', item.name + '　' + (item.class || '')), row('账号', item.username), row('初始密码', item.password), row('登录地址', origin));
+        slip.append(el('b', '', item.name + '　' + (item.class || '')), row('账号', item.username), row('初始密码', item.password), row('登录地址', origin, true));
         slips.append(slip);
       });
       section.append(slips);

@@ -424,4 +424,7 @@ textarea.input { min-height: 120px; font-family: var(--mono); font-size: 13px; l
   .slip-row { display: flex; gap: 2mm; align-items: baseline; }
   .slip-row small { flex: none; width: 15mm; color: #444; font-size: 9pt; }
   .slip-row span { font-family: var(--mono); font-size: 11pt; word-break: break-all; }
+  .slip-row.wide { display: block; }
+  .slip-row.wide small { display: block; width: auto; }
+  .slip-row.wide span { font-size: 9.5pt; }
 }
