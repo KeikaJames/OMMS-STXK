@@ -570,6 +570,31 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             self.assertEqual("ineligible_grade", json.loads(body).get("code"))
         self.assertEqual("3", self.redis.get(key("stock", 1)))
 
+    def test_python_and_rust_treat_an_unset_opening_time_as_not_open(self) -> None:
+        self._reset_state()
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE settings SET registration_start_time=NULL")
+            conn.commit()
+        self.redis.delete(key("open_at"))
+        try:
+            student_token = self._login(self.python_port, "edge1", "student-password")
+            for port in (self.python_port, self.rust_port):
+                status, _headers, body = self._request_raw(port, "GET", "/api/check_registration_time")
+                state = json.loads(body)
+                self.assertEqual(200, status)
+                self.assertEqual((False, None, None), (state["can_register"], state["start_time"], state["open_at"]))
+                status, _headers, body = self._request_raw(
+                    port, "POST", "/api/register_club", body={"club_id": 1}, cookie=f"session={student_token}"
+                )
+                self.assertEqual(200, status, body)
+                self.assertEqual("not_open", json.loads(body).get("code"))
+            self.assertEqual("3", self.redis.get(key("stock", 1)))
+            self.assertEqual(0, self.redis.scard(key("repair")))
+        finally:
+            with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+                conn.execute("UPDATE settings SET registration_start_time='2000-01-01 00:00:00'")
+                conn.commit()
+
     def test_edge_rejects_multiple_cookie_header_fields_without_revoking_session(self) -> None:
         self._reset_state()
         student_token = self._login(self.edge_port, "edge1", "student-password")

@@ -1900,10 +1900,7 @@ def init_db():
             # 首次启动生成随机管理员口令，只在日志里输出一次；字母表去掉易混淆字符。
             _pw_alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
             init_admin_pw = "".join(secrets.choice(_pw_alphabet) for _ in range(12))
-            cur.execute(
-                "INSERT INTO settings (registration_start_time, admin_password) VALUES (?, ?)",
-                (now_text(), hash_password(init_admin_pw)),
-            )
+            cur.execute("INSERT INTO settings (admin_password) VALUES (?)", (hash_password(init_admin_pw),))
             log.warning("=" * 60)
             log.warning("首次启动：管理员账号 admin，初始密码 %s", init_admin_pw)
             log.warning("该密码仅输出一次，请登录后在“设置”中修改。")
@@ -1998,8 +1995,7 @@ def seed_settings_mirror():
             ).fetchone()
         if not row:
             return
-        if row[0]:
-            RG.open_at_set(parse_local_time(row[0]))
+        RG.open_at_set(parse_local_time(row[0]) if row[0] else None)
         RG.locked_set(bool(row[1]))
     except (RuntimeError, ValueError) as e:
         log.warning("同步开放时间与锁定状态失败: %s", e)
@@ -4088,11 +4084,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         start_time = data.get("start_time") or ""
         if not isinstance(start_time, str):
             return self._json(400, {"success": False, "message": "时间格式错误"})
-        start_time = start_time.strip()
-        try:
-            open_at = parse_local_time(start_time)
-        except ValueError:
-            return self._json(400, {"success": False, "message": "时间格式应为 YYYY-MM-DD HH:MM:SS"})
+        start_time = start_time.strip() or None
+        open_at = None
+        if start_time:
+            try:
+                open_at = parse_local_time(start_time)
+            except ValueError:
+                return self._json(400, {"success": False, "message": "时间格式应为 YYYY-MM-DD HH:MM:SS"})
         try:
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()

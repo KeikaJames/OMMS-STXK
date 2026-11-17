@@ -44,7 +44,7 @@
 | -1 | 已有报名或其他操作 | `registered_other` / `registered_already` |
 | -2 | 名额未初始化 | 503 `syncing`，触发重建 |
 | -3 | 维护中或社团修复中 | 503 `syncing` |
-| -4 | 未到开放时间 | `not_open` |
+| -4 | 未到开放时间或未设置开放时间 | `not_open` |
 | -6 | 名单已锁定 | `locked` |
 
 ## 退选
@@ -77,7 +77,7 @@
 | `inflight:{c}` | 集合，成员 `学生|租约` | 社团在途操作 |
 | `fence:{c}` | 标记 | 社团修复栅栏 |
 | `maint` / `init` | 标记 | 全局维护 / 名额已初始化 |
-| `open_at` / `locked` | 时间戳 / 标记 | 开放时间 / 名单锁定 |
+| `open_at` / `locked` | 时间戳 / 标记 | 开放时间（未设置时不存在）/ 名单锁定 |
 | `repair` | 集合 | 待修复社团 |
 | `rb:{lease}` / `cx:{event}` | 标记 | 回滚与退选的幂等记录 |
 | `sess:{token}` | 会话 JSON | 登录会话，有效期 `SESSION_TTL` |

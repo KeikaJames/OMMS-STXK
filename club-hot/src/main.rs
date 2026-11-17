@@ -151,10 +151,16 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
 /// 把 SQLite 中的开放时间与锁定状态同步到 Redis。
 async fn seed_settings(seats: &Seats, db: &Db) {
-    if let Ok(Some(text)) = db.registration_start_time().await
-        && let Some(epoch) = auth::parse_local_datetime(&text)
-    {
-        let _ = seats.open_at_set(Some(epoch)).await;
+    match db.registration_start_time().await {
+        Ok(Some(text)) => {
+            if let Some(epoch) = auth::parse_local_datetime(&text) {
+                let _ = seats.open_at_set(Some(epoch)).await;
+            }
+        }
+        Ok(None) => {
+            let _ = seats.open_at_set(None).await;
+        }
+        Err(_) => {}
     }
     if let Ok(locked) = db.registration_locked().await {
         let _ = seats.locked_set(locked).await;
