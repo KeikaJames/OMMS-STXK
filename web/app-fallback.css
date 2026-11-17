@@ -102,6 +102,10 @@ a:focus, button:focus, input:focus, select:focus, textarea:focus, [tabindex]:foc
 .list small { color: #776F62; }
 .secret-box { background: #E2EAEE; }
 .secret-box small { color: #776F62; }
+.present { background: #F4EFE6; color: #1F1D1A; }
+.present-label { color: #776F62; }
+.present-more { color: #4A453D; }
+.present-hint { color: #776F62; }
 @media (max-width: 900px) {
   .sidebar { border-bottom: 1px solid #E1D8C8; }
 }

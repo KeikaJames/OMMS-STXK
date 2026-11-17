@@ -29,6 +29,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import netinfo  # noqa: E402
 import sheets as tables  # noqa: E402
 
 # ---- 可选重依赖(有 fallback 不致命) -------------------------------------
@@ -2236,6 +2237,7 @@ GET_ROUTES = {
     "/api/export_workbook": ("_h_export_workbook", ROLE_ADMIN),
     "/api/admin/backup": ("_h_backup", ROLE_ADMIN),
     "/api/admin/backups": ("_h_backups", ROLE_ADMIN),
+    "/api/admin/addresses": ("_h_addresses", ROLE_ADMIN),
     "/api/admin/preflight_plan": ("_h_preflight_plan", ROLE_ADMIN),
 }
 POST_ROUTES = {
@@ -4510,6 +4512,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                           "time": datetime.strptime(stamp, "%Y%m%d-%H%M%S").strftime(TIME_FORMAT)})
         self._json(200, {"success": True, "backups": items, "keep": BACKUP_KEEP, "directory": BACKUP_DIR},
                    extra=[("Cache-Control", "no-store")])
+
+    def _h_addresses(self, sess):
+        """本机各网卡的局域网地址，控制台据此显示学生访问地址；端口与协议由浏览器按当前页面补全。"""
+        items = [{"address": item["address"], "label": item["label"]} for item in netinfo.lan_addresses()]
+        self._json(200, {"success": True, "addresses": items}, extra=[("Cache-Control", "no-store")])
 
     def _h_import_students(self, sess, data):
         students = data.get("students", [])
