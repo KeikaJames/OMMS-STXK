@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUST_BIN = REPO_ROOT / "club-hot" / "target" / "release" / "club-hot"
 FORBIDDEN_REDIS_PORT = 6379
 CLUB_ID = 1
+PREFIX = "omms:"
 SESSION_TTL_SECONDS = 3600
 
 
@@ -134,8 +135,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--reservation-ttl",
         type=positive_int,
-        default=60,
-        help="RESV_TTL supplied to club-hot",
+        default=30,
+        help="SEAT_OP_TTL supplied to club-hot",
     )
     return parser.parse_args(argv)
 
@@ -327,6 +328,7 @@ def seed_sessions(port: int, users: int) -> dict[int, str]:
                 "student_id": student_id,
                 "name": f"student-{student_id}",
                 "class": "stress-class",
+                "grade": "",
                 "student_no": f"S{student_id:08d}",
                 "_session_epoch": 0,
                 "_session_version": 1,
@@ -334,8 +336,8 @@ def seed_sessions(port: int, users: int) -> dict[int, str]:
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        commands.append(("SET", f"sess:version:student:{student_id}", "1"))
-        commands.append(("SET", f"sess:{token}", payload, "EX", SESSION_TTL_SECONDS))
+        commands.append(("SET", f"{PREFIX}sessgen:ver:student:{student_id}", "1"))
+        commands.append(("SET", f"{PREFIX}sess:{token}", payload, "EX", SESSION_TTL_SECONDS))
         if len(commands) >= 1000:
             replies = redis_pipeline(port, commands)
             if any(reply != "OK" for reply in replies):
@@ -549,16 +551,20 @@ def read_database_state(path: Path) -> DatabaseState:
 
 
 def read_redis_state(port: int, users: int) -> RedisState:
-    commands: list[Sequence[object]] = [("GET", f"stock:club:{CLUB_ID}")]
-    commands.extend(("GET", f"student:reg:{sid}") for sid in range(1, users + 1))
-    commands.extend(("GET", f"resv:{sid}") for sid in range(1, users + 1))
-    commands.extend(("GET", f"seat:op:{sid}") for sid in range(1, users + 1))
+    commands: list[Sequence[object]] = [("GET", f"{PREFIX}stock:{CLUB_ID}")]
+    commands.extend(("GET", f"{PREFIX}reg:{sid}") for sid in range(1, users + 1))
+    commands.extend(("GET", f"{PREFIX}op:{sid}") for sid in range(1, users + 1))
+    commands.append(("SMEMBERS", f"{PREFIX}inflight:{CLUB_ID}"))
     replies = redis_pipeline(port, commands)
     stock_raw = replies[0]
     stock = int(stock_raw) if stock_raw is not None else None
     stureg_replies = replies[1 : users + 1]
-    resv_replies = replies[users + 1 : 2 * users + 1]
-    operation_replies = replies[2 * users + 1 :]
+    operation_replies = replies[users + 1 : 2 * users + 1]
+    resv_replies = [None] * users
+    for member in replies[-1] or []:
+        sid_text, _, lease = str(member).partition("|")
+        if sid_text.isdigit() and 1 <= int(sid_text) <= users:
+            resv_replies[int(sid_text) - 1] = lease
     stureg = {
         sid: str(value)
         for sid, value in enumerate(stureg_replies, start=1)
@@ -625,7 +631,7 @@ def classify_attempts(
         payload = attempt.payload
         if isinstance(payload, dict) and payload.get("success") is True:
             successes.append(attempt)
-        elif isinstance(payload, dict) and "满员" in str(payload.get("message", "")):
+        elif isinstance(payload, dict) and payload.get("code") == "full":
             full.append(attempt)
         else:
             other_business.append(attempt)
@@ -734,9 +740,9 @@ def validate_and_report(
             f"success_ids={len(success_ids)}, db_students={len(db.registered_student_ids)}",
         ),
         (
-            "no in-flight reservation remains after all responses",
+            "no in-flight member remains after all responses",
             not redis.reservations,
-            f"resv={len(redis.reservations)}",
+            f"inflight={len(redis.reservations)}",
         ),
         (
             "no student operation lease remains after all responses",
@@ -788,7 +794,7 @@ def validate_and_report(
         "state: "
         f"db_count={db.registrations} current_students={db.current_students} "
         f"redis_stock={redis.stock} stureg={len(redis.stureg)} "
-        f"resv={len(redis.reservations)} seat_ops={len(redis.operations)}"
+        f"inflight={len(redis.reservations)} seat_ops={len(redis.operations)}"
     )
     print("invariants:")
     for name, passed, detail in checks:
@@ -885,7 +891,7 @@ def run(args: argparse.Namespace) -> int:
                         "DB_PATH": str(db_path),
                         "REDIS_URL": f"redis://127.0.0.1:{redis_port}/0",
                         "SESSION_TTL": str(SESSION_TTL_SECONDS),
-                        "RESV_TTL": str(args.reservation_ttl),
+                        "SEAT_OP_TTL": str(args.reservation_ttl),
                         "DB_POOL_SIZE": "12",
                         "MAX_CONCURRENCY": str(args.server_max_concurrency),
                         "REQUEST_TIMEOUT_SECS": str(args.server_request_timeout),

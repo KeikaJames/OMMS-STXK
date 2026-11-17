@@ -34,6 +34,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MAIN_PY = REPO_ROOT / "main.py"
 FORBIDDEN_REDIS_PORT = 6379
 CLUB_ID = 1
+PREFIX = "omms:"
+
+
+def key(*parts: object) -> str:
+    return PREFIX + ":".join(str(part) for part in parts)
 
 
 class RedisProtocolError(RuntimeError):
@@ -184,6 +189,8 @@ class PythonRaceRegressionTests(unittest.TestCase):
                     "RESV_TTL": "60",
                     "WEB_DIR": str(REPO_ROOT / "web"),
                     "LOG_LEVEL": "WARNING",
+                    "TZ": "UTC",
+                    "SEAT_OP_TTL": "5",
                 }
             )
             cls.app_process = subprocess.Popen(
@@ -451,14 +458,14 @@ class PythonRaceRegressionTests(unittest.TestCase):
         }
         commands: list[Sequence[object]] = [
             ("FLUSHDB",),
-            ("SET", "seats:initialized", "1"),
-            ("SET", "open_at", "0"),
-            ("SET", "sess:epoch:student", "0"),
-            ("SET", f"stock:club:{CLUB_ID}", redis_stock),
+            ("SET", key("init"), "1"),
+            ("SET", key("open_at"), "0"),
+            ("SET", key("sessgen", "epoch", "student"), "0"),
+            ("SET", key("stock", CLUB_ID), redis_stock),
         ]
         if existing_registration:
             commands.append(
-                ("SET", "student:reg:1", f"{CLUB_ID}|{operation_id}")
+                ("SET", key("reg", 1), f"{CLUB_ID}|{operation_id}")
             )
         for student_id, token in sessions.items():
             session = json.dumps(
@@ -474,8 +481,8 @@ class PythonRaceRegressionTests(unittest.TestCase):
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-            commands.append(("SET", f"sess:version:student:{student_id}", "1"))
-            commands.append(("SET", f"sess:{token}", session, "EX", 3600))
+            commands.append(("SET", key("sessgen", "ver", "student", student_id), "1"))
+            commands.append(("SET", key("sess", token), session, "EX", 3600))
         replies = redis_pipeline(self.redis_port, commands)
         self.assertEqual("OK", replies[1])
         self.assertEqual("OK", replies[2])
@@ -515,6 +522,98 @@ class PythonRaceRegressionTests(unittest.TestCase):
             futures = [executor.submit(worker, index) for index in range(requests)]
             return [future.result(timeout=30.0) for future in futures]
 
+    def test_same_request_id_is_idempotent(self) -> None:
+        sessions = self._seed_scenario(users=1, capacity=2, redis_stock=2)
+        body = {"club_id": CLUB_ID, "request_id": "retry-request-0001"}
+        first = self._request_json("POST", "/api/register_club", token=sessions[1], body=body)
+        second = self._request_json("POST", "/api/register_club", token=sessions[1], body=body)
+        self.assertEqual((200, True, "registered"), (first[0], first[1]["success"], first[1]["code"]))
+        self.assertEqual((200, True, "registered"), (second[0], second[1]["success"], second[1]["code"]))
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            rows = conn.execute("SELECT operation_id FROM registrations").fetchall()
+        self.assertEqual([("1-retry-request-0001",)], rows)
+        self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 1)))
+
+    def test_orphaned_lease_is_repaired_for_its_club_only(self) -> None:
+        sessions = self._seed_scenario(users=2, capacity=1, redis_stock=0)
+        lease = "1|9-orphan|n0"
+        redis_pipeline(self.redis_port, [
+            ("SET", key("op", 2), lease, "EX", 1),
+            ("SADD", key("inflight", 1), f"2|{lease}"),
+        ])
+        status, payload = self._request_json("POST", "/api/register_club", token=sessions[1],
+                                             body={"club_id": CLUB_ID})
+        self.assertEqual("full", payload["code"])
+        time.sleep(1.2)
+        self.assertEqual(503, self._request_json("GET", "/readyz")[0])
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and redis_command(self.redis_port, "GET", key("stock", 1)) != "1":
+            time.sleep(0.05)
+        self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 1)))
+        self.assertEqual(0, redis_command(self.redis_port, "SCARD", key("inflight", 1)))
+        status, payload = self._request_json("POST", "/api/register_club", token=sessions[1],
+                                             body={"club_id": CLUB_ID})
+        self.assertEqual((200, True), (status, payload["success"]))
+
+    def test_stale_registration_mirror_is_cleared_on_registration(self) -> None:
+        sessions = self._seed_scenario(users=1, capacity=1, redis_stock=1)
+        redis_command(self.redis_port, "SET", key("reg", 1), "1|left-over")
+        status, payload = self._request_json("POST", "/api/register_club", token=sessions[1],
+                                             body={"club_id": CLUB_ID})
+        self.assertEqual((200, True), (status, payload["success"]))
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            operation_id = conn.execute("SELECT operation_id FROM registrations").fetchone()[0]
+        self.assertEqual(f"1|{operation_id}", redis_command(self.redis_port, "GET", key("reg", 1)))
+
+    def test_trusted_device_logs_in_while_others_are_throttled(self) -> None:
+        self._seed_scenario(users=1, capacity=1, redis_stock=1)
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE students SET password='device-password' WHERE id=1")
+            conn.commit()
+        status, _payload, headers = self._request_json_with_headers(
+            "POST", "/api/login", body={"username": "race1", "password": "device-password"})
+        self.assertEqual(200, status)
+        conn = http.client.HTTPConnection("127.0.0.1", self.http_port, timeout=10)
+        conn.request("POST", "/api/login", body=json.dumps({"username": "race1", "password": "device-password"}),
+                     headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        response.read()
+        device = next(value.split(";", 1)[0] for name, value in response.getheaders()
+                      if name.lower() == "set-cookie" and value.startswith("device="))
+        conn.close()
+        for _ in range(12):
+            self._request_json("POST", "/api/login", body={"username": "race1", "password": "wrong"})
+        throttled = self._request_json("POST", "/api/login",
+                                       body={"username": "race1", "password": "device-password"})
+        self.assertEqual(429, throttled[0])
+        trusted = self._request_json("POST", "/api/login", cookie_header=device,
+                                     body={"username": "race1", "password": "device-password"})
+        self.assertEqual(200, trusted[0], trusted)
+
+    def test_seat_snapshot_supports_conditional_requests(self) -> None:
+        self._seed_scenario(users=1, capacity=3, redis_stock=3)
+        status, payload, headers = self._request_json_with_headers("GET", "/api/seats")
+        self.assertEqual(200, status)
+        self.assertEqual([[CLUB_ID, 3]], payload["seats"])
+        conn = http.client.HTTPConnection("127.0.0.1", self.http_port, timeout=10)
+        conn.request("GET", "/api/seats", headers={"If-None-Match": headers["etag"]})
+        response = conn.getresponse()
+        self.assertEqual(304, response.status)
+        self.assertEqual(b"", response.read())
+        conn.close()
+
+    def test_school_time_is_independent_of_the_host_timezone(self) -> None:
+        self._seed_scenario(users=1, capacity=1, redis_stock=1)
+        admin_token = self._admin_token()
+        status, payload = self._request_json("POST", "/api/update_registration_time", token=admin_token,
+                                             body={"start_time": "2030-01-01 08:00:00"})
+        self.assertEqual(200, status, payload)
+        status, payload = self._request_json("GET", "/api/check_registration_time")
+        self.assertEqual(1893456000000, payload["open_at"])
+        self.assertEqual("2030-01-01 08:00:00", payload["start_time"])
+        self._request_json("POST", "/api/update_registration_time", token=admin_token,
+                           body={"start_time": "2000-01-01 00:00:00"})
+
     def test_one_hundred_concurrent_cancels_release_exactly_once(self) -> None:
         sessions = self._seed_scenario(
             users=1,
@@ -536,7 +635,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
             and payload.get("success") is True
         ]
 
-        self.assertTrue(all(status == 200 for status, _payload in responses), responses)
+        self.assertTrue(all(status in (200, 202) for status, _payload in responses), responses)
         self.assertEqual(1, len(successes), responses)
         with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             registration_count = conn.execute(
@@ -547,10 +646,10 @@ class PythonRaceRegressionTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(0, registration_count)
         self.assertEqual(0, current_students)
-        self.assertEqual("1", redis_command(self.redis_port, "GET", "stock:club:1"))
-        self.assertIsNone(redis_command(self.redis_port, "GET", "student:reg:1"))
-        self.assertIsNone(redis_command(self.redis_port, "GET", "resv:1"))
-        self.assertIsNone(redis_command(self.redis_port, "GET", "seat:op:1"))
+        self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 1)))
+        self.assertIsNone(redis_command(self.redis_port, "GET", key("reg", 1)))
+        self.assertEqual(0, redis_command(self.redis_port, "SCARD", key("inflight", 1)))
+        self.assertIsNone(redis_command(self.redis_port, "GET", key("op", 1)))
 
     def test_sqlite_capacity_trigger_stops_inflated_redis_stock(self) -> None:
         capacity = 3
@@ -598,16 +697,16 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertEqual(registration_count, current_students)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            if redis_command(self.redis_port, "GET", "stock:club:1") == "0":
+            if redis_command(self.redis_port, "GET", key("stock", 1)) == "0":
                 break
             time.sleep(0.05)
-        self.assertEqual("0", redis_command(self.redis_port, "GET", "stock:club:1"))
+        self.assertEqual("0", redis_command(self.redis_port, "GET", key("stock", 1)))
         for student_id in range(1, users + 1):
             self.assertIsNone(
-                redis_command(self.redis_port, "GET", f"resv:{student_id}")
+                redis_command(self.redis_port, "GET", key("op", student_id))
             )
             self.assertIsNone(
-                redis_command(self.redis_port, "GET", f"seat:op:{student_id}")
+                redis_command(self.redis_port, "GET", key("op", student_id))
             )
 
     def test_understock_readiness_triggers_safe_reconciliation(self) -> None:
@@ -615,14 +714,14 @@ class PythonRaceRegressionTests(unittest.TestCase):
         status, payload = self._request_json("GET", "/readyz")
         self.assertEqual(503, status)
         self.assertIsInstance(payload, dict)
-        self.assertEqual("stock-drift", payload.get("reason"))
+        self.assertEqual("repairing", payload.get("reason"))
 
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            if redis_command(self.redis_port, "GET", "stock:club:1") == "3":
+            if redis_command(self.redis_port, "GET", key("stock", 1)) == "3":
                 break
             time.sleep(0.05)
-        self.assertEqual("3", redis_command(self.redis_port, "GET", "stock:club:1"))
+        self.assertEqual("3", redis_command(self.redis_port, "GET", key("stock", 1)))
         status, payload = self._request_json("GET", "/readyz")
         self.assertEqual(200, status)
         self.assertEqual("ready", payload.get("status"))
@@ -648,11 +747,11 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertTrue(operation_id)
         self.assertEqual(
             f"{club_id}|{operation_id}",
-            redis_command(self.redis_port, "GET", "student:reg:1"),
+            redis_command(self.redis_port, "GET", key("reg", 1)),
         )
-        self.assertIsNone(redis_command(self.redis_port, "GET", "resv:1"))
-        self.assertIsNone(redis_command(self.redis_port, "GET", "seat:op:1"))
-        self.assertEqual("0", redis_command(self.redis_port, "GET", "stock:club:1"))
+        self.assertEqual(0, redis_command(self.redis_port, "SCARD", key("inflight", 1)))
+        self.assertIsNone(redis_command(self.redis_port, "GET", key("op", 1)))
+        self.assertEqual("0", redis_command(self.redis_port, "GET", key("stock", 1)))
 
         retry_status, retry_payload = self._request_json(
             "POST",
@@ -665,7 +764,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertTrue(retry_payload.get("success"), retry_payload)
         with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM registrations").fetchone()[0])
-        self.assertEqual("0", redis_command(self.redis_port, "GET", "stock:club:1"))
+        self.assertEqual("0", redis_command(self.redis_port, "GET", key("stock", 1)))
 
     def test_early_post_responses_cannot_desynchronize_keep_alive_connection(self) -> None:
         """F1: all 401/403/404 POST paths drain before a second request."""
@@ -773,7 +872,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
             "POST", "/api/delete_student", token=admin_token, body={"student_id": 1}
         )
         self.assertEqual(200, deleted_status, deleted_payload)
-        self.assertEqual("1", redis_command(self.redis_port, "GET", "stock:club:1"))
+        self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 1)))
         for method, path, body in [
             ("GET", "/api/get_student_info", None),
             ("POST", "/api/register_club", {"club_id": 1}),
@@ -782,9 +881,9 @@ class PythonRaceRegressionTests(unittest.TestCase):
         ]:
             status, _payload = self._request_json(method, path, token=student_token, body=body)
             self.assertEqual(401, status, (method, path, status))
-        self.assertEqual("1", redis_command(self.redis_port, "GET", "stock:club:1"))
-        self.assertIsNone(redis_command(self.redis_port, "GET", "resv:1"))
-        self.assertIsNone(redis_command(self.redis_port, "GET", "seat:op:1"))
+        self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 1)))
+        self.assertEqual(0, redis_command(self.redis_port, "SCARD", key("inflight", 1)))
+        self.assertIsNone(redis_command(self.redis_port, "GET", key("op", 1)))
 
     def test_import_clubs_rejects_huge_and_boolean_capacities_per_row(self) -> None:
         """F7: one malformed capacity cannot roll back valid club imports."""
@@ -877,8 +976,8 @@ class PythonRaceRegressionTests(unittest.TestCase):
             },
         )
         self.assertEqual(200, status, payload)
-        self.assertEqual("incrby", payload.get("seat_sync"))
-        self.assertEqual("3", redis_command(self.redis_port, "GET", "stock:club:1"))
+        self.assertEqual("published", payload.get("seat_sync"))
+        self.assertEqual("3", redis_command(self.redis_port, "GET", key("stock", 1)))
         status, clubs = self._request_json("GET", "/api/get_clubs")
         self.assertEqual(200, status)
         self.assertEqual("动手搭建机器人", clubs[0]["description"])
@@ -887,7 +986,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
             "POST", "/api/register_club", token=sessions[2], body={"club_id": 1}
         )
         self.assertEqual(200, rejected_status)
-        self.assertEqual("不符合年级限制", rejected.get("message"))
+        self.assertEqual("ineligible_grade", rejected.get("code"))
         accepted_status, accepted = self._request_json(
             "POST", "/api/register_club", token=sessions[1], body={"club_id": 1}
         )
@@ -916,27 +1015,27 @@ class PythonRaceRegressionTests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute("INSERT INTO clubs (id,name,max_students,current_students) VALUES (2,'second-club',2,0)")
             conn.commit()
-        redis_command(self.redis_port, "SET", "stock:club:2", "2")
+        redis_command(self.redis_port, "SET", key("stock", 2), "2")
         admin_token = self._admin_token()
         assign_status, assigned = self._request_json(
             "POST", "/api/admin/assign_registration", token=admin_token,
             body={"student_id": 1, "club_id": 1, "request_id": "assign-0001", "reason": "线下确认"},
         )
         self.assertEqual(200, assign_status, assigned)
-        self.assertEqual("1", redis_command(self.redis_port, "GET", "stock:club:1"))
+        self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 1)))
         transfer_status, transferred = self._request_json(
             "POST", "/api/admin/transfer_registration", token=admin_token,
             body={"student_id": 1, "club_id": 2, "request_id": "transfer-0001", "reason": "调剂到第二社团"},
         )
         self.assertEqual(200, transfer_status, transferred)
-        self.assertEqual("2", redis_command(self.redis_port, "GET", "stock:club:1"))
-        self.assertEqual("1", redis_command(self.redis_port, "GET", "stock:club:2"))
+        self.assertEqual("2", redis_command(self.redis_port, "GET", key("stock", 1)))
+        self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 2)))
         remove_status, removed = self._request_json(
             "POST", "/api/admin/remove_registration", token=admin_token,
             body={"student_id": 1, "request_id": "remove-0001", "reason": "学生退出"},
         )
         self.assertEqual(200, remove_status, removed)
-        self.assertEqual("2", redis_command(self.redis_port, "GET", "stock:club:2"))
+        self.assertEqual("2", redis_command(self.redis_port, "GET", key("stock", 2)))
         audit_status, audit = self._request_json("GET", "/api/admin/audit_events", token=admin_token)
         self.assertEqual(200, audit_status)
         actions = {event["action"] for event in audit["events"]}

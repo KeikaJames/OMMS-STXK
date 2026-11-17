@@ -1,18 +1,15 @@
-//! Unified error type that converts into HTTP responses.
+//! 统一错误类型，转换为带 code 的 HTTP 响应。
 
-use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
+
+use crate::messages;
 
 #[derive(Debug)]
 pub enum AppError {
-    /// Redis is unreachable. Write endpoints MUST reject (503) rather than fall
-    /// back to an unlocked SQLite path (that would reintroduce oversell).
+    /// Redis 不可达；写路径返回 503。
     RedisDown,
-    /// SQLite pool / query failure (500).
     Db(String),
-    /// Generic internal error (500).
     Internal(String),
 }
 
@@ -30,30 +27,16 @@ impl std::error::Error for AppError {}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match &self {
-            AppError::RedisDown => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "服务暂时不可用，请稍后重试".to_string(),
-            ),
-            AppError::Db(m) => {
-                tracing::error!(error = %m, "db error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "服务器错误".to_string())
+        match &self {
+            AppError::RedisDown => messages::fail(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            AppError::Db(m) | AppError::Internal(m) => {
+                tracing::error!(error = %m, "request failed");
+                messages::fail(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
             }
-            AppError::Internal(m) => {
-                tracing::error!(error = %m, "internal error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "服务器错误".to_string())
-            }
-        };
-        (
-            status,
-            Json(json!({ "success": false, "message": message })),
-        )
-            .into_response()
+        }
     }
 }
 
-/// Convenience: any deadpool/redis/rusqlite error -> AppError::Internal at call
-/// sites that don't need finer granularity.
 impl From<deadpool_sqlite::PoolError> for AppError {
     fn from(e: deadpool_sqlite::PoolError) -> Self {
         AppError::Db(format!("sqlite pool: {e}"))
