@@ -263,21 +263,16 @@ class MaintenanceTests(unittest.TestCase):
         status, body = app.register(3)
         self.assertTrue(body.get("success"), body)
 
-    def test_full_backup_downloads_and_restores_database_and_photos(self) -> None:
+    def test_full_backup_downloads_and_restores_the_database(self) -> None:
         app = self.instance
         app.register(1)
-        image_dir = app.workdir / "club-images"
-        image_dir.mkdir(exist_ok=True)
-        photo = "1-" + "a" * 32 + ".jpg"
-        (image_dir / photo).write_bytes(b"photo-bytes")
-        app.sql("UPDATE clubs SET image_path=?", ("/club-images/" + photo,))
 
         status, headers, raw = request(app.http_port, "GET", "/api/admin/backup", token=self.admin)
         self.assertEqual(200, status)
         self.assertEqual("application/zip", headers["content-type"])
         self.assertIn("filename*=UTF-8''", headers["content-disposition"])
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            self.assertEqual(["club_system.db", "club-images/" + photo], archive.namelist())
+            self.assertEqual(["club_system.db"], archive.namelist())
         backup_file = app.workdir / "full.zip"
         backup_file.write_bytes(raw)
 
@@ -295,13 +290,11 @@ class MaintenanceTests(unittest.TestCase):
         app.stop()
         app.sql("DELETE FROM registrations")
         app.sql("DELETE FROM students")
-        (image_dir / photo).unlink()
         app.client.set(key("sess", "stale-session"), "{}")
         result = app.cli("restore", str(backup_file))
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertIn("已恢复：学生 3 名，社团 1 个，报名 1 条，照片 1 张。", result.stdout)
+        self.assertIn("已恢复：学生 3 名，社团 1 个，报名 1 条。", result.stdout)
         self.assertEqual((3, 1, 1), counts(app.db_path))
-        self.assertEqual(b"photo-bytes", (image_dir / photo).read_bytes())
         self.assertIsNone(app.client.get(key("sess", "stale-session")))
         before = [name for name in os.listdir(app.backups) if name.endswith("-before-restore.db")]
         self.assertEqual(1, len(before))

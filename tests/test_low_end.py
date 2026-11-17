@@ -144,7 +144,7 @@ class AccessLogTests(unittest.TestCase):
 
 
 class FootprintTests(unittest.TestCase):
-    def test_import_defers_pinyin_and_imaging_libraries(self) -> None:
+    def test_import_loads_neither_pinyin_nor_imaging_libraries(self) -> None:
         env = os.environ.copy()
         env.update(ISOLATED_ENV)
         probe = (
