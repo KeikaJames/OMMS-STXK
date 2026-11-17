@@ -9,11 +9,11 @@
 <meta name="theme-color" content="#F4EFE6">
 <title>管理控制台 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=22">
+<link rel="stylesheet" href="/app.css?v=23">
 <script src="/js/legacy.js?v=18" defer></script>
 <script src="/js/common.js?v=18" defer></script>
 <script src="/js/club-art.js?v=2" defer></script>
-<script src="/js/admin.js?v=26" defer></script>
+<script src="/js/admin.js?v=27" defer></script>
 </head>
 <body>
 <div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
@@ -53,16 +53,9 @@
         </div>
         <img src="/img/admin-desk.webp" alt="" width="960" height="540" decoding="async">
       </article>
-      <article class="card home-card">
-        <h2>导入学生</h2>
-        <p class="hint">从 Excel 粘贴姓名、班级、学号，生成登录账号。</p>
-        <button class="btn btn-primary btn-sm" type="button" data-home-route="students:students-import">开始导入</button>
-      </article>
-      <article class="card home-card">
-        <h2>学生账号</h2>
-        <p class="big num" id="home-account-total">—</p>
-        <p class="hint" id="home-account-count">暂无学生账号</p>
-        <button class="btn btn-secondary btn-sm" type="button" data-home-route="students:students-accounts">账号发放</button>
+      <article class="card home-flow">
+        <h2>流程</h2>
+        <ol class="flow" id="home-flow"><li class="todo"><span class="mark" aria-hidden="true">1</span><div><b>读取中</b></div></li></ol>
       </article>
       <article class="card home-card">
         <h2>报名进度</h2>

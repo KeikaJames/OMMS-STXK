@@ -9,6 +9,27 @@
   const error = $('#login-error');
   const wait = $('#login-wait');
 
+  // 开放与截止时间按学校时区的原始文本显示，与设备时区无关。
+  function schoolTime(text) {
+    const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(text || '');
+    return match ? Number(match[2]) + ' 月 ' + Number(match[3]) + ' 日 ' + match[4] + ':' + match[5] : '';
+  }
+
+  async function showSchedule() {
+    const result = await App.request('/api/check_registration_time');
+    const data = result.data;
+    if (!result.ok || !data) return;
+    const until = data.end_time ? '，截止 ' + schoolTime(data.end_time) : '';
+    let text = '报名开放时间待定';
+    if (data.registration_locked) text = '报名已截止';
+    else if (data.can_register) text = '报名中' + until;
+    else if (data.start_time) text = '报名开放 ' + schoolTime(data.start_time) + until;
+    const line = $('#login-schedule');
+    line.textContent = text;
+    line.hidden = false;
+  }
+  showSchedule();
+
   $$('.seg button').forEach(button => {
     button.addEventListener('click', () => {
       role = button.dataset.role;

@@ -390,6 +390,26 @@ class MaintenanceTests(unittest.TestCase):
         status, again = app.post(self.admin, path, body)
         self.assertEqual((200, True, []), (status, again.get("replayed"), again.get("credentials")))
 
+    def test_summary_tracks_capacity_exports_and_backups(self) -> None:
+        app = self.instance
+        status, summary = request_json(app.http_port, "GET", "/api/admin/summary", token=self.admin)
+        self.assertEqual(200, status)
+        self.assertEqual((3, 0, 1, 5), (summary["students"], summary["registered"], summary["clubs"], summary["capacity"]))
+        self.assertEqual((None, None), (summary["last_export"], summary["last_backup"]))
+        app.register(1)
+        for path in ("/api/export_workbook", "/api/admin/backup"):
+            status, _headers, _raw = request(app.http_port, "GET", path, token=self.admin)
+            self.assertEqual(200, status, path)
+        status, summary = request_json(app.http_port, "GET", "/api/admin/summary", token=self.admin)
+        self.assertGreaterEqual(summary["last_export"], summary["last_change"])
+        self.assertGreaterEqual(summary["last_backup"], summary["last_change"])
+        time.sleep(0.01)
+        app.register(2)
+        status, summary = request_json(app.http_port, "GET", "/api/admin/summary", token=self.admin)
+        self.assertGreater(summary["last_change"], summary["last_export"])
+        self.assertEqual([("registrations.exported",), ("backup.downloaded",)], app.sql(
+            "SELECT action FROM audit_events WHERE action IN ('registrations.exported', 'backup.downloaded') ORDER BY id"))
+
     def test_reset_admin_password_from_the_command_line(self) -> None:
         app = self.instance
         result = app.cli("reset-admin-password")

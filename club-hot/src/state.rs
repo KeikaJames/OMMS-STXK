@@ -71,7 +71,9 @@ impl Config {
             "OFF" | "NORMAL" | "FULL" | "EXTRA" => synchronous,
             _ => "NORMAL".to_string(),
         };
-        let auth_concurrency = env_parse("AUTH_CONCURRENCY", cores.min(4)).max(1);
+        // 口令校验线程：核数的一半，不少于 4、不多于 8，核数更少时取核数。
+        let auth_concurrency =
+            env_parse("AUTH_CONCURRENCY", cores.min(8).min((cores / 2).max(4))).max(1);
         Config {
             bind: env_or("BIND", "127.0.0.1:2002"),
             db_path: env_or("DB_PATH", "club_system.db"),
