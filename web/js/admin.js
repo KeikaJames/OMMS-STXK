@@ -461,7 +461,7 @@
     if (event.action === 'registration.admin_assigned') parts.push('报名 ' + clubLabel(after.club_id));
     if (event.action === 'registration.admin_removed') parts.push('从 ' + clubLabel(before.club_id) + ' 移出');
     if (event.action === 'registration.admin_transferred') parts.push(clubLabel(before.club_id) + ' → ' + clubLabel(after.club_id));
-    if (event.action === 'registration.start_time_updated') parts.push(after.start_time || '');
+    if (event.action === 'registration.start_time_updated') parts.push(after.start_time || '清除');
     if (event.action === 'registration.lock_updated') parts.push(after.locked ? '锁定' : '解除锁定');
     if (event.action === 'registrations.adjusted') {
       parts.push('安排 ' + after.assigned + ' 人' + (after.unassigned ? '，' + after.unassigned + ' 人无可用名额' : ''));
@@ -1008,7 +1008,8 @@
   async function loadSettings() {
     const result = await App.request('/api/check_registration_time');
     if (!result.data) return;
-    if (result.data.start_time) $('#open-at').value = result.data.start_time.slice(0, 16).replace(' ', 'T');
+    $('#open-at').value = result.data.start_time ? result.data.start_time.slice(0, 16).replace(' ', 'T') : '';
+    $('#clear-time').hidden = !result.data.start_time;
     locked = Boolean(result.data.registration_locked);
     $('#lock-state').textContent = locked ? '名单已锁定，报名与退选已停止。未报名的学生在“报名数据 → 调剂”中安排。' : '名单未锁定。';
     $('#toggle-lock').textContent = locked ? '解除锁定' : '锁定名单';
@@ -1019,8 +1020,17 @@
     if (!value) { App.toast('请选择开放时间', 'err'); return; }
     const result = await App.request('/api/update_registration_time', { method: 'POST', body: { start_time: value.replace('T', ' ') + ':00' } });
     App.toast(ok(result) ? '开放时间已保存' : message(result, '保存失败'), ok(result) ? 'ok' : 'err');
+    loadSettings();
     loadOverview();
   });
+
+  $('#clear-time').addEventListener('click', () => confirmInline($('#clear-time'), async () => {
+    const result = await adminRetry('/api/update_registration_time', { start_time: '' });
+    if (!ok(result)) throw new Error(message(result, '清除失败'));
+    App.toast('开放时间已清除', 'ok');
+    await loadSettings();
+    loadOverview();
+  }));
 
   $('#toggle-lock').addEventListener('click', async () => {
     const reason = $('#lock-reason').value.trim();

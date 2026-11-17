@@ -13,7 +13,7 @@
 <script src="/js/legacy.js?v=18" defer></script>
 <script src="/js/common.js?v=18" defer></script>
 <script src="/js/club-art.js?v=1" defer></script>
-<script src="/js/admin.js?v=21" defer></script>
+<script src="/js/admin.js?v=22" defer></script>
 </head>
 <body>
 <div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
@@ -168,9 +168,9 @@
 
   <section data-view="settings" id="view-settings" hidden>
     <article class="card" data-pane="settings-registration">
-      <div class="pane-head"><h2>开放时间与名单锁定</h2><p>到开放时间后开放报名；锁定后报名与退选停止。</p></div>
+      <div class="pane-head"><h2>开放时间与名单锁定</h2><p>到开放时间后开放报名；未设置开放时间时，学生页显示“开放时间待定”。锁定后报名与退选停止。</p></div>
       <div class="field"><label for="open-at">开放时间（学校时间）</label><input class="input" id="open-at" type="datetime-local"></div>
-      <div class="actions"><button class="btn btn-primary" id="save-time" type="button">保存开放时间</button></div>
+      <div class="actions"><button class="btn btn-primary" id="save-time" type="button">保存开放时间</button><button class="btn btn-quiet" id="clear-time" type="button" hidden>清除开放时间</button></div>
       <hr>
       <p class="hint" id="lock-state">读取中</p>
       <div class="field"><label for="lock-reason">原因（记入操作记录）</label><input class="input" id="lock-reason" maxlength="200" placeholder="例如：报名截止"></div>
