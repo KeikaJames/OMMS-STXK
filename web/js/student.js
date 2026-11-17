@@ -271,7 +271,7 @@
     const restriction = eligibility(club);
     const next = actionFor(club, left, restriction, mine);
     const signature = [club.name, club.location, club.meeting_time, club.advisor_name, club.description,
-      club.image_path, club.max_students, (club.allowed_grades || []).join(','), (club.allowed_classes || []).length,
+      club.max_students, (club.allowed_grades || []).join(','), (club.allowed_classes || []).length,
       left, mine, restriction, next.key, state.expanded.has(club.id)].join('|');
     if (card.dataset.signature === signature) return;
     card.dataset.signature = signature;

@@ -14,7 +14,7 @@
 
 **后端**
 
-- Python 服务使用标准库与内联 SQL。`pypinyin`、`Pillow` 为可选依赖，代码保留降级路径。
+- Python 服务使用标准库与内联 SQL。`pypinyin` 为可选依赖，代码保留降级路径。
 - Rust 服务通过 `cargo fmt` 与 `cargo clippy -- -D warnings`。
 - 4 空格缩进，`snake_case`。注释精简，说明原因。
 

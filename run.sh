@@ -150,7 +150,7 @@ if ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 7))' 2>/dev/null;
     exit 1
 fi
 if ! "$PYTHON" -c 'import redis, argon2' 2>/dev/null; then
-    say "[python] 缺少依赖，请先运行：$PYTHON -m pip install redis argon2-cffi pypinyin Pillow"
+    say "[python] 缺少依赖，请先运行：$PYTHON -m pip install redis argon2-cffi pypinyin"
     exit 1
 fi
 

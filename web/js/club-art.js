@@ -1,6 +1,6 @@
 'use strict';
 
-// 社团卡片默认插图：管理员没有上传照片时按社团名称选用，线条跟随文字颜色。
+// 社团卡片插图：按社团名称选用，线条跟随文字颜色。
 const ClubArt = (() => {
   const art = {
     "print": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 240 150\" preserveAspectRatio=\"xMidYMid slice\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M68 128 L172 128 L168 120 L72 120 Z\"/><path d=\"M80 120 L80.6 27\"/><path d=\"M160 120 L159.4 27\"/><path d=\"M73 26.5 C 100 25.6, 140 25.6, 167 26.5\"/><path d=\"M80 54 L160 53.4\"/><path d=\"M110 45 H130 V61 H110 Z\"/><path d=\"M116 61 L124 61 L120 68 Z\" fill=\"currentColor\"/><path d=\"M88 106 C 108 105.4, 132 105.4, 152 106\"/><path d=\"M92 110.5 H148\"/><path d=\"M108.5 105.5 C 106 98, 104.5 92, 110.5 85.5 L129.5 85.5 C 135.5 92, 134 98, 131.5 105.5\"/><path d=\"M107 99 H133\"/><path d=\"M106.6 92.5 H133.4\"/><circle cx=\"180\" cy=\"40\" r=\"11\"/><circle cx=\"180\" cy=\"40\" r=\"3.5\"/><path d=\"M160 40 H169\"/><path d=\"M184 50.5 C 182 66, 150 66, 127 45\" stroke-width=\"1.6\"/></svg>",
@@ -19,25 +19,15 @@ const ClubArt = (() => {
     return match ? match[0] : 'club';
   }
   return {
-    // 返回卡片顶部要放的节点：上传的照片，或者按名称选的插图。
+    // 返回卡片顶部的插图节点。
     node(club) {
-      const source = typeof club.image_path === 'string' && club.image_path.startsWith('/club-images/') ? club.image_path : null;
-      if (source) {
-        const image = document.createElement('img');
-        image.src = source;
-        image.alt = '';
-        image.loading = 'lazy';
-        image.decoding = 'async';
-        return image;
-      }
       const holder = document.createElement('span');
       holder.className = 'club-illustration';
       holder.innerHTML = art[kind(club.name)];
       return holder;
     },
     key(club) {
-      const source = typeof club.image_path === 'string' && club.image_path.startsWith('/club-images/') ? club.image_path : null;
-      return source || 'art:' + kind(club.name);
+      return kind(club.name);
     }
   };
 })();
