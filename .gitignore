@@ -24,3 +24,7 @@ run/
 club-images/
 backups/
 admin-password.txt
+
+# 本机运行参数与导出文件
+deploy/omms.env
+exports/

@@ -1,0 +1,17 @@
+{
+  "enabledMcpjsonServers": ["omms"],
+  "permissions": {
+    "allow": [
+      "mcp__omms__service_status",
+      "mcp__omms__get_overview",
+      "mcp__omms__get_settings",
+      "mcp__omms__service_logs",
+      "mcp__omms__list_students",
+      "mcp__omms__list_clubs",
+      "mcp__omms__list_snapshots",
+      "mcp__omms__audit_log",
+      "mcp__omms__preview_roster"
+    ],
+    "deny": ["Edit", "Write", "NotebookEdit"]
+  }
+}

@@ -15,6 +15,8 @@
 
 </div>
 
+> 由 AI 代理运行本系统时，从 [agent/AGENTS.md](agent/AGENTS.md) 开始。
+
 ## 功能
 
 **学生端**
@@ -164,6 +166,18 @@ python3 tests/stress_site.py login --backend python --users 1000
 python3 tests/stress_site.py hot --backend python --users 1000
 ```
 
+## 由 AI 代理运行
+
+`agent/` 目录提供 MCP 服务 `omms_mcp.py`（只用 Python 标准库），让 Claude、Codex、Cursor 等 AI 客户端代管理员完成全部操作：启动与停止服务、查看状态和日志、调整运行参数、查看与修改管理员密码、设置开放与截止时间、锁定、导入名单并生成账号表、修改学生和社团、调剂、导出、备份与恢复。共 30 个工具，删除、清空、恢复、重置密码、调剂等操作在管理员确认后执行。
+
+- 运行指南：[agent/AGENTS.md](agent/AGENTS.md)，同时作为 MCP 资源 `omms://guide` 提供。
+- Claude Code、Cursor、VS Code：在 `agent` 文件夹中打开，配置已写好。
+- Claude 桌面版：`python3 agent/omms_mcp.py register claude-desktop`，重新打开 Claude。
+- Codex：`python3 agent/omms_mcp.py register codex`。
+- 没有 MCP 的环境：`python3 agent/omms_mcp.py call 工具名 '{"参数": "值"}'`。
+
+运行参数写在 `deploy/omms.env`（每行 `键=值`），`run.sh` 启动时读取，代理用 `update_settings` 修改。
+
 ## 使用流程
 
 **管理员**（双击 `启动.command` 后控制台自动打开；在其他电脑上从登录页选择“管理员”）
@@ -223,11 +237,14 @@ python3 tests/stress_site.py hot --backend python --users 1000
 | `REGISTER_WAIT_MS` | `8000` | Rust 报名请求等待结果的时长，超出后返回 `pending` |
 | `MAX_CONCURRENCY` | `1024` | Rust 同时处理的请求上限 |
 
-`run.sh` 另外读取：
+`run.sh` 另外读取下列变量。它们也可以写在 `deploy/omms.env` 里，启动命令中给出的同名变量优先；该文件中 `run.sh` 只读取本表、`APP_UTC_OFFSET`、`BACKUP_KEEP`、`MAX_IMPORT_STUDENTS`、`SESSION_TTL`、`LOGIN_MAX_FAILS`、`AUTH_CONCURRENCY`、`MAX_HTTP_WORKERS`、`SEATS_CACHE_MS`、`LOG_LEVEL` 和 `PYTHON`。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `TLS_CERT` / `TLS_KEY` | 空 | 证书与私钥路径。设置后在 `TLS_PORT` 上提供 HTTPS，8080 跳转到 HTTPS，两个服务使用 `COOKIE_SECURE=1` |
+| `HTTP_PORT` | `8080` | 访问端口；设为 80 时访问地址里不用写端口 |
+| `OMMS_PYTHON_ONLY` | `0` | 设为 `1` 时只运行 Python 服务 |
+| `OMMS_OPEN_BROWSER` | `1` | 启动后在本机浏览器打开控制台 |
+| `TLS_CERT` / `TLS_KEY` | 空 | 证书与私钥路径。设置后在 `TLS_PORT` 上提供 HTTPS，`HTTP_PORT` 跳转到 HTTPS，两个服务使用 `COOKIE_SECURE=1` |
 | `TLS_PORT` | `8443` | HTTPS 端口 |
 | `REAL_IP_FROM` | 空 | 内网穿透或反向代理的地址，逗号分隔。nginx 只从这些地址接受 `REAL_IP_HEADER` 中的学生地址，限流按学生地址计算 |
 | `REAL_IP_HEADER` | `X-Forwarded-For` | 学生地址所在的请求头；Cloudflare Tunnel 为 `CF-Connecting-IP` |
@@ -292,7 +309,8 @@ shared/          两个服务共用的 Lua 脚本与提示文案
 web/             前端页面、样式、脚本与插画（原生 HTML、CSS、ES5 脚本）
 nginx.conf       边缘限流、缓存与路由
 run.sh           一键启动与平滑重启；启动.command、停止.command 为双击入口
-deploy/          Redis 配置、环境变量模板、systemd 单元
+agent/           AI 代理接口：MCP 服务、运行指南、各客户端配置
+deploy/          Redis 配置、环境变量模板、systemd 单元；本机运行参数 omms.env
 tools/           颜色回退样式生成、ES5 语法检查
 tests/           隔离的回归测试与压测
 docs/            设计说明与截图
