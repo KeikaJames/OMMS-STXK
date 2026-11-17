@@ -9,11 +9,11 @@
 <meta name="theme-color" content="#F4EFE6">
 <title>管理控制台 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=21">
+<link rel="stylesheet" href="/app.css?v=22">
 <script src="/js/legacy.js?v=18" defer></script>
 <script src="/js/common.js?v=18" defer></script>
 <script src="/js/club-art.js?v=1" defer></script>
-<script src="/js/admin.js?v=24" defer></script>
+<script src="/js/admin.js?v=25" defer></script>
 </head>
 <body>
 <div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
@@ -99,8 +99,16 @@
     </article>
 
     <article class="card" data-pane="students-accounts" hidden>
-      <div class="pane-head"><h2>账号发放</h2><p>初始密码只保存在当前页面，请下载后发放。</p></div>
+      <div class="pane-head"><h2>账号发放</h2><p>新建账号和重置后的密码只保存在当前页面，可下载账号密码表或打印账号条。</p></div>
       <div id="imp-stu-out" aria-live="polite"></div>
+      <hr>
+      <h3>按班重置密码</h3>
+      <p class="hint">为所选班级的全部学生生成新密码，原密码失效，已登录的学生需重新登录。</p>
+      <div class="row2">
+        <div class="field"><label for="reset-class">班级</label><select class="input" id="reset-class"></select></div>
+        <div class="field"><label for="reset-class-reason">原因（记入操作记录）</label><input class="input" id="reset-class-reason" maxlength="200" placeholder="例如：账号条遗失"></div>
+      </div>
+      <div class="actions"><button class="btn btn-secondary" id="reset-class-go" type="button">重置该班密码</button></div>
     </article>
 
     <article class="card danger-card" data-pane="students-danger" hidden>

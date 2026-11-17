@@ -357,6 +357,46 @@ class MaintenanceTests(unittest.TestCase):
         status, body = app.register(2)
         self.assertTrue(body.get("success"), body)
 
+    def test_editing_a_student_keeps_the_account_and_signs_out_on_class_change(self) -> None:
+        app = self.instance
+        token = write_session(app.client, 1)
+        path = "/api/admin/update_student"
+        body = {"student_id": 1, "name": "学生1", "class": "高一1班", "student_no": "S0001", "request_id": "edit-same-1"}
+        status, result = app.post(self.admin, path, body)
+        self.assertEqual((200, False), (status, result.get("changed")), result)
+        status, result = app.post(self.admin, path, dict(body, student_no="S0002", request_id="edit-dup-01"))
+        self.assertEqual(409, status, result)
+        status, result = app.post(self.admin, path, dict(body, name="学生甲", **{"class": "高二3班"}, request_id="edit-move-1"))
+        self.assertEqual((200, True), (status, result.get("changed")), result)
+        self.assertEqual([("学生甲", "高二3班", "高二", "S0001", "student1")],
+                         app.sql("SELECT name, class, grade, student_id, username FROM students WHERE id=1"))
+        status, _body = request_json(app.http_port, "GET", "/api/get_student_info", token=token)
+        self.assertEqual(401, status)
+        status, result = app.post(self.admin, path, dict(body, name="学生甲", **{"class": "高二3班"}, request_id="edit-move-1"))
+        self.assertTrue(result.get("replayed"), result)
+        self.assertEqual(1, len(app.sql("SELECT 1 FROM audit_events WHERE action='student.updated'")))
+
+    def test_class_password_reset_returns_new_passwords_once(self) -> None:
+        app = self.instance
+        token = write_session(app.client, 2)
+        path = "/api/admin/reset_class_passwords"
+        status, result = app.post(self.admin, path, {"class": "高三9班", "reason": "测试", "request_id": "class-reset-0"})
+        self.assertEqual(404, status, result)
+        body = {"class": "高一1班", "reason": "账号条遗失", "request_id": "class-reset-1"}
+        status, result = app.post(self.admin, path, body)
+        self.assertEqual(200, status, result)
+        self.assertEqual(3, result["count"])
+        credentials = {item["username"]: item["password"] for item in result["credentials"]}
+        self.assertEqual({"student1", "student2", "student3"}, set(credentials))
+        self.assertTrue(all(len(password) == 8 for password in credentials.values()))
+        status, _body = request_json(app.http_port, "GET", "/api/get_student_info", token=token)
+        self.assertEqual(401, status)
+        status, _headers, raw = request(app.http_port, "POST", "/api/login",
+                                        body={"username": "student2", "password": credentials["student2"]})
+        self.assertEqual(200, status, raw)
+        status, again = app.post(self.admin, path, body)
+        self.assertEqual((200, True, []), (status, again.get("replayed"), again.get("credentials")))
+
     def test_reset_admin_password_from_the_command_line(self) -> None:
         app = self.instance
         result = app.cli("reset-admin-password")

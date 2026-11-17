@@ -2355,6 +2355,8 @@ POST_ROUTES = {
     "/api/admin/transfer_registration": ("_h_admin_transfer_registration", ROLE_ADMIN),
     "/api/admin/adjust_registrations": ("_h_adjust_registrations", ROLE_ADMIN),
     "/api/admin/clear_registrations": ("_h_clear_registrations", ROLE_ADMIN),
+    "/api/admin/update_student": ("_h_update_student", ROLE_ADMIN),
+    "/api/admin/reset_class_passwords": ("_h_reset_class_passwords", ROLE_ADMIN),
     "/api/remove_club_image": ("_h_remove_club_image", ROLE_ADMIN),
 }
 RAW_POST_ROUTES = {
@@ -3396,6 +3398,113 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
         finally:
             RG.session_end_mutation(mutation_lock)
+
+    def _h_update_student(self, sess, data):
+        """修改姓名、班级、学号；账号和密码不变。班级变化时该生重新登录。"""
+        try:
+            student_id = int(data.get("student_id"))
+        except (TypeError, ValueError):
+            return self._json(400, {"success": False, "message": "缺少或非法的学生ID"})
+        request_id = admin_request_id(data)
+        name = clean_text(data.get("name"))
+        klass = clean_text(data.get("class"))
+        number = clean_text(data.get("student_no"), maxlen=40)
+        if request_id is None or not name or not klass or not number:
+            return self._json(400, {"success": False, "message": "请填写姓名、班级和学号"})
+        actor = sess.get("username", "admin")
+        replay = self._admin_replay(actor, "student.updated", request_id)
+        if replay:
+            if str(replay[1]) != str(student_id):
+                return self._json(409, {"success": False, "message": "request_id 已用于其他学生"})
+            return self._json(200, {"success": True, "replayed": True, "changed": True})
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                row = cur.execute("SELECT name, class, student_id FROM students WHERE id=?",
+                                  (student_id,)).fetchone()
+                if not row:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "学生不存在"})
+                if (name, klass, number) == tuple(row):
+                    conn.rollback()
+                    return self._json(200, {"success": True, "changed": False})
+                cur.execute("UPDATE students SET name=?, class=?, grade=?, student_id=? WHERE id=?",
+                            (name, klass, derive_grade(klass), number, student_id))
+                append_audit_event(
+                    cur, event_id="student-update-" + secrets.token_urlsafe(18), actor_role="admin",
+                    actor_id=actor, action="student.updated", target_type="student", target_id=student_id,
+                    request_id=request_id,
+                    before={"name": row[0], "class": row[1], "student_no": row[2]},
+                    after={"name": name, "class": klass, "student_no": number},
+                )
+                conn.commit()
+        except sqlite3.IntegrityError:
+            return self._json(409, {"success": False, "message": "学号 {} 已被其他学生使用".format(number)})
+        except sqlite3.Error as e:
+            log.error("修改学生失败: %s", e)
+            return self._json(500, {"success": False, "message": "保存失败"})
+        if klass != row[1]:
+            with contextlib.suppress(RuntimeError):
+                RG.session_revoke_identity("student", str(student_id))
+        self._json(200, {"success": True, "changed": True})
+
+    def _h_reset_class_passwords(self, sess, data):
+        """为一个班的全部学生生成新密码；明文只在本次响应中出现。"""
+        klass = clean_text(data.get("class"))
+        request_id = admin_request_id(data)
+        reason = clean_text(data.get("reason"), maxlen=400)
+        if not klass or request_id is None or not reason:
+            return self._json(400, {"success": False, "message": "请选择班级并填写原因"})
+        actor = sess.get("username", "admin")
+        replay = self._admin_replay(actor, "students.passwords_reset", request_id)
+        if replay:
+            after = json.loads(replay[3] or "{}")
+            return self._json(200, {"success": True, "replayed": True, "count": after.get("count", 0),
+                                    "credentials": [],
+                                    "message": "该请求已执行，新密码仅在首次返回时显示"})
+        with DB_POOL.connection() as conn:
+            students = conn.execute(
+                "SELECT id, name, class, username FROM students WHERE class=? ORDER BY student_id, id", (klass,)
+            ).fetchall()
+        if not students:
+            return self._json(404, {"success": False, "message": "该班级没有学生"})
+        passwords = [gen_password() for _ in students]
+        hashes = [future.result() for future in
+                  [AUTH.submit(hash_password, password, force=True)[0] for password in passwords]]
+        locks = []
+        try:
+            for student in students:
+                lock = RG.session_begin_mutation("student", str(student[0]))
+                if not lock:
+                    return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"},
+                                      extra=[("Retry-After", "2")])
+                locks.append(lock)
+            for student in students:
+                RG.session_revoke_identity("student", str(student[0]))
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                cur.executemany("UPDATE students SET password=? WHERE id=?",
+                                [(password_hash, student[0]) for password_hash, student in zip(hashes, students)])
+                append_audit_event(
+                    cur, event_id="class-password-reset-" + secrets.token_urlsafe(18), actor_role="admin",
+                    actor_id=actor, action="students.passwords_reset", target_type="students", target_id=klass,
+                    request_id=request_id, reason=reason, before={"class": klass}, after={"count": len(students)},
+                )
+                conn.commit()
+        except RuntimeError:
+            return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+        except sqlite3.Error as e:
+            log.error("按班重置密码失败: %s", e)
+            return self._json(500, {"success": False, "message": "重置失败"})
+        finally:
+            for lock in locks:
+                RG.session_end_mutation(lock)
+        credentials = [{"name": name, "class": student_class, "username": username, "password": password}
+                       for (_sid, name, student_class, username), password in zip(students, passwords)]
+        self._json(200, {"success": True, "count": len(students), "credentials": credentials},
+                   extra=[("Cache-Control", "no-store")])
 
     def _h_update_club(self, sess, data):
         club_id = data.get("club_id")

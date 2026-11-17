@@ -255,6 +255,7 @@
       return;
     }
     studentRows = result.data;
+    fillClassSelect();
     knownStudentIds.clear();
     studentRows.forEach(student => knownStudentIds.add(String(student.student_id)));
     directoryReady = true;
@@ -316,6 +317,16 @@
     const panel = el('div', 'student-panel');
     panel.id = 'student-panel';
     const field = (label, input) => { const wrap = el('label', 'field'); wrap.append(el('span', '', label), input); return wrap; };
+    const textInput = (value, max) => { const input = el('input', 'input'); input.value = value || ''; input.maxLength = max; return input; };
+    const nameInput = textInput(student.name, 50);
+    const classInput = textInput(student.class, 50);
+    const numberInput = textInput(student.student_id, 40);
+    const info = el('div', 'row3');
+    info.append(field('姓名', nameInput), field('班级', classInput), field('学号', numberInput));
+    const saveInfo = el('button', 'btn btn-secondary btn-sm', '保存信息');
+    saveInfo.type = 'button';
+    const infoActions = el('div', 'actions');
+    infoActions.append(saveInfo);
     const select = el('select', 'input');
     const none = el('option', '', '未报名');
     none.value = '';
@@ -350,12 +361,27 @@
     actions.append(save, reset, remove);
     const columns = el('div', 'row2');
     columns.append(field('社团', select), field('原因（记入操作记录）', reason));
-    panel.append(columns, overrideLabel, error, actions, output);
+    panel.append(info, infoActions, el('hr'), columns, overrideLabel, error, actions, output);
     cell.append(panel);
     row.append(cell);
 
-    const ids = { move: App.requestId(), reset: App.requestId() };
+    const ids = { move: App.requestId(), reset: App.requestId(), info: App.requestId() };
     [select, override, reason].forEach(input => input.addEventListener('input', () => { ids.move = App.requestId(); }));
+    [nameInput, classInput, numberInput].forEach(input => input.addEventListener('input', () => { ids.info = App.requestId(); }));
+
+    saveInfo.addEventListener('click', async () => {
+      const body = { student_id: student.id, name: nameInput.value.trim(), class: classInput.value.trim(),
+        student_no: numberInput.value.trim(), request_id: ids.info };
+      if (!body.name || !body.class || !body.student_no) { error.textContent = '请填写姓名、班级和学号'; return; }
+      error.textContent = '';
+      App.busy(saveInfo, '保存中');
+      const result = await adminRetry('/api/admin/update_student', body);
+      App.busy(saveInfo, null);
+      if (!ok(result)) { error.textContent = message(result, '保存失败'); return; }
+      ids.info = App.requestId();
+      App.toast(result.data.changed === false ? '信息没有变化' : '已保存 ' + body.name + ' 的信息', 'ok');
+      await loadStudents();
+    });
 
     save.addEventListener('click', async () => {
       const target = select.value ? Number(select.value) : null;
@@ -432,6 +458,7 @@
     'registration.admin_assigned': '代为报名', 'registration.admin_removed': '移出社团', 'registration.admin_transferred': '调整社团',
     'registration.start_time_updated': '设置开放时间', 'registration.end_time_updated': '设置截止时间', 'registration.lock_updated': '名单锁定',
     'student.password_reset': '重置学生密码', 'student.password_changed': '学生修改密码', 'student.deleted': '删除学生',
+    'student.updated': '修改学生信息', 'students.passwords_reset': '按班重置密码',
     'students.imported': '导入学生', 'students.deleted_all': '清空学生',
     'club.updated': '编辑社团', 'club.deleted': '删除社团', 'club.image_uploaded': '更新社团图片', 'club.image_removed': '移除社团图片',
     'clubs.imported': '添加社团', 'clubs.deleted_all': '清空社团', 'admin.password_changed': '修改管理员密码',
@@ -452,7 +479,9 @@
       case 'student': return !studentKnown(event.target_id) && before.name ? before.name + (before.class ? '（' + before.class + '）' : '') : studentLabel(event.target_id);
       case 'club': return !clubIndex.has(Number(event.target_id)) && before.name ? splitRoom(before.name).name : clubLabel(event.target_id);
       case 'registration': return clubLabel(after.club_id || before.club_id);
-      case 'students': return after.success !== undefined ? after.success + ' 名' : before.students !== undefined ? before.students + ' 名' : '全部学生';
+      case 'students':
+        if (before.class) return before.class + ' · ' + after.count + ' 名';
+        return after.success !== undefined ? after.success + ' 名' : before.students !== undefined ? before.students + ' 名' : '全部学生';
       case 'clubs': return after.success !== undefined ? after.success + ' 个' : '全部社团';
       case 'registrations': return '未报名学生';
       default: return '';
@@ -470,6 +499,11 @@
     if (event.action === 'registration.end_time_updated') parts.push(after.end_time || '清除');
     if (event.action === 'registration.lock_updated') parts.push(after.locked ? '锁定' : '解除锁定');
     if (event.action === 'registrations.cleared') parts.push('删除 ' + after.cleared + ' 条报名');
+    if (event.action === 'student.updated') {
+      [['name', '姓名'], ['class', '班级'], ['student_no', '学号']].forEach(([key, label]) => {
+        if (before[key] !== after[key]) parts.push(label + ' ' + before[key] + ' → ' + after[key]);
+      });
+    }
     if (event.action === 'registrations.adjusted') {
       parts.push('安排 ' + after.assigned + ' 人' + (after.unassigned ? '，' + after.unassigned + ' 人无可用名额' : ''));
     }
@@ -737,27 +771,108 @@
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   }
 
+  function fillClassSelect() {
+    const select = $('#reset-class');
+    const current = select.value;
+    const counts = new Map();
+    studentRows.forEach(student => counts.set(student.class, (counts.get(student.class) || 0) + 1));
+    select.replaceChildren();
+    Array.from(counts.keys()).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN', { numeric: true })).forEach(klass => {
+      const option = new Option(klass + '（' + counts.get(klass) + ' 人）', klass);
+      option.selected = klass === current;
+      select.append(option);
+    });
+    $('#reset-class-go').disabled = !counts.size;
+  }
+
+  let classResetId = App.requestId();
+  $('#reset-class').addEventListener('change', () => { classResetId = App.requestId(); });
+  $('#reset-class-go').addEventListener('click', () => {
+    const klass = $('#reset-class').value;
+    const reason = $('#reset-class-reason').value.trim();
+    if (!klass || !reason) { App.toast('请选择班级并填写原因', 'err'); return; }
+    if (pendingCredentials.length) { App.toast('本页还有未清除的账号密码，请先下载或清除', 'err'); return; }
+    confirmInline($('#reset-class-go'), async () => {
+      const result = await adminRetry('/api/admin/reset_class_passwords', { class: klass, reason, request_id: classResetId });
+      if (!ok(result)) throw new Error(message(result, '重置失败'));
+      classResetId = App.requestId();
+      $('#reset-class-reason').value = '';
+      if (result.data.credentials.length) {
+        pendingCredentials = result.data.credentials;
+        renderCredentials();
+      }
+      App.toast(klass + ' ' + result.data.count + ' 名学生的密码已重置', 'ok');
+    });
+  });
+
+  function slipOrigin() {
+    try { return localStorage.getItem('omms-slip-origin') || location.origin; } catch (error) { return location.origin; }
+  }
+
+  function printSlips(origin) {
+    try { localStorage.setItem('omms-slip-origin', origin); } catch (error) { /* 仅记住上次填写的地址 */ }
+    const groups = new Map();
+    pendingCredentials.forEach(item => {
+      const klass = item.class || '';
+      if (!groups.has(klass)) groups.set(klass, []);
+      groups.get(klass).push(item);
+    });
+    const row = (label, value) => { const line = el('div', 'slip-row'); line.append(el('small', '', label), el('span', '', value)); return line; };
+    const sheet = el('div', 'print-sheet');
+    sheet.id = 'print-sheet';
+    Array.from(groups.keys()).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN', { numeric: true })).forEach(klass => {
+      const section = el('section', 'print-class');
+      section.append(el('h2', '', (klass || '未分班') + ' · ' + groups.get(klass).length + ' 人'));
+      const slips = el('div', 'slips');
+      groups.get(klass).forEach(item => {
+        const slip = el('div', 'slip');
+        slip.append(el('b', '', item.name + '　' + (item.class || '')), row('账号', item.username), row('初始密码', item.password), row('登录地址', origin));
+        slips.append(slip);
+      });
+      section.append(slips);
+      sheet.append(section);
+    });
+    removePrintSheet();
+    document.body.append(sheet);
+    window.print();
+  }
+
+  function removePrintSheet() {
+    const sheet = document.getElementById('print-sheet');
+    if (sheet) sheet.remove();
+  }
+  window.addEventListener('afterprint', removePrintSheet);
+
   function renderCredentials() {
     const box = $('#imp-stu-out');
     box.replaceChildren();
     if (!pendingCredentials.length) {
-      box.append(el('p', 'empty', '暂无待下载的账号。'));
+      removePrintSheet();
+      box.append(el('p', 'empty', '暂无待发放的账号。'));
       return;
     }
     const head = el('div', 'actions');
     const download = el('button', 'btn btn-primary', '下载账号密码表');
     download.type = 'button';
     download.addEventListener('click', downloadCredentials);
+    const origin = el('input', 'input');
+    origin.id = 'slip-origin';
+    origin.value = slipOrigin();
+    const print = el('button', 'btn btn-secondary', '打印账号条');
+    print.type = 'button';
+    print.addEventListener('click', () => printSlips(origin.value.trim() || location.origin));
     const done = el('button', 'btn btn-quiet', '清除本页密码');
     done.type = 'button';
     done.addEventListener('click', () => {
       pendingCredentials = [];
       renderCredentials();
       updateImportCheck();
-      App.toast('已从本页清除初始密码', 'ok');
+      App.toast('已从本页清除密码', 'ok');
     });
-    head.append(download, done);
-    box.append(el('p', 'hint', '本次创建 ' + pendingCredentials.length + ' 个账号'), head);
+    head.append(download, print, done);
+    const originField = el('label', 'field');
+    originField.append(el('span', '', '登录地址（印在账号条上）'), origin);
+    box.append(el('p', 'hint', '本页 ' + pendingCredentials.length + ' 个账号'), originField, head);
     const wrap = el('div', 'table-wrap');
     const table = el('table', 'tbl');
     const header = el('tr');
