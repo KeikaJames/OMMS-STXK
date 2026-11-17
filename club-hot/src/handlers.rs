@@ -734,8 +734,11 @@ pub async fn check_registration_time(State(state): State<AppState>) -> Response 
         start_str = Some(text);
     }
     let server_now = redis.now_epoch_ms().await;
+    let end_str = state.db.registration_end_time().await.ok().flatten();
+    let close_at = end_str.as_deref().and_then(auth::parse_local_datetime);
     let locked = state.db.registration_locked().await.unwrap_or(false)
-        || redis.locked_get().await.unwrap_or(false);
+        || redis.locked_get().await.unwrap_or(false)
+        || close_at.is_some_and(|c| server_now >= c.saturating_mul(1000));
     let can = open_at.is_some_and(|o| server_now >= o.saturating_mul(1000)) && !locked;
     (
         [(header::CACHE_CONTROL, "no-store")],
@@ -745,7 +748,8 @@ pub async fn check_registration_time(State(state): State<AppState>) -> Response 
             "open_at": open_at.map(|value| value.saturating_mul(1000)),
             "server_now": server_now,
             "registration_locked": locked,
-            "end_time": Value::Null,
+            "end_time": if close_at.is_some() { json!(end_str) } else { Value::Null },
+            "close_at": close_at.map(|value| value.saturating_mul(1000)),
         })),
     )
         .into_response()

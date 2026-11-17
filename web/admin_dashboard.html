@@ -9,11 +9,11 @@
 <meta name="theme-color" content="#F4EFE6">
 <title>管理控制台 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=21">
+<link rel="stylesheet" href="/app.css?v=22">
 <script src="/js/legacy.js?v=18" defer></script>
 <script src="/js/common.js?v=18" defer></script>
 <script src="/js/club-art.js?v=1" defer></script>
-<script src="/js/admin.js?v=22" defer></script>
+<script src="/js/admin.js?v=25" defer></script>
 </head>
 <body>
 <div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
@@ -89,7 +89,7 @@
     </article>
 
     <article class="card" data-pane="students-list" hidden>
-      <div class="pane-head"><h2>学生名单</h2><p>在“管理”中调整社团或重置密码，修改记入操作记录。</p></div>
+      <div class="pane-head"><h2>学生名单</h2><p>在“管理”中修改学生信息、调整社团或重置密码，修改记入操作记录。</p></div>
       <div class="toolbar">
         <label class="sr-only" for="stu-search">查找学生</label>
         <input class="input" id="stu-search" type="search" placeholder="按姓名、班级、学号、账号或社团查找" autocomplete="off">
@@ -99,8 +99,16 @@
     </article>
 
     <article class="card" data-pane="students-accounts" hidden>
-      <div class="pane-head"><h2>账号发放</h2><p>初始密码只保存在当前页面，请下载后发放。</p></div>
+      <div class="pane-head"><h2>账号发放</h2><p>新建账号和重置后的密码只保存在当前页面，可下载账号密码表或打印账号条。</p></div>
       <div id="imp-stu-out" aria-live="polite"></div>
+      <hr>
+      <h3>按班重置密码</h3>
+      <p class="hint">为所选班级的全部学生生成新密码，原密码失效，已登录的学生需重新登录。</p>
+      <div class="row2">
+        <div class="field"><label for="reset-class">班级</label><select class="input" id="reset-class"></select></div>
+        <div class="field"><label for="reset-class-reason">原因（记入操作记录）</label><input class="input" id="reset-class-reason" maxlength="200" placeholder="例如：账号条遗失"></div>
+      </div>
+      <div class="actions"><button class="btn btn-secondary" id="reset-class-go" type="button">重置该班密码</button></div>
     </article>
 
     <article class="card danger-card" data-pane="students-danger" hidden>
@@ -155,6 +163,11 @@
       <div id="adjust-body"><p class="hint">读取中</p></div>
     </article>
 
+    <article class="card danger-card" data-pane="overview-clear" hidden>
+      <div class="pane-head"><h2>清空报名</h2><p>删除全部报名记录，学生账号和社团保留，用于演练后重新开放或下一轮选课。名单锁定后可以清空，清空前自动备份。</p></div>
+      <div id="clear-body"><p class="hint">读取中</p></div>
+    </article>
+
     <article class="card" data-pane="overview-exports" hidden>
       <div class="pane-head"><h2>导出</h2><p>报名表含总表、各社团名单和未报名名单，“方式”一列区分自选、调剂和管理员安排。</p></div>
       <div class="table-wrap">
@@ -168,13 +181,23 @@
 
   <section data-view="settings" id="view-settings" hidden>
     <article class="card" data-pane="settings-registration">
-      <div class="pane-head"><h2>开放时间与名单锁定</h2><p>到开放时间后开放报名；未设置开放时间时，学生页显示“开放时间待定”。锁定后报名与退选停止。</p></div>
-      <div class="field"><label for="open-at">开放时间（学校时间）</label><input class="input" id="open-at" type="datetime-local"></div>
-      <div class="actions"><button class="btn btn-primary" id="save-time" type="button">保存开放时间</button><button class="btn btn-quiet" id="clear-time" type="button" hidden>清除开放时间</button></div>
+      <div class="pane-head"><h2>开放时间与名单锁定</h2><p>到开放时间后开放报名；未设置开放时间时，学生页显示“开放时间待定”。到截止时间或手动锁定后，报名与退选停止。</p></div>
+      <div class="row2">
+        <div class="field"><label for="open-at">开放时间（学校时间）</label><input class="input" id="open-at" type="datetime-local"></div>
+        <div class="field"><label for="close-at">截止时间（可不填）</label><input class="input" id="close-at" type="datetime-local"></div>
+      </div>
+      <div class="actions"><button class="btn btn-primary" id="save-time" type="button">保存时间</button><button class="btn btn-quiet" id="clear-time" type="button" hidden>清除开放时间</button></div>
       <hr>
       <p class="hint" id="lock-state">读取中</p>
       <div class="field"><label for="lock-reason">原因（记入操作记录）</label><input class="input" id="lock-reason" maxlength="200" placeholder="例如：报名截止"></div>
       <div class="actions"><button class="btn btn-secondary" id="toggle-lock" type="button">锁定名单</button></div>
+    </article>
+
+    <article class="card" data-pane="settings-backup" hidden>
+      <div class="pane-head"><h2>备份</h2><p>完整备份包含数据库和社团照片，下载后保存到另一台电脑。名单锁定时，以及调剂、清空报名、清空学生、清空社团之前，系统自动保存数据库快照。</p></div>
+      <div class="actions"><a class="btn btn-primary" href="/api/admin/backup">下载完整备份</a></div>
+      <div class="table-wrap"><table class="tbl" id="backup-tbl"><tbody><tr><td>读取中</td></tr></tbody></table></div>
+      <p class="hint" id="backup-note"></p>
     </article>
 
     <article class="card" data-pane="settings-security" hidden>

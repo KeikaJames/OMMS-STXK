@@ -113,6 +113,9 @@ impl Seats {
     fn k_open_at(&self) -> String {
         self.key(&[&"open_at"])
     }
+    fn k_close_at(&self) -> String {
+        self.key(&[&"close_at"])
+    }
     fn k_locked(&self) -> String {
         self.key(&[&"locked"])
     }
@@ -225,6 +228,7 @@ impl Seats {
             self.k_locked(),
             self.k_fence(club),
             self.k_inflight(club),
+            self.k_close_at(),
         ];
         let args = [
             lease.to_string(),
@@ -292,6 +296,7 @@ impl Seats {
             self.k_op(student),
             self.k_inflight(club),
             self.k_locked(),
+            self.k_close_at(),
         ];
         let args = [
             lease.to_string(),
@@ -573,12 +578,13 @@ impl Seats {
             .map(|keys| !keys.is_empty())
     }
 
-    /// 持有全局维护锁时整体发布库存、镜像、开放时间与锁定状态。
+    /// 持有全局维护锁时整体发布库存、镜像、开放与截止时间、锁定状态。
     pub async fn publish_all(
         &self,
         token: &str,
         snapshot: &Snapshot,
         open_at: Option<i64>,
+        close_at: Option<i64>,
     ) -> AppResult<()> {
         let mut conn = self.conn().await?;
         let mut stale = Vec::new();
@@ -619,6 +625,10 @@ impl Seats {
         match open_at {
             Some(epoch) => pipe.set(self.k_open_at(), epoch).ignore(),
             None => pipe.del(self.k_open_at()).ignore(),
+        };
+        match close_at {
+            Some(epoch) => pipe.set(self.k_close_at(), epoch).ignore(),
+            None => pipe.del(self.k_close_at()).ignore(),
         };
         if snapshot.locked {
             pipe.set(self.k_locked(), "1").ignore();
@@ -675,6 +685,17 @@ impl Seats {
                     .await
             }
             None => self.deadline(conn.del::<_, ()>(self.k_open_at())).await,
+        }
+    }
+
+    pub async fn close_at_set(&self, epoch: Option<i64>) -> AppResult<()> {
+        let mut conn = self.conn().await?;
+        match epoch {
+            Some(epoch) => {
+                self.deadline(conn.set::<_, _, ()>(self.k_close_at(), epoch))
+                    .await
+            }
+            None => self.deadline(conn.del::<_, ()>(self.k_close_at())).await,
         }
     }
 
@@ -941,7 +962,13 @@ pub async fn rebuild_all(seats: &Seats, db: &Db) -> AppResult<bool> {
             .start_time
             .as_deref()
             .and_then(crate::auth::parse_local_datetime);
-        seats.publish_all(&token, &snapshot, open_at).await?;
+        let close_at = snapshot
+            .end_time
+            .as_deref()
+            .and_then(crate::auth::parse_local_datetime);
+        seats
+            .publish_all(&token, &snapshot, open_at, close_at)
+            .await?;
         db.mark_all_synced().await?;
         tracing::info!(clubs = snapshot.clubs.len(), "Redis seats published");
         Ok::<_, AppError>(())

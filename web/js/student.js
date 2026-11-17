@@ -9,6 +9,8 @@
     seats: new Map(),
     openAt: null,
     openText: null,
+    closeAt: null,
+    closeText: null,
     locked: false,
     offset: 0,
     expanded: new Set(),
@@ -24,7 +26,7 @@
     return state.me && state.me.registered_club_id ? Number(state.me.registered_club_id) : null;
   }
   function phase() {
-    if (state.locked) return 'locked';
+    if (state.locked || (state.closeAt !== null && now() >= state.closeAt)) return 'locked';
     if (registeredId()) return 'chosen';
     if (state.openAt === null) return 'unset';
     return now() >= state.openAt ? 'open' : 'countdown';
@@ -70,6 +72,8 @@
     }
     state.openAt = typeof result.data.open_at === 'number' ? result.data.open_at : null;
     state.openText = result.data.start_time || null;
+    state.closeAt = typeof result.data.close_at === 'number' ? result.data.close_at : null;
+    state.closeText = result.data.end_time || null;
     state.locked = Boolean(result.data.registration_locked);
   }
 
@@ -88,6 +92,8 @@
     }
     state.seats = new Map(data.seats.map(([id, left]) => [id, left]));
     state.openAt = typeof data.open_at === 'number' ? data.open_at : null;
+    state.closeAt = typeof data.close_at === 'number' ? data.close_at : null;
+    state.closeText = data.end_time || null;
     state.locked = Boolean(data.locked);
     const stamp = new Date();
     $('#updated-at').textContent = '名额更新于 ' + [stamp.getHours(), stamp.getMinutes(), stamp.getSeconds()].map(App.pad).join(':');
@@ -133,21 +139,23 @@
     const date = new Date(ms);
     return [date.getHours(), date.getMinutes(), date.getSeconds()].map(App.pad).join(':');
   }
-  // 开放时间按学校时区的原始文本显示，与设备时区无关。
-  function formatOpenAt() {
-    const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(state.openText || '');
+  // 开放与截止时间按学校时区的原始文本显示，与设备时区无关。
+  function formatSchoolTime(text) {
+    const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(text || '');
     return match ? Number(match[2]) + ' 月 ' + Number(match[3]) + ' 日 ' + match[4] + ':' + match[5] : '';
   }
 
   function renderStatus() {
     const current = phase();
-    const openText = formatOpenAt();
+    const openText = formatSchoolTime(state.openText);
+    const closeText = formatSchoolTime(state.closeText);
+    const until = closeText ? '截止时间 ' + closeText : '';
     // 已报名时社团名称和退选按钮在下方的“已报名”区域，状态条只写状态。
     const texts = {
       unset: ['开放时间待定', ''],
-      countdown: ['距开放', openText ? '开放时间 ' + openText : ''],
-      open: ['报名中', '每人限报一个社团'],
-      chosen: ['已报名', ''],
+      countdown: ['距开放', [openText ? '开放时间 ' + openText : '', until].filter(Boolean).join('，')],
+      open: ['报名中', ['每人限报一个社团', until].filter(Boolean).join('，')],
+      chosen: ['已报名', until],
       locked: ['报名已截止', registeredId() ? '' : '未报名的学生由学校统一调剂']
     };
     const [title, detail] = texts[current];

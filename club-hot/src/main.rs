@@ -162,6 +162,10 @@ async fn seed_settings(seats: &Seats, db: &Db) {
         }
         Err(_) => {}
     }
+    if let Ok(end) = db.registration_end_time().await {
+        let close_at = end.as_deref().and_then(auth::parse_local_datetime);
+        let _ = seats.close_at_set(close_at).await;
+    }
     if let Ok(locked) = db.registration_locked().await {
         let _ = seats.locked_set(locked).await;
     }

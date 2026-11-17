@@ -26,7 +26,7 @@ cargo test --manifest-path club-hot/Cargo.toml
 | `test_redis_recovery.py` | Lua 脚本：写入前开启效果复制、租约回滚与吸收模式、Redis 晚于服务启动、提交后故障保持名额占用 |
 | `test_edge_security.py` | nginx + Python + Rust：响应头、Cookie 轮换限额、图片代理、栅栏只暂停对应社团、后台修复、登录失败计数隔离、两个服务的准入规则与会话格式一致、请求 ID 幂等 |
 | `test_inflight_scan.py` | 后台扫描两次读取之间完成的报名不算失效，租约缺失或被替换的成员算失效 |
-| `test_lifecycle.py` | 空数据库首次启动不开放报名，开放时间的设置、清除与重启后的同步 |
+| `test_lifecycle.py` | 空数据库首次启动不开放报名，开放时间的设置、清除与重启后的同步；截止时间到点停止报名与退选并写入锁定；清空报名、自动快照、完整备份的下载与恢复、命令行重置管理员密码；修改学生信息、按班重置密码 |
 | `test_low_end.py` | 口令队列的容量、顺序、超时与约定的等待时间，新旧 nginx 访问日志格式，按需加载 pypinyin 与 Pillow，繁忙响应的提示码 |
 | `club-hot` 单元测试 | Cookie 解析、口令哈希与 Python 互通、口令队列、学校时区、ETag、提示文案覆盖全部返回码、报名镜像格式、令牌字符集 |
 

@@ -293,6 +293,10 @@ textarea.input { min-height: 120px; font-family: var(--mono); font-size: 13px; l
 .student-panel .field { margin-bottom: 6px; }
 .reset-result { margin-top: 12px; padding: 12px 14px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--surface); line-height: 1.8; }
 .reset-result small { display: block; color: var(--muted); }
+.row2, .row3 { display: grid; gap: 12px; }
+.row2 { grid-template-columns: 1fr 1fr; }
+.row3 { grid-template-columns: 1fr 1fr 1fr; }
+.print-sheet { display: none; }
 .audit-wrap { margin-top: 14px; }
 
 /* ---- 管理端 ---- */
@@ -400,4 +404,27 @@ textarea.input { min-height: 120px; font-family: var(--mono); font-size: 13px; l
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+@media (max-width: 560px) {
+  .row2, .row3 { grid-template-columns: 1fr; }
+}
+
+/* 账号条：A4，每行 3 张，每个班级从新的一页开始 */
+@media print {
+  @page { size: A4; margin: 10mm; }
+  body { background: #fff; }
+  body > :not(.print-sheet) { display: none !important; }
+  .print-sheet { display: block; color: #000; font-size: 11pt; }
+  .print-class + .print-class { page-break-before: always; break-before: page; }
+  .print-class h2 { margin: 0 0 4mm; font-size: 13pt; color: #000; }
+  .slips { display: grid; grid-template-columns: repeat(3, 1fr); }
+  .slip { display: grid; gap: 1.2mm; min-height: 34mm; padding: 4mm; border: 1px dashed #777; page-break-inside: avoid; break-inside: avoid; }
+  .slip b { font-size: 12pt; }
+  .slip-row { display: flex; gap: 2mm; align-items: baseline; }
+  .slip-row small { flex: none; width: 15mm; color: #444; font-size: 9pt; }
+  .slip-row span { font-family: var(--mono); font-size: 11pt; word-break: break-all; }
+  .slip-row.wide { display: block; }
+  .slip-row.wide small { display: block; width: auto; }
+  .slip-row.wide span { font-size: 9.5pt; }
 }

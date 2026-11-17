@@ -4,9 +4,12 @@
 import collections
 import http.server
 import random
+import shutil
 import socketserver
 import json
 import sqlite3
+import sys
+import tempfile
 import urllib.parse
 import os
 import secrets
@@ -157,6 +160,7 @@ def rk(*parts):
 
 
 K_OPEN_AT = rk("open_at")      # 报名开放 epoch 秒
+K_CLOSE_AT = rk("close_at")    # 截止 epoch 秒，到点后报名与退选停止
 K_LOCKED = rk("locked")        # "1" 表示名单已锁定
 K_INIT = rk("init")            # 整体发布完成的标记
 K_MAINT = rk("maint")          # 全局维护锁(清空类操作与冷启动)
@@ -340,7 +344,7 @@ class RedisGate:
     def acquire(self, student_id, club_id, lease, member, idem_prefix):
         """返回 acquire.lua 的结果码；本次请求的重放(2)按抢到(1)处理。"""
         keys = [k_stock(club_id), k_reg(student_id), k_op(student_id), K_OPEN_AT, K_MAINT,
-                K_LOCKED, k_fence(club_id), k_inflight(club_id)]
+                K_LOCKED, k_fence(club_id), k_inflight(club_id), K_CLOSE_AT]
         args = [lease, SEAT_OP_TTL, member, idem_prefix]
         code = int(self._run("acquire", keys, args))
         return 1 if code == 2 else code
@@ -364,7 +368,7 @@ class RedisGate:
     def cancel_begin(self, student_id, club_id, lease, member):
         return int(self._run(
             "cancel_begin",
-            [K_MAINT, k_fence(club_id), k_op(student_id), k_inflight(club_id), K_LOCKED],
+            [K_MAINT, k_fence(club_id), k_op(student_id), k_inflight(club_id), K_LOCKED, K_CLOSE_AT],
             [lease, SEAT_OP_TTL, member],
         ))
 
@@ -507,8 +511,8 @@ class RedisGate:
     def has_active_operations(self):
         return next(self._r.scan_iter(match=rk("op", "*"), count=1000), None) is not None
 
-    def publish_all(self, token, stocks, mirrors, open_at, locked):
-        """持有全局维护锁时整体发布库存、镜像、开放时间与锁定状态。"""
+    def publish_all(self, token, stocks, mirrors, open_at, locked, close_at=None):
+        """持有全局维护锁时整体发布库存、镜像、开放与截止时间、锁定状态。"""
         stale = []
         for name in ("stock", "reg", "inflight", "fence"):
             stale.extend(self._r.scan_iter(match=rk(name, "*"), count=1000))
@@ -528,6 +532,10 @@ class RedisGate:
                 pipe.delete(K_OPEN_AT)
             else:
                 pipe.set(K_OPEN_AT, int(open_at))
+            if close_at is None:
+                pipe.delete(K_CLOSE_AT)
+            else:
+                pipe.set(K_CLOSE_AT, int(close_at))
             if locked:
                 pipe.set(K_LOCKED, "1")
             else:
@@ -572,6 +580,19 @@ class RedisGate:
             self._call("delete", K_OPEN_AT)
         else:
             self._call("set", K_OPEN_AT, int(epoch))
+
+    def close_at_get(self):
+        try:
+            value = self._r.get(K_CLOSE_AT)
+            return int(value) if value is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def close_at_set(self, epoch):
+        if epoch is None:
+            self._call("delete", K_CLOSE_AT)
+        else:
+            self._call("set", K_CLOSE_AT, int(epoch))
 
     def locked_get(self):
         try:
@@ -1200,9 +1221,27 @@ def registration_method(operation_id):
     return "自选"
 
 
+def parse_optional_time(text):
+    if not text:
+        return None
+    try:
+        return parse_local_time(text)
+    except ValueError:
+        return None
+
+
+def deadline_passed(close_at, now_ms=None):
+    if close_at is None:
+        return False
+    return (now_ms if now_ms is not None else time.time() * 1000) >= close_at * 1000
+
+
 def registration_locked(conn):
-    row = conn.execute("SELECT COALESCE(registration_locked, 0) FROM settings ORDER BY id DESC LIMIT 1").fetchone()
-    return bool(row and row[0])
+    """名单已锁定，或已到截止时间（后台随后写入锁定）。"""
+    row = conn.execute(
+        "SELECT COALESCE(registration_locked, 0), registration_end_time FROM settings ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return bool(row and (row[0] or deadline_passed(parse_optional_time(row[1]))))
 
 
 def _max_flow(groups, seats):
@@ -1390,6 +1429,192 @@ def export_stamp():
     return datetime.now(APP_TZ).strftime("%Y%m%d_%H%M")
 
 
+def gen_admin_password():
+    # 字母表去掉易混淆字符。
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(12))
+
+
+# ==========================================================================
+# 备份：危险操作前与锁定时自动保存数据库快照；完整备份含数据库与社团照片
+# ==========================================================================
+BACKUP_DIR = os.path.abspath(os.environ.get(
+    "BACKUP_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups"),
+))
+BACKUP_KEEP = max(1, int(os.environ.get("BACKUP_KEEP", "30")))
+BACKUP_NAME_RE = re.compile(r"(\d{8}-\d{6})-([a-z-]+)\.db")
+BACKUP_LABELS = {
+    "locked": "名单锁定", "before-adjust": "调剂前", "before-clear": "清空报名前",
+    "before-delete-students": "清空学生前", "before-delete-clubs": "清空社团前", "before-restore": "恢复前",
+}
+BACKUP_DB_NAME = "club_system.db"
+BACKUP_TABLES = {"settings", "students", "clubs", "registrations"}
+
+
+def copy_database(source_path, target_path):
+    """用 SQLite 备份接口复制：源库同时被写入时，得到的是某一时刻的完整状态。"""
+    source = sqlite3.connect(source_path, timeout=30.0)
+    try:
+        target = sqlite3.connect(target_path, timeout=30.0)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+def list_snapshots():
+    try:
+        names = os.listdir(BACKUP_DIR)
+    except OSError:
+        return []
+    return sorted((name for name in names if BACKUP_NAME_RE.fullmatch(name)), reverse=True)
+
+
+def snapshot_database(label):
+    """把当前数据库存入备份目录，返回文件名；只保留最近 BACKUP_KEEP 份。"""
+    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    name = "{}-{}.db".format(datetime.now(APP_TZ).strftime("%Y%m%d-%H%M%S"), label)
+    path = os.path.join(BACKUP_DIR, name)
+    partial = path + ".part"
+    try:
+        copy_database(DB_PATH, partial)
+        os.replace(partial, path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(partial)
+    for stale in list_snapshots()[BACKUP_KEEP:]:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(BACKUP_DIR, stale))
+    return name
+
+
+def backup_archive():
+    """完整备份：数据库与当前的社团照片，打成 zip。"""
+    out = io.BytesIO()
+    with tempfile.TemporaryDirectory(prefix="omms-backup-") as tmp:
+        database = os.path.join(tmp, BACKUP_DB_NAME)
+        copy_database(DB_PATH, database)
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(database, BACKUP_DB_NAME)
+            with contextlib.suppress(OSError):
+                for entry in sorted(os.listdir(CLUB_IMAGE_DIR)):
+                    if _CLUB_IMAGE_NAME.fullmatch(entry):
+                        archive.write(os.path.join(CLUB_IMAGE_DIR, entry), "club-images/" + entry,
+                                      compress_type=zipfile.ZIP_STORED)
+    return out.getvalue()
+
+
+def database_counts(path):
+    conn = sqlite3.connect(path, timeout=30.0)
+    try:
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("数据库文件损坏")
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = BACKUP_TABLES - tables
+        if missing:
+            raise ValueError("缺少数据表：" + "、".join(sorted(missing)))
+        return tuple(conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+                     for table in ("students", "clubs", "registrations"))
+    finally:
+        conn.close()
+
+
+def flush_redis_state():
+    """删除本系统在 Redis 中的全部键（会话、名额、镜像），服务启动时按 SQLite 重新发布。"""
+    deleted = 0
+    batch = []
+    for name in RG.r.scan_iter(match=REDIS_PREFIX + "*", count=1000):
+        batch.append(name)
+        if len(batch) >= 500:
+            deleted += RG.r.delete(*batch)
+            batch = []
+    if batch:
+        deleted += RG.r.delete(*batch)
+    return deleted
+
+
+def cli_restore(path):
+    """从完整备份（.zip）或数据库快照（.db）恢复，需先停止服务。"""
+    if not os.path.isfile(path):
+        print("找不到备份文件：" + path)
+        return 1
+    with tempfile.TemporaryDirectory(prefix="omms-restore-") as tmp:
+        images = None
+        source = path
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                names = archive.namelist()
+                if BACKUP_DB_NAME not in names:
+                    print("备份中没有 " + BACKUP_DB_NAME)
+                    return 1
+                source = os.path.join(tmp, BACKUP_DB_NAME)
+                with archive.open(BACKUP_DB_NAME) as src, open(source, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                images = {}
+                for name in names:
+                    base = name[len("club-images/"):] if name.startswith("club-images/") else ""
+                    if _CLUB_IMAGE_NAME.fullmatch(base):
+                        images[base] = archive.read(name)
+        try:
+            students, clubs, registrations = database_counts(source)
+        except (ValueError, sqlite3.Error) as exc:
+            print("备份文件不可用：{}".format(exc))
+            return 1
+        saved = snapshot_database("before-restore") if os.path.exists(DB_PATH) else None
+        copy_database(source, DB_PATH)
+        if images is not None:
+            os.makedirs(CLUB_IMAGE_DIR, mode=0o700, exist_ok=True)
+            for entry in os.listdir(CLUB_IMAGE_DIR):
+                if _CLUB_IMAGE_NAME.fullmatch(entry):
+                    os.remove(os.path.join(CLUB_IMAGE_DIR, entry))
+            for base, data in images.items():
+                descriptor = os.open(os.path.join(CLUB_IMAGE_DIR, base), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(descriptor, "wb") as target:
+                    target.write(data)
+    try:
+        flush_redis_state()
+    except Exception:  # noqa: BLE001
+        print("Redis 未连接：会话与名额在下次启动时重新发布。")
+    print("已恢复：学生 {} 名，社团 {} 个，报名 {} 条{}。".format(
+        students, clubs, registrations, "，照片 {} 张".format(len(images)) if images is not None else ""))
+    if saved:
+        print("恢复前的数据库已保存为 " + os.path.join(BACKUP_DIR, saved))
+    return 0
+
+
+def cli_reset_admin_password():
+    if not os.path.isfile(DB_PATH):
+        print("找不到数据库：" + DB_PATH)
+        return 1
+    password = gen_admin_password()
+    password_hash = hash_password(password)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        row = cur.execute("SELECT id, admin_username FROM settings ORDER BY id DESC LIMIT 1").fetchone()
+        if not row:
+            conn.rollback()
+            print("数据库中没有系统设置，请先启动一次服务。")
+            return 1
+        cur.execute("UPDATE settings SET admin_password=? WHERE id=?", (password_hash, row[0]))
+        append_audit_event(
+            cur, event_id="admin-password-reset-" + secrets.token_urlsafe(18), actor_role="admin",
+            actor_id="命令行", action="admin.password_reset", target_type="settings", target_id=row[0],
+            after={"password_reset": True},
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with contextlib.suppress(Exception):
+        RG.session_revoke_role("admin")
+    print("管理员账号 {}，新密码 {}".format(row[1] or "admin", password))
+    print("该密码仅输出一次，原有的管理员登录已失效。")
+    return 0
+
+
 def restriction_code(grade, klass, allowed_grades, allowed_classes):
     """资格不符时返回提示码，符合返回 None。"""
     grades = strict_text_list(allowed_grades)
@@ -1559,7 +1784,8 @@ def build_seats():
     with DB_POOL.connection() as conn:
         rows = conn.execute("SELECT id, max_students, current_students FROM clubs ORDER BY id").fetchall()
         setting = conn.execute(
-            "SELECT registration_start_time, registration_locked FROM settings ORDER BY id DESC LIMIT 1"
+            "SELECT registration_start_time, registration_locked, registration_end_time "
+            "FROM settings ORDER BY id DESC LIMIT 1"
         ).fetchone()
     live = RG.stock_left([row[0] for row in rows]) or {}
     seats = []
@@ -1574,9 +1800,11 @@ def build_seats():
             open_at = parse_local_time(setting[0])
         except ValueError:
             open_at = None
-    locked = bool(setting and setting[1]) or bool(RG.locked_get())
+    close_at = parse_optional_time(setting[2]) if setting else None
+    locked = bool(setting and setting[1]) or bool(RG.locked_get()) or deadline_passed(close_at, RG.now_epoch_ms())
     return {"catalog": catalog_etag, "open_at": open_at * 1000 if open_at is not None else None,
-            "locked": locked, "seats": seats}
+            "close_at": close_at * 1000 if close_at is not None else None,
+            "end_time": setting[2] if close_at is not None else None, "locked": locked, "seats": seats}
 
 
 CATALOG_CACHE = ConditionalCache(CATALOG_CACHE_SECONDS, build_catalog)
@@ -1771,6 +1999,7 @@ def init_db():
 
         ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")
         ensure_column("settings", "registration_locked", "registration_locked INTEGER NOT NULL DEFAULT 0")
+        ensure_column("settings", "registration_end_time", "registration_end_time TEXT")
         for name, definition in (
             ("description", "description TEXT NOT NULL DEFAULT ''"),
             ("advisor_name", "advisor_name TEXT NOT NULL DEFAULT ''"),
@@ -1897,13 +2126,12 @@ def init_db():
         cur.execute("SELECT id, admin_password FROM settings LIMIT 1")
         row = cur.fetchone()
         if row is None:
-            # 首次启动生成随机管理员口令，只在日志里输出一次；字母表去掉易混淆字符。
-            _pw_alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
-            init_admin_pw = "".join(secrets.choice(_pw_alphabet) for _ in range(12))
+            # 首次启动生成随机管理员口令，只在日志里输出一次。
+            init_admin_pw = gen_admin_password()
             cur.execute("INSERT INTO settings (admin_password) VALUES (?)", (hash_password(init_admin_pw),))
             log.warning("=" * 60)
             log.warning("首次启动：管理员账号 admin，初始密码 %s", init_admin_pw)
-            log.warning("该密码仅输出一次，请登录后在“设置”中修改。")
+            log.warning("该密码仅输出一次，请登录后在“设置”中修改；忘记时在服务器上执行 bash run.sh reset-admin。")
             log.warning("=" * 60)
         else:
             # 管理员口令一次性迁移成 argon2
@@ -1955,7 +2183,7 @@ def rebuild_all(token=None):
                 "SELECT student_id, club_id, operation_id FROM registrations"
             ).fetchall()
             setting = conn.execute(
-                "SELECT registration_start_time, registration_locked "
+                "SELECT registration_start_time, registration_locked, registration_end_time "
                 "FROM settings ORDER BY id DESC LIMIT 1"
             ).fetchone()
             conn.commit()
@@ -1967,7 +2195,8 @@ def rebuild_all(token=None):
                 log.warning("报名开放时间格式无效: %s", setting[0])
         stocks = {int(cid): max(0, int(maximum) - int(used)) for cid, maximum, used in rows}
         mirrors = {int(sid): reservation_mirror(cid, op) for sid, cid, op in registrations}
-        RG.publish_all(token, stocks, mirrors, open_at, bool(setting and setting[1]))
+        RG.publish_all(token, stocks, mirrors, open_at, bool(setting and setting[1]),
+                       parse_optional_time(setting[2]) if setting else None)
         with DB_POOL.connection() as conn:
             conn.execute(
                 "UPDATE clubs SET current_students="
@@ -1990,24 +2219,69 @@ def seed_settings_mirror():
     try:
         with DB_POOL.connection() as conn:
             row = conn.execute(
-                "SELECT registration_start_time, registration_locked "
+                "SELECT registration_start_time, registration_locked, registration_end_time "
                 "FROM settings ORDER BY id DESC LIMIT 1"
             ).fetchone()
         if not row:
             return
         RG.open_at_set(parse_local_time(row[0]) if row[0] else None)
+        RG.close_at_set(parse_optional_time(row[2]))
         RG.locked_set(bool(row[1]))
     except (RuntimeError, ValueError) as e:
         log.warning("同步开放时间与锁定状态失败: %s", e)
 
 
+def lock_at_deadline():
+    """到截止时间后写入锁定：清除截止时间，记入操作记录，并保存快照。抢位脚本此前已按截止时间拒绝。"""
+    with DB_POOL.connection() as conn:
+        row = conn.execute(
+            "SELECT id, registration_end_time, COALESCE(registration_locked, 0) FROM settings ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    close_at = parse_optional_time(row[1]) if row else None
+    if close_at is None or not deadline_passed(close_at, RG.now_epoch_ms()):
+        return False
+    if row[2]:
+        with DB_POOL.connection() as conn:
+            conn.execute("UPDATE settings SET registration_end_time=NULL WHERE id=? AND registration_end_time=?",
+                         (row[0], row[1]))
+        RG.close_at_set(None)
+        SEATS_CACHE.invalidate()
+        return False
+    with DB_POOL.connection() as conn:
+        cur = conn.cursor()
+        conn.execute("BEGIN IMMEDIATE")
+        current = cur.execute(
+            "SELECT registration_end_time, COALESCE(registration_locked, 0) FROM settings WHERE id=?", (row[0],)
+        ).fetchone()
+        if not current or current[0] != row[1] or current[1]:
+            conn.rollback()
+            return False
+        cur.execute("UPDATE settings SET registration_locked=1, registration_end_time=NULL WHERE id=?", (row[0],))
+        append_audit_event(
+            cur, event_id="registration-deadline-" + secrets.token_urlsafe(18), actor_role="admin",
+            actor_id="系统", action="registration.lock_updated", target_type="settings", target_id=row[0],
+            reason="到达截止时间", before={"locked": False, "end_time": row[1]}, after={"locked": True},
+        )
+        conn.commit()
+    RG.locked_set(True)
+    RG.close_at_set(None)
+    SEATS_CACHE.invalidate()
+    log.info("到达截止时间 %s，名单已锁定", row[1])
+    try:
+        snapshot_database("locked")
+    except (OSError, sqlite3.Error) as exc:
+        log.error("锁定后自动备份失败: %s", exc)
+    return True
+
+
 def seat_worker():
-    """后台维护名额：Redis 重启后整体发布，按需修复单个社团，定期清理失效的在途成员。"""
+    """后台维护名额：Redis 重启后整体发布，按需修复单个社团，定期清理失效的在途成员，到截止时间写入锁定。"""
     last_scan = 0.0
     while not RECONCILE_STOP.wait(REPAIR_INTERVAL):
         try:
             if not RG.alive():
                 continue
+            lock_at_deadline()
             if RECONCILE_REQUESTED.is_set() or not RG.r.exists(K_INIT):
                 RECONCILE_REQUESTED.set()
                 if rebuild_all():
@@ -2054,6 +2328,8 @@ GET_ROUTES = {
     "/api/admin/summary": ("_h_admin_summary", ROLE_ADMIN),
     "/api/admin/adjustment": ("_h_adjustment_plan", ROLE_ADMIN),
     "/api/export_workbook": ("_h_export_workbook", ROLE_ADMIN),
+    "/api/admin/backup": ("_h_backup", ROLE_ADMIN),
+    "/api/admin/backups": ("_h_backups", ROLE_ADMIN),
     "/api/admin/preflight_plan": ("_h_preflight_plan", ROLE_ADMIN),
 }
 POST_ROUTES = {
@@ -2078,6 +2354,9 @@ POST_ROUTES = {
     "/api/admin/remove_registration": ("_h_admin_remove_registration", ROLE_ADMIN),
     "/api/admin/transfer_registration": ("_h_admin_transfer_registration", ROLE_ADMIN),
     "/api/admin/adjust_registrations": ("_h_adjust_registrations", ROLE_ADMIN),
+    "/api/admin/clear_registrations": ("_h_clear_registrations", ROLE_ADMIN),
+    "/api/admin/update_student": ("_h_update_student", ROLE_ADMIN),
+    "/api/admin/reset_class_passwords": ("_h_reset_class_passwords", ROLE_ADMIN),
     "/api/remove_club_image": ("_h_remove_club_image", ROLE_ADMIN),
 }
 RAW_POST_ROUTES = {
@@ -2444,15 +2723,17 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_check_time(self, sess):
         open_at = RG.open_at_get()
         start_str = None
+        end_str = None
         db_locked = False
         try:
             with DB_POOL.connection() as conn:
                 row = conn.execute(
-                    "SELECT registration_start_time, registration_locked "
+                    "SELECT registration_start_time, registration_locked, registration_end_time "
                     "FROM settings ORDER BY id DESC LIMIT 1"
                 ).fetchone()
             if row:
                 db_locked = bool(row[1])
+                end_str = row[2]
                 if open_at is None and row[0]:
                     start_str = row[0]
                     try:
@@ -2463,8 +2744,9 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             pass
         if open_at is not None and start_str is None:
             start_str = format_local_time(open_at)
-        locked = db_locked or bool(RG.locked_get())
+        close_at = parse_optional_time(end_str)
         server_now = RG.now_epoch_ms()
+        locked = db_locked or bool(RG.locked_get()) or deadline_passed(close_at, server_now)
         can = open_at is not None and server_now >= open_at * 1000 and not locked
         self._json(200, {
             "can_register": can,
@@ -2472,7 +2754,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             "open_at": open_at * 1000 if open_at is not None else None,
             "server_now": server_now,
             "registration_locked": locked,
-            "end_time": None,
+            "end_time": end_str if close_at is not None else None,
+            "close_at": close_at * 1000 if close_at is not None else None,
         }, extra=[("Cache-Control", "no-store")])
 
     def _h_get_clubs(self, sess):
@@ -3116,6 +3399,113 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         finally:
             RG.session_end_mutation(mutation_lock)
 
+    def _h_update_student(self, sess, data):
+        """修改姓名、班级、学号；账号和密码不变。班级变化时该生重新登录。"""
+        try:
+            student_id = int(data.get("student_id"))
+        except (TypeError, ValueError):
+            return self._json(400, {"success": False, "message": "缺少或非法的学生ID"})
+        request_id = admin_request_id(data)
+        name = clean_text(data.get("name"))
+        klass = clean_text(data.get("class"))
+        number = clean_text(data.get("student_no"), maxlen=40)
+        if request_id is None or not name or not klass or not number:
+            return self._json(400, {"success": False, "message": "请填写姓名、班级和学号"})
+        actor = sess.get("username", "admin")
+        replay = self._admin_replay(actor, "student.updated", request_id)
+        if replay:
+            if str(replay[1]) != str(student_id):
+                return self._json(409, {"success": False, "message": "request_id 已用于其他学生"})
+            return self._json(200, {"success": True, "replayed": True, "changed": True})
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                row = cur.execute("SELECT name, class, student_id FROM students WHERE id=?",
+                                  (student_id,)).fetchone()
+                if not row:
+                    conn.rollback()
+                    return self._json(404, {"success": False, "message": "学生不存在"})
+                if (name, klass, number) == tuple(row):
+                    conn.rollback()
+                    return self._json(200, {"success": True, "changed": False})
+                cur.execute("UPDATE students SET name=?, class=?, grade=?, student_id=? WHERE id=?",
+                            (name, klass, derive_grade(klass), number, student_id))
+                append_audit_event(
+                    cur, event_id="student-update-" + secrets.token_urlsafe(18), actor_role="admin",
+                    actor_id=actor, action="student.updated", target_type="student", target_id=student_id,
+                    request_id=request_id,
+                    before={"name": row[0], "class": row[1], "student_no": row[2]},
+                    after={"name": name, "class": klass, "student_no": number},
+                )
+                conn.commit()
+        except sqlite3.IntegrityError:
+            return self._json(409, {"success": False, "message": "学号 {} 已被其他学生使用".format(number)})
+        except sqlite3.Error as e:
+            log.error("修改学生失败: %s", e)
+            return self._json(500, {"success": False, "message": "保存失败"})
+        if klass != row[1]:
+            with contextlib.suppress(RuntimeError):
+                RG.session_revoke_identity("student", str(student_id))
+        self._json(200, {"success": True, "changed": True})
+
+    def _h_reset_class_passwords(self, sess, data):
+        """为一个班的全部学生生成新密码；明文只在本次响应中出现。"""
+        klass = clean_text(data.get("class"))
+        request_id = admin_request_id(data)
+        reason = clean_text(data.get("reason"), maxlen=400)
+        if not klass or request_id is None or not reason:
+            return self._json(400, {"success": False, "message": "请选择班级并填写原因"})
+        actor = sess.get("username", "admin")
+        replay = self._admin_replay(actor, "students.passwords_reset", request_id)
+        if replay:
+            after = json.loads(replay[3] or "{}")
+            return self._json(200, {"success": True, "replayed": True, "count": after.get("count", 0),
+                                    "credentials": [],
+                                    "message": "该请求已执行，新密码仅在首次返回时显示"})
+        with DB_POOL.connection() as conn:
+            students = conn.execute(
+                "SELECT id, name, class, username FROM students WHERE class=? ORDER BY student_id, id", (klass,)
+            ).fetchall()
+        if not students:
+            return self._json(404, {"success": False, "message": "该班级没有学生"})
+        passwords = [gen_password() for _ in students]
+        hashes = [future.result() for future in
+                  [AUTH.submit(hash_password, password, force=True)[0] for password in passwords]]
+        locks = []
+        try:
+            for student in students:
+                lock = RG.session_begin_mutation("student", str(student[0]))
+                if not lock:
+                    return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"},
+                                      extra=[("Retry-After", "2")])
+                locks.append(lock)
+            for student in students:
+                RG.session_revoke_identity("student", str(student[0]))
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                cur.executemany("UPDATE students SET password=? WHERE id=?",
+                                [(password_hash, student[0]) for password_hash, student in zip(hashes, students)])
+                append_audit_event(
+                    cur, event_id="class-password-reset-" + secrets.token_urlsafe(18), actor_role="admin",
+                    actor_id=actor, action="students.passwords_reset", target_type="students", target_id=klass,
+                    request_id=request_id, reason=reason, before={"class": klass}, after={"count": len(students)},
+                )
+                conn.commit()
+        except RuntimeError:
+            return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+        except sqlite3.Error as e:
+            log.error("按班重置密码失败: %s", e)
+            return self._json(500, {"success": False, "message": "重置失败"})
+        finally:
+            for lock in locks:
+                RG.session_end_mutation(lock)
+        credentials = [{"name": name, "class": student_class, "username": username, "password": password}
+                       for (_sid, name, student_class, username), password in zip(students, passwords)]
+        self._json(200, {"success": True, "count": len(students), "credentials": credentials},
+                   extra=[("Cache-Control", "no-store")])
+
     def _h_update_club(self, sess, data):
         club_id = data.get("club_id")
         try:
@@ -3495,6 +3885,15 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         if "override_eligibility" in data and type(data["override_eligibility"]) is not bool:
             return None
         return student_id, club_id, request_id, reason, bool(data.get("override_eligibility", False))
+
+    def _snapshot_before(self, label):
+        """危险操作前保存快照；失败时直接回复并返回 None。"""
+        try:
+            return snapshot_database(label)
+        except (OSError, sqlite3.Error) as exc:
+            log.error("自动备份失败: %s", exc)
+            self._json(500, {"success": False, "message": "自动备份失败，操作未执行"})
+            return None
 
     def _admin_replay(self, actor, action, request_id):
         with DB_POOL.connection() as conn:
@@ -3930,6 +4329,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                               extra=[("Retry-After", "2")])
         try:
             with DB_POOL.connection() as conn:
+                locked_now = registration_locked(conn)
+            if not locked_now:
+                return self._json(409, {"success": False, "message": "请先锁定名单"})
+            backup = self._snapshot_before("before-adjust")
+            if backup is None:
+                return
+            with DB_POOL.connection() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     if not registration_locked(conn):
@@ -3953,7 +4359,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         action="registrations.adjusted", target_type="registrations", request_id=request_id,
                         before={"unregistered": len(pairs) + len(unplaced)},
                         after=dict(summary, students=[[student, club] for student, club in pairs]),
-                        metadata={"batch": batch},
+                        metadata={"batch": batch, "backup": backup},
                     )
                     conn.commit()
                 except sqlite3.Error as e:
@@ -3964,9 +4370,96 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 RECONCILE_REQUESTED.set()
                 return self._json(503, dict(summary, success=False, message="调剂已保存，名额稍后发布"),
                                   extra=[("Retry-After", "2")])
+            self._json(200, dict(summary, success=True, backup=backup))
+        finally:
+            RG.maintenance_end(maintenance)
+
+    def _h_clear_registrations(self, sess, data):
+        """名单锁定后删除全部报名，学生与社团保留；清空前自动备份。"""
+        request_id = admin_request_id(data)
+        if request_id is None:
+            return self._json(400, {"success": False, "message": "请求编号无效"})
+        actor = sess.get("username", "admin")
+        replay = self._admin_replay(actor, "registrations.cleared", request_id)
+        if replay:
+            return self._json(200, dict(json.loads(replay[3] or "{}"), success=True, replayed=True))
+        maintenance = RG.maintenance_begin()
+        if not maintenance:
+            return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        try:
+            with DB_POOL.connection() as conn:
+                locked_now = registration_locked(conn)
+            if not locked_now:
+                return self._json(409, {"success": False, "message": "请先锁定名单"})
+            backup = self._snapshot_before("before-clear")
+            if backup is None:
+                return
+            with DB_POOL.connection() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur = conn.cursor()
+                    by_club = dict(cur.execute(
+                        "SELECT club_id, COUNT(*) FROM registrations GROUP BY club_id").fetchall())
+                    summary = {"cleared": sum(by_club.values()), "backup": backup}
+                    cur.execute("DELETE FROM registrations")
+                    cur.execute("UPDATE clubs SET current_students = 0")
+                    append_audit_event(
+                        cur, event_id="clear-" + secrets.token_urlsafe(18), actor_role="admin", actor_id=actor,
+                        action="registrations.cleared", target_type="registrations", request_id=request_id,
+                        before={"registrations": summary["cleared"],
+                                "by_club": {str(club): count for club, count in sorted(by_club.items())}},
+                        after=summary,
+                    )
+                    conn.commit()
+                except sqlite3.Error as e:
+                    conn.rollback()
+                    log.error("清空报名失败: %s", e)
+                    return self._json(500, {"success": False, "message": "清空失败"})
+            if not rebuild_all(maintenance):
+                RECONCILE_REQUESTED.set()
+                return self._json(503, dict(summary, success=False, message="报名已清空，名额稍后发布"),
+                                  extra=[("Retry-After", "2")])
             self._json(200, dict(summary, success=True))
         finally:
             RG.maintenance_end(maintenance)
+
+    def _h_backup(self, sess):
+        """不带参数时生成完整备份；name 指定时下载该份自动快照。"""
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        name = (qs.get("name") or [""])[0]
+        if name:
+            if not BACKUP_NAME_RE.fullmatch(name):
+                return self._json(400, {"success": False, "message": "备份名称无效"})
+            try:
+                with open(os.path.join(BACKUP_DIR, name), "rb") as source:
+                    body = source.read()
+            except OSError:
+                return self._json(404, {"success": False, "message": "备份不存在"})
+            return self._send(200, body, ctype="application/vnd.sqlite3",
+                              extra=[attachment_header(name, name), ("Cache-Control", "no-store")])
+        try:
+            body = backup_archive()
+        except (OSError, sqlite3.Error) as exc:
+            log.error("生成完整备份失败: %s", exc)
+            return self._json(500, {"success": False, "message": "生成备份失败"})
+        stamp = export_stamp()
+        self._send(200, body, ctype="application/zip",
+                   extra=[attachment_header("社团报名备份_{}.zip".format(stamp), "omms-backup_{}.zip".format(stamp)),
+                          ("Cache-Control", "no-store")])
+
+    def _h_backups(self, sess):
+        items = []
+        for name in list_snapshots():
+            stamp, label = BACKUP_NAME_RE.fullmatch(name).groups()
+            try:
+                size = os.path.getsize(os.path.join(BACKUP_DIR, name))
+            except OSError:
+                continue
+            items.append({"name": name, "label": BACKUP_LABELS.get(label, label), "size": size,
+                          "time": datetime.strptime(stamp, "%Y%m%d-%H%M%S").strftime(TIME_FORMAT)})
+        self._json(200, {"success": True, "backups": items, "keep": BACKUP_KEEP, "directory": BACKUP_DIR},
+                   extra=[("Cache-Control", "no-store")])
 
     def _h_import_students(self, sess, data):
         students = data.get("students", [])
@@ -4081,31 +4574,56 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         self._json(200, {"success": results["success"], "failed": results["failed"]})
 
     def _h_update_time(self, sess, data):
-        start_time = data.get("start_time") or ""
-        if not isinstance(start_time, str):
-            return self._json(400, {"success": False, "message": "时间格式错误"})
-        start_time = start_time.strip() or None
-        open_at = None
-        if start_time:
-            try:
-                open_at = parse_local_time(start_time)
-            except ValueError:
-                return self._json(400, {"success": False, "message": "时间格式应为 YYYY-MM-DD HH:MM:SS"})
+        """start_time、end_time 出现即更新，空字符串表示清除；到截止时间后名单自动锁定。"""
+        values = {}
+        for field in ("start_time", "end_time"):
+            if field not in data:
+                continue
+            text = data.get(field) or ""
+            if not isinstance(text, str):
+                return self._json(400, {"success": False, "message": "时间格式错误"})
+            text = text.strip() or None
+            if text:
+                try:
+                    parse_local_time(text)
+                except ValueError:
+                    return self._json(400, {"success": False, "message": "时间格式应为 YYYY-MM-DD HH:MM:SS"})
+            values[field] = text
+        if not values:
+            return self._json(400, {"success": False, "message": "缺少开放时间或截止时间"})
+        actor = sess.get("username", "admin")
+        columns = {"start_time": ("registration_start_time", "registration.start_time_updated"),
+                   "end_time": ("registration_end_time", "registration.end_time_updated")}
         try:
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()
                 conn.execute("BEGIN IMMEDIATE")
-                previous = cur.execute(
-                    "SELECT registration_start_time FROM settings ORDER BY id DESC LIMIT 1"
+                row = cur.execute(
+                    "SELECT id, registration_start_time, registration_end_time FROM settings ORDER BY id DESC LIMIT 1"
                 ).fetchone()
-                cur.execute("UPDATE settings SET registration_start_time = ?", (start_time,))
-                append_audit_event(
-                    cur, event_id="registration-time-" + secrets.token_urlsafe(18),
-                    actor_role="admin", actor_id=sess.get("username", "admin"),
-                    action="registration.start_time_updated", target_type="settings",
-                    before={"start_time": previous[0] if previous else None},
-                    after={"start_time": start_time},
-                )
+                if not row:
+                    conn.rollback()
+                    return self._json(500, {"success": False, "message": "系统设置不存在"})
+                current = {"start_time": row[1], "end_time": row[2]}
+                merged = dict(current, **values)
+                open_at = parse_optional_time(merged["start_time"])
+                close_at = parse_optional_time(merged["end_time"])
+                if values.get("end_time") and close_at * 1000 <= RG.now_epoch_ms():
+                    conn.rollback()
+                    return self._json(400, {"success": False, "message": "截止时间应晚于当前时间"})
+                if open_at is not None and close_at is not None and close_at <= open_at:
+                    conn.rollback()
+                    return self._json(400, {"success": False, "message": "截止时间应晚于开放时间"})
+                for field, value in values.items():
+                    if value == current[field]:
+                        continue
+                    column, action = columns[field]
+                    cur.execute("UPDATE settings SET {} = ? WHERE id = ?".format(column), (value, row[0]))
+                    append_audit_event(
+                        cur, event_id="registration-time-" + secrets.token_urlsafe(18),
+                        actor_role="admin", actor_id=actor, action=action, target_type="settings",
+                        target_id=row[0], before={field: current[field]}, after={field: value},
+                    )
                 conn.commit()
         except sqlite3.Error as e:
             log.error("更新报名时间失败: %s", e)
@@ -4113,12 +4631,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         SEATS_CACHE.invalidate()
         try:
             RG.open_at_set(open_at)
+            RG.close_at_set(close_at)
         except RuntimeError as e:
-            log.error("报名时间已保存，同步开放时间失败: %s", e)
+            log.error("报名时间已保存，同步到 Redis 失败: %s", e)
             RECONCILE_REQUESTED.set()
             return self._json(503, {"success": False, "message": "时间已保存，正在同步"},
                               extra=[("Retry-After", "2")])
-        self._json(200, {"success": True})
+        self._json(200, {"success": True, "start_time": merged["start_time"], "end_time": merged["end_time"]})
 
     def _h_update_registration_lock(self, sess, data):
         locked = data.get("locked")
@@ -4131,6 +4650,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         actor = sess.get("username", "admin")
         event_id = None
         changed = True
+        clear_close = False
         try:
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()
@@ -4161,6 +4681,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     else:
                         cur.execute("UPDATE settings SET registration_locked=? WHERE id=?",
                                     (int(locked), settings_id))
+                        if not locked:
+                            end_row = cur.execute("SELECT registration_end_time FROM settings WHERE id=?",
+                                                  (settings_id,)).fetchone()
+                            if end_row and deadline_passed(parse_optional_time(end_row[0])):
+                                cur.execute("UPDATE settings SET registration_end_time=NULL WHERE id=?",
+                                            (settings_id,))
+                                clear_close = True
                         event_id = "registration-lock-" + secrets.token_urlsafe(18)
                         append_audit_event(
                             cur, event_id=event_id, actor_role="admin", actor_id=actor,
@@ -4175,6 +4702,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         SEATS_CACHE.invalidate()
         try:
             RG.locked_set(locked)
+            if clear_close:
+                RG.close_at_set(None)
         except RuntimeError:
             return self._json(503, {"success": False, "request_id": request_id, "retriable": True,
                                     "message": "锁定状态已保存，正在同步；请用同一请求编号重试"},
@@ -4185,6 +4714,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         payload = {"success": True, "locked": locked, "changed": changed, "request_id": request_id}
         if event_id:
             payload["event_id"] = event_id
+            if locked:
+                try:
+                    payload["backup"] = snapshot_database("locked")
+                except (OSError, sqlite3.Error) as exc:
+                    log.error("锁定后自动备份失败: %s", exc)
         self._json(200, payload)
 
     def _h_delete_student(self, sess, data):
@@ -4253,6 +4787,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                               extra=[("Retry-After", "2")])
         session_lock = None
         try:
+            if self._snapshot_before("before-delete-students") is None:
+                return
             try:
                 session_lock = RG.session_begin_mutation("student")
                 if not session_lock:
@@ -4341,6 +4877,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
                               extra=[("Retry-After", "2")])
         try:
+            if self._snapshot_before("before-delete-clubs") is None:
+                return
             with DB_POOL.connection() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
@@ -4438,4 +4976,12 @@ def main():
 
 
 if __name__ == "__main__":
+    arguments = sys.argv[1:]
+    if arguments == ["reset-admin-password"]:
+        sys.exit(cli_reset_admin_password())
+    if len(arguments) == 2 and arguments[0] == "restore":
+        sys.exit(cli_restore(arguments[1]))
+    if arguments:
+        print("用法：python3 main.py [reset-admin-password | restore 备份文件]")
+        sys.exit(2)
     main()
