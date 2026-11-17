@@ -27,7 +27,7 @@
 
 - 从 Excel 粘贴名单，识别姓名、班级、学号列，分批创建账号；下载账号密码表，或按班打印账号条（A4，每个班级从新的一页开始）。
 - 按班重置密码，新密码同样可以下载或打印。
-- 编辑社团名称、名额、简介、老师、时间地点、年级与班级范围和照片；没有上传照片时，3D 打印、传媒、木工等社团显示对应插图。
+- 编辑社团名称、名额、简介、老师、时间地点、年级与班级范围和照片；照片可直接用手机原图（10 MB 以内），服务器缩到长边 960 像素后保存。没有上传照片时，3D 打印、传媒、木工等社团显示对应插图。
 - 设置开放时间和截止时间；到截止时间自动锁定名单，也可以手动锁定。
 - 调剂：锁定后把未报名的学生随机安排到有空余名额的社团，遵守年级和班级范围，安排人数取最大值。
 - 下载 Excel 报名表：总表、各社团名单、未报名名单，“方式”一列区分自选、调剂和管理员安排。
@@ -99,7 +99,22 @@ sudo cp deploy/systemd/omms-*.service /etc/systemd/system/
 sudo systemctl enable --now omms-python omms-hot
 ```
 
-nginx 使用仓库里的 `nginx.conf`：把 `__APP_ROOT__`、`__RUN_DIR__` 替换为实际路径，再加上 443 端口的 TLS 配置。
+nginx 使用仓库里的 `nginx.conf`：把 `__APP_ROOT__`、`__RUN_DIR__` 替换为实际路径；需要 HTTPS 时按 `run.sh` 中 `TLS_CERT` 的写法加入证书配置。
+
+## 在 Mac 上运行
+
+Apple 芯片的 Mac 可以直接做服务器。用 Homebrew 安装依赖后执行 `bash run.sh`：
+
+```bash
+brew install redis nginx
+python3 -m pip install redis argon2-cffi pypinyin Pillow
+```
+
+- **文件句柄**：终端默认每个进程 256 个，`run.sh` 启动前调到 65536，nginx 每个工作进程 16384。
+- **连接队列**：macOS 默认 `kern.ipc.somaxconn` 为 128，开放瞬间的连接会在内核排队。开放报名前执行 `sudo sysctl -w kern.ipc.somaxconn=2048`，重启后恢复默认；`run.sh` 在上限低于 1024 时给出这条命令。
+- **睡眠**：`run.sh` 用 `caffeinate` 在服务运行期间阻止系统闲置睡眠，接通电源时同时阻止系统睡眠。MacBook 运行期间保持开盖并接通电源。
+- **防火墙**：首次运行时系统询问是否允许 nginx 接受传入连接，选择允许。
+- **网络**：使用有线网口。三张社团照片的情况下，每名学生首次打开登录页和报名页共下载约 360 KB：1000 人约 350 MB，3000 人约 1 GB，千兆网口约 10 秒传完。开放瞬间的报名请求和每 2 秒一次的名额刷新，每次不足 1 KB。学生经无线网络访问时，各无线接入点的带宽同样限制下载速度。
 
 ## 在旧电脑上运行
 
@@ -196,6 +211,15 @@ python3 tests/stress_site.py hot --backend python --users 1000
 | `REGISTER_WAIT_MS` | `8000` | Rust 报名请求等待结果的时长，超出后返回 `pending` |
 | `MAX_CONCURRENCY` | `1024` | Rust 同时处理的请求上限 |
 
+`run.sh` 另外读取：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `TLS_CERT` / `TLS_KEY` | 空 | 证书与私钥路径。设置后在 `TLS_PORT` 上提供 HTTPS，8080 跳转到 HTTPS，两个服务使用 `COOKIE_SECURE=1` |
+| `TLS_PORT` | `8443` | HTTPS 端口 |
+| `REAL_IP_FROM` | 空 | 内网穿透或反向代理的地址，逗号分隔。nginx 只从这些地址接受 `REAL_IP_HEADER` 中的学生地址，限流按学生地址计算 |
+| `REAL_IP_HEADER` | `X-Forwarded-For` | 学生地址所在的请求头；Cloudflare Tunnel 为 `CF-Connecting-IP` |
+
 ## 学生端接口
 
 | 接口 | 说明 |
@@ -239,7 +263,8 @@ python3 tests/stress_registration.py --seats 100 --users 1000 --concurrency 1000
 
 ## 上线清单
 
-- 开启 HTTPS，两个服务设置 `COOKIE_SECURE=1`。
+- 从校外访问时设置 `TLS_CERT`、`TLS_KEY` 启用 HTTPS；经内网穿透访问时设置 `REAL_IP_FROM`。
+- 服务器是 Mac 时，开放报名前执行 `sudo sysctl -w kern.ipc.somaxconn=2048`，保持接通电源。
 - Redis 使用 `deploy/redis.conf`，或者为本系统单独分配一个库和键前缀。
 - 按学校时区设置 `APP_UTC_OFFSET`，并校准服务器时钟。
 - 提醒学生提前几分钟登录，让口令校验的计算分散在开放之前。

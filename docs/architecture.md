@@ -162,6 +162,7 @@
 - `deploy/redis.conf` 关闭持久化、限制 256 MB 内存并使用 `noeviction`，名额以 SQLite 为准，重启后自动重建。
 - `run.sh` 每次启动保留上一次的服务日志（`python.log.1`、`rust.log.1`），访问日志超过 64 MB 时换新文件。
 - 前端为原生 HTML、CSS、JS；登录页与工作台插画为 WebP（单张 21–56 KB），社团默认插图和管理端图标为内嵌 SVG。页面使用纯色顶栏和小范围阴影，适合集成显卡。
+- 社团照片上传后按 EXIF 方向摆正，缩到长边 960 像素，带透明通道的存 PNG，其余存 JPEG（质量 82），每张约 70–160 KB；文件名随每次上传变化，响应带一年的 `immutable` 缓存。
 - 管理端工作台比较服务器与管理员电脑的时钟，相差超过一分钟时提示校准。
 
 `tests/stress_site.py` 用来在目标机器上测量登录高峰、抢课和轮询，见 [tests/README.md](../tests/README.md)。

@@ -90,9 +90,11 @@ MAX_CLUB_CAPACITY = 10_000
 CLUB_IMAGE_DIR = os.path.abspath(os.environ.get(
     "CLUB_IMAGE_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "club-images"),
 ))
-MAX_CLUB_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_CLUB_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_CLUB_IMAGE_OUTPUT_BYTES = 4 * 1024 * 1024
-MAX_CLUB_IMAGE_WIDTH = 1920
+MAX_CLUB_IMAGE_PIXELS = 50_000_000
+CLUB_IMAGE_SIDE = 960           # 照片长边缩到 960 像素，卡片在 2 倍屏上仍然清晰
+MAX_CLUB_IMAGE_WIDTH = 1920     # GIF 不缩放，保持原有尺寸上限
 MAX_CLUB_IMAGE_HEIGHT = 1080
 MAX_CLUB_GIF_FRAMES = 120
 MAX_CLUB_GIF_DURATION_MS = 30_000
@@ -991,7 +993,7 @@ def _sanitize_club_image(raw, declared_type):
         raise ClubImageFeatureUnavailable("服务器暂未启用图片处理，请联系管理员")
     from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
     if not raw or len(raw) > MAX_CLUB_IMAGE_BYTES:
-        raise ClubImageError("图片内容为空或超过 2MB")
+        raise ClubImageError("图片内容为空或超过 10 MB")
     declared_type = (declared_type or "").split(";", 1)[0].strip().lower()
     if declared_type not in {mime for _ext, mime in _CLUB_IMAGE_MIME.values()}:
         raise ClubImageError("仅支持 JPEG、PNG、WebP 和 GIF")
@@ -1006,8 +1008,11 @@ def _sanitize_club_image(raw, declared_type):
                 if declared_type != actual_type:
                     raise ClubImageError("图片内容与 Content-Type 不一致")
                 width, height = source.size
-                if not (1 <= width <= MAX_CLUB_IMAGE_WIDTH and 1 <= height <= MAX_CLUB_IMAGE_HEIGHT):
-                    raise ClubImageError("图片尺寸不能超过 1920×1080")
+                if image_format == "GIF" and not (1 <= width <= MAX_CLUB_IMAGE_WIDTH
+                                                  and 1 <= height <= MAX_CLUB_IMAGE_HEIGHT):
+                    raise ClubImageError("GIF 尺寸不能超过 1920×1080")
+                if not 1 <= width * height <= MAX_CLUB_IMAGE_PIXELS:
+                    raise ClubImageError("图片不能超过 5000 万像素")
                 output = io.BytesIO()
                 frames, duration_ms = 1, 0
                 if image_format == "GIF":
@@ -1031,22 +1036,20 @@ def _sanitize_club_image(raw, declared_type):
                                      duration=durations, loop=int(source.info.get("loop", 0) or 0),
                                      disposal=2, optimize=True)
                 else:
+                    # 照片统一缩到长边 CLUB_IMAGE_SIDE；带透明通道的存 PNG，其余存 JPEG（旧版 iOS 不支持 WebP）。
+                    if image_format == "JPEG":
+                        source.draft("RGB", (CLUB_IMAGE_SIDE * 2, CLUB_IMAGE_SIDE * 2))
                     source.load()
                     image = ImageOps.exif_transpose(source)
-                    if image_format == "JPEG":
-                        if image.mode not in ("RGB", "L"):
-                            canvas = Image.new("RGB", image.size, "white")
-                            if "A" in image.getbands():
-                                canvas.paste(image, mask=image.getchannel("A"))
-                            else:
-                                canvas.paste(image)
-                            image = canvas
-                        image.convert("RGB").save(output, format="JPEG", quality=85, optimize=True,
-                                                  progressive=True, subsampling="4:2:0")
-                    elif image_format == "PNG":
-                        image.convert("RGBA" if "A" in image.getbands() else "RGB").save(output, format="PNG", optimize=True)
+                    image.thumbnail((CLUB_IMAGE_SIDE, CLUB_IMAGE_SIDE), Image.LANCZOS)
+                    width, height = image.size
+                    if "A" in image.getbands() or image.mode == "P" and "transparency" in image.info:
+                        image.convert("RGBA").save(output, format="PNG", optimize=True)
+                        extension, actual_type = _CLUB_IMAGE_MIME["PNG"]
                     else:
-                        image.convert("RGBA" if "A" in image.getbands() else "RGB").save(output, format="WEBP", quality=84, method=6)
+                        image.convert("RGB").save(output, format="JPEG", quality=82, optimize=True,
+                                                  progressive=True, subsampling="4:2:0")
+                        extension, actual_type = _CLUB_IMAGE_MIME["JPEG"]
     except ClubImageError:
         raise
     except (UnidentifiedImageError, OSError, ValueError) as exc:
@@ -2527,7 +2530,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             raise RequestBodyError("非法 Content-Length")
         n = int(length)
-        limit = MAX_BODY if max_bytes is None else min(MAX_BODY, int(max_bytes))
+        limit = MAX_BODY if max_bytes is None else int(max_bytes)
         if n > limit:
             self.close_connection = True
             raise RequestBodyError("请求体过大", status=413)
@@ -4921,7 +4924,7 @@ BUSY_BODY = json.dumps({"success": False, "code": "queued", "message": MESSAGES[
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
-    request_queue_size = 256   # 抬高 listen backlog(默认 5 -> 开放瞬间不被 reset)
+    request_queue_size = 1024  # 抬高 listen backlog(默认 5 -> 开放瞬间不被 reset)；实际上限取系统 somaxconn
 
     def __init__(self, *args, **kwargs):
         self._request_slots = threading.BoundedSemaphore(MAX_HTTP_WORKERS)

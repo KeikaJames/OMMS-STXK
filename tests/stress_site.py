@@ -212,7 +212,7 @@ class Stack:
         conf = (REPO_ROOT / "nginx.conf").read_text(encoding="utf-8")
         conf = conf.replace("__APP_ROOT__", str(REPO_ROOT)).replace("__RUN_DIR__", str(self.temp))
         conf = conf.replace("worker_processes auto;", f"worker_processes {self.args.nginx_workers};")
-        conf = conf.replace("listen 8080;", f"listen {self.nginx_port};\n        set_real_ip_from 127.0.0.1;\n"
+        conf = conf.replace("listen 8080 backlog=2048;", f"listen {self.nginx_port} backlog=2048;\n        set_real_ip_from 127.0.0.1;\n"
                                             "        real_ip_header X-Forwarded-For;")
         if self.args.backend == "python":
             conf = conf.replace("        server 127.0.0.1:2002 max_fails=2 fail_timeout=5s;\n", "")
