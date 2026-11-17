@@ -165,11 +165,13 @@ class LuaScriptTests(unittest.TestCase):
         stop_process(self.redis_process)
         self.tmp.cleanup()
 
-    def test_acquire_script_enables_effects_replication_before_writes(self) -> None:
-        code = [line for line in lua_script("acquire").splitlines() if not line.startswith("--")]
-        self.assertEqual(REPLICATE_GUARD, code[0])
+    def test_scripts_that_read_time_enable_effects_replication_first(self) -> None:
         rust = RUST_SEATS.read_text(encoding="utf-8")
-        self.assertIn('include_str!("../../shared/lua/acquire.lua")', rust)
+        for name in ("acquire", "cancel_begin"):
+            code = [line for line in lua_script(name).splitlines() if not line.startswith("--")]
+            self.assertIn("redis.call('TIME')", "\n".join(code))
+            self.assertEqual(REPLICATE_GUARD, code[0], name)
+            self.assertIn('include_str!("../../shared/lua/{}.lua")'.format(name), rust)
 
     def test_rollback_returns_a_seat_only_while_the_lease_is_owned(self) -> None:
         script = lua_script("rollback")

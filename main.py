@@ -160,6 +160,7 @@ def rk(*parts):
 
 
 K_OPEN_AT = rk("open_at")      # 报名开放 epoch 秒
+K_CLOSE_AT = rk("close_at")    # 截止 epoch 秒，到点后报名与退选停止
 K_LOCKED = rk("locked")        # "1" 表示名单已锁定
 K_INIT = rk("init")            # 整体发布完成的标记
 K_MAINT = rk("maint")          # 全局维护锁(清空类操作与冷启动)
@@ -343,7 +344,7 @@ class RedisGate:
     def acquire(self, student_id, club_id, lease, member, idem_prefix):
         """返回 acquire.lua 的结果码；本次请求的重放(2)按抢到(1)处理。"""
         keys = [k_stock(club_id), k_reg(student_id), k_op(student_id), K_OPEN_AT, K_MAINT,
-                K_LOCKED, k_fence(club_id), k_inflight(club_id)]
+                K_LOCKED, k_fence(club_id), k_inflight(club_id), K_CLOSE_AT]
         args = [lease, SEAT_OP_TTL, member, idem_prefix]
         code = int(self._run("acquire", keys, args))
         return 1 if code == 2 else code
@@ -367,7 +368,7 @@ class RedisGate:
     def cancel_begin(self, student_id, club_id, lease, member):
         return int(self._run(
             "cancel_begin",
-            [K_MAINT, k_fence(club_id), k_op(student_id), k_inflight(club_id), K_LOCKED],
+            [K_MAINT, k_fence(club_id), k_op(student_id), k_inflight(club_id), K_LOCKED, K_CLOSE_AT],
             [lease, SEAT_OP_TTL, member],
         ))
 
@@ -510,8 +511,8 @@ class RedisGate:
     def has_active_operations(self):
         return next(self._r.scan_iter(match=rk("op", "*"), count=1000), None) is not None
 
-    def publish_all(self, token, stocks, mirrors, open_at, locked):
-        """持有全局维护锁时整体发布库存、镜像、开放时间与锁定状态。"""
+    def publish_all(self, token, stocks, mirrors, open_at, locked, close_at=None):
+        """持有全局维护锁时整体发布库存、镜像、开放与截止时间、锁定状态。"""
         stale = []
         for name in ("stock", "reg", "inflight", "fence"):
             stale.extend(self._r.scan_iter(match=rk(name, "*"), count=1000))
@@ -531,6 +532,10 @@ class RedisGate:
                 pipe.delete(K_OPEN_AT)
             else:
                 pipe.set(K_OPEN_AT, int(open_at))
+            if close_at is None:
+                pipe.delete(K_CLOSE_AT)
+            else:
+                pipe.set(K_CLOSE_AT, int(close_at))
             if locked:
                 pipe.set(K_LOCKED, "1")
             else:
@@ -575,6 +580,19 @@ class RedisGate:
             self._call("delete", K_OPEN_AT)
         else:
             self._call("set", K_OPEN_AT, int(epoch))
+
+    def close_at_get(self):
+        try:
+            value = self._r.get(K_CLOSE_AT)
+            return int(value) if value is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def close_at_set(self, epoch):
+        if epoch is None:
+            self._call("delete", K_CLOSE_AT)
+        else:
+            self._call("set", K_CLOSE_AT, int(epoch))
 
     def locked_get(self):
         try:
@@ -1203,9 +1221,27 @@ def registration_method(operation_id):
     return "自选"
 
 
+def parse_optional_time(text):
+    if not text:
+        return None
+    try:
+        return parse_local_time(text)
+    except ValueError:
+        return None
+
+
+def deadline_passed(close_at, now_ms=None):
+    if close_at is None:
+        return False
+    return (now_ms if now_ms is not None else time.time() * 1000) >= close_at * 1000
+
+
 def registration_locked(conn):
-    row = conn.execute("SELECT COALESCE(registration_locked, 0) FROM settings ORDER BY id DESC LIMIT 1").fetchone()
-    return bool(row and row[0])
+    """名单已锁定，或已到截止时间（后台随后写入锁定）。"""
+    row = conn.execute(
+        "SELECT COALESCE(registration_locked, 0), registration_end_time FROM settings ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return bool(row and (row[0] or deadline_passed(parse_optional_time(row[1]))))
 
 
 def _max_flow(groups, seats):
@@ -1748,7 +1784,8 @@ def build_seats():
     with DB_POOL.connection() as conn:
         rows = conn.execute("SELECT id, max_students, current_students FROM clubs ORDER BY id").fetchall()
         setting = conn.execute(
-            "SELECT registration_start_time, registration_locked FROM settings ORDER BY id DESC LIMIT 1"
+            "SELECT registration_start_time, registration_locked, registration_end_time "
+            "FROM settings ORDER BY id DESC LIMIT 1"
         ).fetchone()
     live = RG.stock_left([row[0] for row in rows]) or {}
     seats = []
@@ -1763,9 +1800,11 @@ def build_seats():
             open_at = parse_local_time(setting[0])
         except ValueError:
             open_at = None
-    locked = bool(setting and setting[1]) or bool(RG.locked_get())
+    close_at = parse_optional_time(setting[2]) if setting else None
+    locked = bool(setting and setting[1]) or bool(RG.locked_get()) or deadline_passed(close_at, RG.now_epoch_ms())
     return {"catalog": catalog_etag, "open_at": open_at * 1000 if open_at is not None else None,
-            "locked": locked, "seats": seats}
+            "close_at": close_at * 1000 if close_at is not None else None,
+            "end_time": setting[2] if close_at is not None else None, "locked": locked, "seats": seats}
 
 
 CATALOG_CACHE = ConditionalCache(CATALOG_CACHE_SECONDS, build_catalog)
@@ -1960,6 +1999,7 @@ def init_db():
 
         ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")
         ensure_column("settings", "registration_locked", "registration_locked INTEGER NOT NULL DEFAULT 0")
+        ensure_column("settings", "registration_end_time", "registration_end_time TEXT")
         for name, definition in (
             ("description", "description TEXT NOT NULL DEFAULT ''"),
             ("advisor_name", "advisor_name TEXT NOT NULL DEFAULT ''"),
@@ -2143,7 +2183,7 @@ def rebuild_all(token=None):
                 "SELECT student_id, club_id, operation_id FROM registrations"
             ).fetchall()
             setting = conn.execute(
-                "SELECT registration_start_time, registration_locked "
+                "SELECT registration_start_time, registration_locked, registration_end_time "
                 "FROM settings ORDER BY id DESC LIMIT 1"
             ).fetchone()
             conn.commit()
@@ -2155,7 +2195,8 @@ def rebuild_all(token=None):
                 log.warning("报名开放时间格式无效: %s", setting[0])
         stocks = {int(cid): max(0, int(maximum) - int(used)) for cid, maximum, used in rows}
         mirrors = {int(sid): reservation_mirror(cid, op) for sid, cid, op in registrations}
-        RG.publish_all(token, stocks, mirrors, open_at, bool(setting and setting[1]))
+        RG.publish_all(token, stocks, mirrors, open_at, bool(setting and setting[1]),
+                       parse_optional_time(setting[2]) if setting else None)
         with DB_POOL.connection() as conn:
             conn.execute(
                 "UPDATE clubs SET current_students="
@@ -2178,24 +2219,69 @@ def seed_settings_mirror():
     try:
         with DB_POOL.connection() as conn:
             row = conn.execute(
-                "SELECT registration_start_time, registration_locked "
+                "SELECT registration_start_time, registration_locked, registration_end_time "
                 "FROM settings ORDER BY id DESC LIMIT 1"
             ).fetchone()
         if not row:
             return
         RG.open_at_set(parse_local_time(row[0]) if row[0] else None)
+        RG.close_at_set(parse_optional_time(row[2]))
         RG.locked_set(bool(row[1]))
     except (RuntimeError, ValueError) as e:
         log.warning("同步开放时间与锁定状态失败: %s", e)
 
 
+def lock_at_deadline():
+    """到截止时间后写入锁定：清除截止时间，记入操作记录，并保存快照。抢位脚本此前已按截止时间拒绝。"""
+    with DB_POOL.connection() as conn:
+        row = conn.execute(
+            "SELECT id, registration_end_time, COALESCE(registration_locked, 0) FROM settings ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    close_at = parse_optional_time(row[1]) if row else None
+    if close_at is None or not deadline_passed(close_at, RG.now_epoch_ms()):
+        return False
+    if row[2]:
+        with DB_POOL.connection() as conn:
+            conn.execute("UPDATE settings SET registration_end_time=NULL WHERE id=? AND registration_end_time=?",
+                         (row[0], row[1]))
+        RG.close_at_set(None)
+        SEATS_CACHE.invalidate()
+        return False
+    with DB_POOL.connection() as conn:
+        cur = conn.cursor()
+        conn.execute("BEGIN IMMEDIATE")
+        current = cur.execute(
+            "SELECT registration_end_time, COALESCE(registration_locked, 0) FROM settings WHERE id=?", (row[0],)
+        ).fetchone()
+        if not current or current[0] != row[1] or current[1]:
+            conn.rollback()
+            return False
+        cur.execute("UPDATE settings SET registration_locked=1, registration_end_time=NULL WHERE id=?", (row[0],))
+        append_audit_event(
+            cur, event_id="registration-deadline-" + secrets.token_urlsafe(18), actor_role="admin",
+            actor_id="系统", action="registration.lock_updated", target_type="settings", target_id=row[0],
+            reason="到达截止时间", before={"locked": False, "end_time": row[1]}, after={"locked": True},
+        )
+        conn.commit()
+    RG.locked_set(True)
+    RG.close_at_set(None)
+    SEATS_CACHE.invalidate()
+    log.info("到达截止时间 %s，名单已锁定", row[1])
+    try:
+        snapshot_database("locked")
+    except (OSError, sqlite3.Error) as exc:
+        log.error("锁定后自动备份失败: %s", exc)
+    return True
+
+
 def seat_worker():
-    """后台维护名额：Redis 重启后整体发布，按需修复单个社团，定期清理失效的在途成员。"""
+    """后台维护名额：Redis 重启后整体发布，按需修复单个社团，定期清理失效的在途成员，到截止时间写入锁定。"""
     last_scan = 0.0
     while not RECONCILE_STOP.wait(REPAIR_INTERVAL):
         try:
             if not RG.alive():
                 continue
+            lock_at_deadline()
             if RECONCILE_REQUESTED.is_set() or not RG.r.exists(K_INIT):
                 RECONCILE_REQUESTED.set()
                 if rebuild_all():
@@ -2635,15 +2721,17 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_check_time(self, sess):
         open_at = RG.open_at_get()
         start_str = None
+        end_str = None
         db_locked = False
         try:
             with DB_POOL.connection() as conn:
                 row = conn.execute(
-                    "SELECT registration_start_time, registration_locked "
+                    "SELECT registration_start_time, registration_locked, registration_end_time "
                     "FROM settings ORDER BY id DESC LIMIT 1"
                 ).fetchone()
             if row:
                 db_locked = bool(row[1])
+                end_str = row[2]
                 if open_at is None and row[0]:
                     start_str = row[0]
                     try:
@@ -2654,8 +2742,9 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             pass
         if open_at is not None and start_str is None:
             start_str = format_local_time(open_at)
-        locked = db_locked or bool(RG.locked_get())
+        close_at = parse_optional_time(end_str)
         server_now = RG.now_epoch_ms()
+        locked = db_locked or bool(RG.locked_get()) or deadline_passed(close_at, server_now)
         can = open_at is not None and server_now >= open_at * 1000 and not locked
         self._json(200, {
             "can_register": can,
@@ -2663,7 +2752,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             "open_at": open_at * 1000 if open_at is not None else None,
             "server_now": server_now,
             "registration_locked": locked,
-            "end_time": None,
+            "end_time": end_str if close_at is not None else None,
+            "close_at": close_at * 1000 if close_at is not None else None,
         }, extra=[("Cache-Control", "no-store")])
 
     def _h_get_clubs(self, sess):
@@ -4375,31 +4465,56 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         self._json(200, {"success": results["success"], "failed": results["failed"]})
 
     def _h_update_time(self, sess, data):
-        start_time = data.get("start_time") or ""
-        if not isinstance(start_time, str):
-            return self._json(400, {"success": False, "message": "时间格式错误"})
-        start_time = start_time.strip() or None
-        open_at = None
-        if start_time:
-            try:
-                open_at = parse_local_time(start_time)
-            except ValueError:
-                return self._json(400, {"success": False, "message": "时间格式应为 YYYY-MM-DD HH:MM:SS"})
+        """start_time、end_time 出现即更新，空字符串表示清除；到截止时间后名单自动锁定。"""
+        values = {}
+        for field in ("start_time", "end_time"):
+            if field not in data:
+                continue
+            text = data.get(field) or ""
+            if not isinstance(text, str):
+                return self._json(400, {"success": False, "message": "时间格式错误"})
+            text = text.strip() or None
+            if text:
+                try:
+                    parse_local_time(text)
+                except ValueError:
+                    return self._json(400, {"success": False, "message": "时间格式应为 YYYY-MM-DD HH:MM:SS"})
+            values[field] = text
+        if not values:
+            return self._json(400, {"success": False, "message": "缺少开放时间或截止时间"})
+        actor = sess.get("username", "admin")
+        columns = {"start_time": ("registration_start_time", "registration.start_time_updated"),
+                   "end_time": ("registration_end_time", "registration.end_time_updated")}
         try:
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()
                 conn.execute("BEGIN IMMEDIATE")
-                previous = cur.execute(
-                    "SELECT registration_start_time FROM settings ORDER BY id DESC LIMIT 1"
+                row = cur.execute(
+                    "SELECT id, registration_start_time, registration_end_time FROM settings ORDER BY id DESC LIMIT 1"
                 ).fetchone()
-                cur.execute("UPDATE settings SET registration_start_time = ?", (start_time,))
-                append_audit_event(
-                    cur, event_id="registration-time-" + secrets.token_urlsafe(18),
-                    actor_role="admin", actor_id=sess.get("username", "admin"),
-                    action="registration.start_time_updated", target_type="settings",
-                    before={"start_time": previous[0] if previous else None},
-                    after={"start_time": start_time},
-                )
+                if not row:
+                    conn.rollback()
+                    return self._json(500, {"success": False, "message": "系统设置不存在"})
+                current = {"start_time": row[1], "end_time": row[2]}
+                merged = dict(current, **values)
+                open_at = parse_optional_time(merged["start_time"])
+                close_at = parse_optional_time(merged["end_time"])
+                if values.get("end_time") and close_at * 1000 <= RG.now_epoch_ms():
+                    conn.rollback()
+                    return self._json(400, {"success": False, "message": "截止时间应晚于当前时间"})
+                if open_at is not None and close_at is not None and close_at <= open_at:
+                    conn.rollback()
+                    return self._json(400, {"success": False, "message": "截止时间应晚于开放时间"})
+                for field, value in values.items():
+                    if value == current[field]:
+                        continue
+                    column, action = columns[field]
+                    cur.execute("UPDATE settings SET {} = ? WHERE id = ?".format(column), (value, row[0]))
+                    append_audit_event(
+                        cur, event_id="registration-time-" + secrets.token_urlsafe(18),
+                        actor_role="admin", actor_id=actor, action=action, target_type="settings",
+                        target_id=row[0], before={field: current[field]}, after={field: value},
+                    )
                 conn.commit()
         except sqlite3.Error as e:
             log.error("更新报名时间失败: %s", e)
@@ -4407,12 +4522,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         SEATS_CACHE.invalidate()
         try:
             RG.open_at_set(open_at)
+            RG.close_at_set(close_at)
         except RuntimeError as e:
-            log.error("报名时间已保存，同步开放时间失败: %s", e)
+            log.error("报名时间已保存，同步到 Redis 失败: %s", e)
             RECONCILE_REQUESTED.set()
             return self._json(503, {"success": False, "message": "时间已保存，正在同步"},
                               extra=[("Retry-After", "2")])
-        self._json(200, {"success": True})
+        self._json(200, {"success": True, "start_time": merged["start_time"], "end_time": merged["end_time"]})
 
     def _h_update_registration_lock(self, sess, data):
         locked = data.get("locked")
@@ -4425,6 +4541,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         actor = sess.get("username", "admin")
         event_id = None
         changed = True
+        clear_close = False
         try:
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()
@@ -4455,6 +4572,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     else:
                         cur.execute("UPDATE settings SET registration_locked=? WHERE id=?",
                                     (int(locked), settings_id))
+                        if not locked:
+                            end_row = cur.execute("SELECT registration_end_time FROM settings WHERE id=?",
+                                                  (settings_id,)).fetchone()
+                            if end_row and deadline_passed(parse_optional_time(end_row[0])):
+                                cur.execute("UPDATE settings SET registration_end_time=NULL WHERE id=?",
+                                            (settings_id,))
+                                clear_close = True
                         event_id = "registration-lock-" + secrets.token_urlsafe(18)
                         append_audit_event(
                             cur, event_id=event_id, actor_role="admin", actor_id=actor,
@@ -4469,6 +4593,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         SEATS_CACHE.invalidate()
         try:
             RG.locked_set(locked)
+            if clear_close:
+                RG.close_at_set(None)
         except RuntimeError:
             return self._json(503, {"success": False, "request_id": request_id, "retriable": True,
                                     "message": "锁定状态已保存，正在同步；请用同一请求编号重试"},

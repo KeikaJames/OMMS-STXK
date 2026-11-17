@@ -207,9 +207,10 @@
     locked = Boolean(time.registration_locked);
     let title = '开放时间未设置';
     let detail = '在“设置 → 开放与锁定”中设置。';
+    const schedule = '开放时间 ' + time.start_time + (time.end_time ? '，截止时间 ' + time.end_time : '');
     if (locked) { title = '名单已锁定'; detail = '可在“报名数据”中调剂和导出。'; }
-    else if (time.can_register) { title = '报名中'; detail = '开放时间 ' + time.start_time; }
-    else if (time.start_time) { title = '待开放'; detail = '开放时间 ' + time.start_time; }
+    else if (time.can_register) { title = '报名中'; detail = schedule; }
+    else if (time.start_time) { title = '待开放'; detail = schedule; }
     $('#home-phase').textContent = title;
     $('#home-phase-detail').textContent = detail;
     $('#ov-time').textContent = detail;
@@ -429,7 +430,7 @@
   const actionLabels = {
     'registration.created': '报名', 'registration.cancelled': '退选',
     'registration.admin_assigned': '代为报名', 'registration.admin_removed': '移出社团', 'registration.admin_transferred': '调整社团',
-    'registration.start_time_updated': '设置开放时间', 'registration.lock_updated': '名单锁定',
+    'registration.start_time_updated': '设置开放时间', 'registration.end_time_updated': '设置截止时间', 'registration.lock_updated': '名单锁定',
     'student.password_reset': '重置学生密码', 'student.password_changed': '学生修改密码', 'student.deleted': '删除学生',
     'students.imported': '导入学生', 'students.deleted_all': '清空学生',
     'club.updated': '编辑社团', 'club.deleted': '删除社团', 'club.image_uploaded': '更新社团图片', 'club.image_removed': '移除社团图片',
@@ -466,6 +467,7 @@
     if (event.action === 'registration.admin_removed') parts.push('从 ' + clubLabel(before.club_id) + ' 移出');
     if (event.action === 'registration.admin_transferred') parts.push(clubLabel(before.club_id) + ' → ' + clubLabel(after.club_id));
     if (event.action === 'registration.start_time_updated') parts.push(after.start_time || '清除');
+    if (event.action === 'registration.end_time_updated') parts.push(after.end_time || '清除');
     if (event.action === 'registration.lock_updated') parts.push(after.locked ? '锁定' : '解除锁定');
     if (event.action === 'registrations.cleared') parts.push('删除 ' + after.cleared + ' 条报名');
     if (event.action === 'registrations.adjusted') {
@@ -1082,18 +1084,23 @@
   async function loadSettings() {
     const result = await App.request('/api/check_registration_time');
     if (!result.data) return;
-    $('#open-at').value = result.data.start_time ? result.data.start_time.slice(0, 16).replace(' ', 'T') : '';
+    const field = text => (text ? text.slice(0, 16).replace(' ', 'T') : '');
+    $('#open-at').value = field(result.data.start_time);
+    $('#close-at').value = field(result.data.end_time);
     $('#clear-time').hidden = !result.data.start_time;
     locked = Boolean(result.data.registration_locked);
-    $('#lock-state').textContent = locked ? '名单已锁定，报名与退选已停止。未报名的学生在“报名数据 → 调剂”中安排。' : '名单未锁定。';
+    $('#lock-state').textContent = locked ? '名单已锁定，报名与退选已停止。未报名的学生在“报名数据 → 调剂”中安排。'
+      : result.data.end_time ? '名单未锁定。到截止时间 ' + result.data.end_time + ' 自动锁定。' : '名单未锁定。';
     $('#toggle-lock').textContent = locked ? '解除锁定' : '锁定名单';
   }
 
   $('#save-time').addEventListener('click', async () => {
     const value = $('#open-at').value;
+    const close = $('#close-at').value;
     if (!value) { App.toast('请选择开放时间', 'err'); return; }
-    const result = await App.request('/api/update_registration_time', { method: 'POST', body: { start_time: value.replace('T', ' ') + ':00' } });
-    App.toast(ok(result) ? '开放时间已保存' : message(result, '保存失败'), ok(result) ? 'ok' : 'err');
+    const text = input => (input ? input.replace('T', ' ') + ':00' : '');
+    const result = await App.request('/api/update_registration_time', { method: 'POST', body: { start_time: text(value), end_time: text(close) } });
+    App.toast(ok(result) ? '时间已保存' : message(result, '保存失败'), ok(result) ? 'ok' : 'err');
     loadSettings();
     loadOverview();
   });

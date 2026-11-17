@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 import unittest
 
 import redis
@@ -594,6 +595,30 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
                 conn.execute("UPDATE settings SET registration_start_time='2000-01-01 00:00:00'")
                 conn.commit()
+
+    def test_python_and_rust_stop_registration_at_the_close_time(self) -> None:
+        self._reset_state()
+        past = (datetime.now(timezone(timedelta(hours=8))) - timedelta(seconds=5)).strftime("%Y-%m-%d %H:%M:%S")
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE settings SET registration_end_time=?", (past,))
+            conn.commit()
+        self.redis.set(key("close_at"), int(time.time()) - 5)
+        try:
+            student_token = self._login(self.python_port, "edge1", "student-password")
+            for port in (self.python_port, self.rust_port):
+                status, _headers, body = self._request_raw(
+                    port, "POST", "/api/register_club", body={"club_id": 1}, cookie=f"session={student_token}"
+                )
+                self.assertEqual(200, status, body)
+                self.assertEqual("locked", json.loads(body).get("code"))
+                status, _headers, body = self._request_raw(port, "GET", "/api/check_registration_time")
+                self.assertTrue(json.loads(body)["registration_locked"])
+            self.assertEqual("3", self.redis.get(key("stock", 1)))
+        finally:
+            with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+                conn.execute("UPDATE settings SET registration_end_time=NULL, registration_locked=0")
+                conn.commit()
+            self.redis.delete(key("close_at"), key("locked"))
 
     def test_edge_rejects_multiple_cookie_header_fields_without_revoking_session(self) -> None:
         self._reset_state()

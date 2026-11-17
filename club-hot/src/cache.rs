@@ -128,10 +128,19 @@ pub async fn seats(state: &AppState) -> AppResult<CachedJson> {
     {
         open_at = crate::auth::parse_local_datetime(&text);
     }
-    let locked = state.db.registration_locked().await? || redis.locked_get().await.unwrap_or(false);
+    let end_time = state.db.registration_end_time().await?;
+    let close_at = end_time
+        .as_deref()
+        .and_then(crate::auth::parse_local_datetime);
+    let now = redis.now_epoch_ms().await;
+    let locked = state.db.registration_locked().await?
+        || redis.locked_get().await.unwrap_or(false)
+        || close_at.is_some_and(|c| now >= c.saturating_mul(1000));
     let fresh = CachedJson::new(&json!({
         "catalog": catalog.json.etag,
         "open_at": open_at.map(|value| value.saturating_mul(1000)),
+        "close_at": close_at.map(|value| value.saturating_mul(1000)),
+        "end_time": if close_at.is_some() { json!(end_time) } else { Value::Null },
         "locked": locked,
         "seats": seats,
     }));

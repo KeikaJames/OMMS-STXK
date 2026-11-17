@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime, timedelta, timezone
 import http.client
 import io
 import json
@@ -197,6 +198,13 @@ class FreshInstallTests(unittest.TestCase):
 
 
 
+SCHOOL_TZ = timezone(timedelta(hours=8))
+
+
+def school_time(offset_seconds: float) -> str:
+    return (datetime.now(SCHOOL_TZ) + timedelta(seconds=offset_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def counts(path: Path) -> tuple[int, int, int]:
     with contextlib.closing(sqlite3.connect(path)) as conn:
         return tuple(conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
@@ -306,6 +314,48 @@ class MaintenanceTests(unittest.TestCase):
         result = app.cli("restore", str(broken))
         self.assertEqual(1, result.returncode)
         self.assertIn("备份文件不可用", result.stdout)
+
+    def test_close_time_stops_registration_and_locks_the_list(self) -> None:
+        app = self.instance
+        times = "/api/update_registration_time"
+        status, body = app.post(self.admin, times, {"end_time": school_time(-60)})
+        self.assertEqual((400, "截止时间应晚于当前时间"), (status, body.get("message")))
+        status, body = app.post(self.admin, times, {"start_time": school_time(3600), "end_time": school_time(1800)})
+        self.assertEqual((400, "截止时间应晚于开放时间"), (status, body.get("message")))
+
+        end_time = school_time(3)
+        status, body = app.post(self.admin, times, {"start_time": "2000-01-01 00:00:00", "end_time": end_time})
+        self.assertEqual(200, status, body)
+        status, state = request_json(app.http_port, "GET", "/api/check_registration_time")
+        self.assertEqual((True, False, end_time), (state["can_register"], state["registration_locked"], state["end_time"]))
+        self.assertIsNotNone(app.client.get(key("close_at")))
+        status, body = app.register(1)
+        self.assertTrue(body.get("success"), body)
+        cancel_token = write_session(app.client, 1)
+
+        deadline = int(app.client.get(key("close_at")))
+        time.sleep(max(0.0, deadline - time.time()) + 0.05)
+        status, body = app.register(2)
+        self.assertEqual((200, "locked"), (status, body.get("code")), body)
+        status, body = request_json(app.http_port, "POST", "/api/cancel_registration", token=cancel_token, body={})
+        self.assertEqual("locked", body.get("code"), body)
+        status, state = request_json(app.http_port, "GET", "/api/check_registration_time")
+        self.assertTrue(state["registration_locked"])
+
+        waited = time.monotonic() + 5.0
+        while time.monotonic() < waited and app.sql("SELECT registration_locked FROM settings") != [(1,)]:
+            time.sleep(0.05)
+        self.assertEqual([(1, None)], app.sql("SELECT registration_locked, registration_end_time FROM settings"))
+        self.assertEqual([("系统", "到达截止时间")], app.sql(
+            "SELECT actor_id, reason FROM audit_events WHERE action='registration.lock_updated'"))
+        self.assertEqual("1", app.client.get(key("locked")))
+        self.assertIsNone(app.client.get(key("close_at")))
+        self.assertTrue(any(name.endswith("-locked.db") for name in os.listdir(app.backups)))
+        self.assertEqual((3, 1, 1), counts(app.db_path))
+
+        self.lock(False)
+        status, body = app.register(2)
+        self.assertTrue(body.get("success"), body)
 
     def test_reset_admin_password_from_the_command_line(self) -> None:
         app = self.instance

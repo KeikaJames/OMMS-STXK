@@ -65,6 +65,7 @@ pub struct Snapshot {
     pub clubs: Vec<ClubStock>,
     pub registrations: Vec<(i64, i64, Option<String>)>,
     pub start_time: Option<String>,
+    pub end_time: Option<String>,
     pub locked: bool,
 }
 
@@ -337,17 +338,23 @@ impl Db {
                     .prepare("SELECT student_id, club_id, operation_id FROM registrations")?
                     .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
-                let settings: Option<(Option<String>, bool)> = tx
+                let settings: Option<(Option<String>, Option<String>, bool)> = tx
                     .query_row(
-                        "SELECT registration_start_time, COALESCE(registration_locked,0) \
-                         FROM settings ORDER BY id DESC LIMIT 1",
+                        "SELECT registration_start_time, registration_end_time, \
+                         COALESCE(registration_locked,0) FROM settings ORDER BY id DESC LIMIT 1",
                         [],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()?;
                 tx.commit()?;
-                let (start_time, locked) = settings.unwrap_or((None, false));
-                Ok::<_, rusqlite::Error>(Snapshot { clubs, registrations, start_time, locked })
+                let (start_time, end_time, locked) = settings.unwrap_or((None, None, false));
+                Ok::<_, rusqlite::Error>(Snapshot {
+                    clubs,
+                    registrations,
+                    start_time,
+                    end_time,
+                    locked,
+                })
             })
             .await
             .map_err(interact_error)??;
@@ -440,6 +447,22 @@ impl Db {
             .interact(|conn| {
                 conn.query_row(
                     "SELECT registration_start_time FROM settings ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(interact_error)??;
+        Ok(v.flatten())
+    }
+
+    pub async fn registration_end_time(&self) -> AppResult<Option<String>> {
+        let conn = self.read.get().await?;
+        let v = conn
+            .interact(|conn| {
+                conn.query_row(
+                    "SELECT registration_end_time FROM settings ORDER BY id DESC LIMIT 1",
                     [],
                     |r| r.get::<_, Option<String>>(0),
                 )

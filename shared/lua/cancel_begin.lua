@@ -1,7 +1,10 @@
 -- 退选开始：取得学生租约并登记为该社团的在途成员。
--- KEYS: maint fence op inflight locked   ARGV: lease ttl member
--- 返回: 1 成功 / -1 有其他操作 / -3 维护或同步中 / -6 已锁定
+-- KEYS: maint fence op inflight locked close_at   ARGV: lease ttl member
+-- 返回: 1 成功 / -1 有其他操作 / -3 维护或同步中 / -6 已锁定或已截止
+if redis.replicate_commands then redis.replicate_commands() end
 if redis.call('GET', KEYS[5]) == '1' then return -6 end
+local close_at = redis.call('GET', KEYS[6])
+if close_at and tonumber(redis.call('TIME')[1]) >= tonumber(close_at) then return -6 end
 if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then return -3 end
 local current = redis.call('GET', KEYS[3])
 if current == ARGV[1] then return 1 end
