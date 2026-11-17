@@ -92,7 +92,8 @@
 
 - 会话保存在 `sess:{token}`，Cookie 为 HttpOnly、SameSite=Strict，`COOKIE_SECURE=1` 时加 Secure。
 - 修改密码、重置密码、删除学生时提升该账号的会话代际，旧会话随之失效。
-- 口令使用 Argon2id，参数可配置。`AUTH_CONCURRENCY` 限制同时进行的哈希计算，登录高峰时请求排队，CPU 和内存保持在固定范围。
+- 口令使用 Argon2id，参数可配置。哈希集中在 `AUTH_CONCURRENCY` 个专用线程里按到达顺序计算，同时占用的内存不超过线程数 × `ARGON2_MEMORY_KIB`。
+- 排队请求数达到 `AUTH_QUEUE`，或按最近耗时估算要等 8 秒以上时，新的登录请求立即得到 503 `login_queued`。服务器按单次校验的耗时给这些请求依次约定回来的时间，写在 `Retry-After` 里，回来时队列正好有空位。登录页按这个时间自动重试，最长 2 分钟。
 - `login_fail.lua` 按"账号 + 设备"计数失败次数，达到 `LOGIN_MAX_FAILS`（默认 10）后该组合暂停登录。成功登录过的设备记为受信设备，学生在自己的设备上照常登录。
 
 ## 读流量
@@ -105,7 +106,9 @@
 | nginx | `/api/seats`、`/api/catalog` 缓存 1 秒，`proxy_cache_lock` 合并并发回源，更新期间返回旧副本 |
 | 服务 | 名额快照缓存 500 毫秒，目录缓存 1 秒；报名或退选成功后立即刷新快照；ETag 相同时返回 304 |
 
-名额快照包含每个社团的剩余名额、开放时间、锁定状态和目录版本。社团介绍等内容由 `/api/catalog` 提供，前端在目录版本变化时重新获取。
+名额快照包含每个社团的剩余名额、开放时间、锁定状态和目录版本。社团介绍等内容由 `/api/catalog` 提供，前端在目录版本变化时重新获取。学生页每次轮询后只更新内容有变化的卡片。
+
+管理端工作台每 6 秒读取 `/api/admin/summary`（学生数和报名数）与社团列表。
 
 ## 边缘限流
 
@@ -116,15 +119,22 @@
 | 轮询（每 IP） | 2000 次/秒，适配学校出口 NAT |
 | 全站 | 5000 次/秒 |
 
-触发限流或上游停止响应时，nginx 返回带 `code`、`message` 的 JSON 和 `Retry-After`，前端按同一格式处理。
+触发限流或上游停止响应时，nginx 返回带 `code`、`message` 的 JSON 和 `Retry-After: 1`；后端已经给出 `Retry-After` 时原样转发。前端按同一格式处理。
 
 ## 低配服务器
 
-- 只装 Python 的服务器使用 `OMMS_PYTHON_ONLY=1` 或直接运行 `main.py`，接口与 Rust 版本一致。
+- 没有 cargo、Rust 版本过旧或首次编译失败时，`run.sh` 只运行 Python 服务，nginx 配置去掉 Rust 上游和到 Python 的长连接，Python 的线程只在处理请求时占用。也可以用 `OMMS_PYTHON_ONLY=1` 指定。接口与 Rust 版本一致。
+- 编译 Rust 时按内存决定并行数，每个编译进程按 1 GB 计。
+- Python 服务启动时只加载必需的模块：pypinyin 在导入学生时加载，并且只加载单字表；Pillow 在上传社团图片时加载。空闲内存约 62 MB。
 - `ARGON2_MEMORY_KIB`、`AUTH_CONCURRENCY`、`MAX_HTTP_WORKERS`、`DB_POOL_SIZE` 按内存和核数下调。
+- Rust 从连接池取 Redis 连接最多等 1 秒（`REDIS_POOL_WAIT_MS`），建立和校验连接按 `REDIS_TIMEOUT`；Redis 稍慢时请求继续等待。
 - `SQLITE_SYNCHRONOUS=NORMAL` 配合 WAL；数据盘较慢时同样适用。
 - `deploy/redis.conf` 关闭持久化、限制 256 MB 内存并使用 `noeviction`，名额以 SQLite 为准，重启后自动重建。
-- 前端为原生 HTML、CSS、JS，插画为 WebP（单张 5–56 KB）。
+- `run.sh` 每次启动保留上一次的服务日志（`python.log.1`、`rust.log.1`），访问日志超过 64 MB 时换新文件。
+- 前端为原生 HTML、CSS、JS，插画为 WebP（单张 5–56 KB），管理端图标为内嵌 SVG。页面使用纯色顶栏和小范围阴影，适合集成显卡。
+- 管理端工作台比较服务器与管理员电脑的时钟，相差超过一分钟时提示校准。
+
+`tests/stress_site.py` 用来在目标机器上测量登录高峰、抢课和轮询，见 [tests/README.md](../tests/README.md)。
 
 ## 兼容范围
 
@@ -134,4 +144,5 @@
 | Rust | 1.88 及以上（edition 2024） |
 | Redis | 3.2 及以上；Lua 脚本在 3.2–4.x 上调用 `redis.replicate_commands()` 后再写入 |
 | SQLite | 3.8 及以上（WAL、触发器、部分索引）；Rust 服务内置 SQLite |
-| 浏览器 | 脚本为 ES2018，样式使用 CSS 自定义属性；Chrome 61、Safari 11.1、Firefox 60 及以上满足要求 |
+| nginx | 1.12 及以上；1.17.6 以前的版本由 `run.sh` 去掉访问日志里的 `limit_req`、`limit_conn` 字段 |
+| 浏览器 | Chrome 57、Edge 15、Firefox 52、Safari 10.1 及以上：脚本使用 async/await，请求显式携带 Cookie，CSS 新特性都有退回写法。页面声明使用 WebKit 内核，360、QQ、搜狗浏览器默认进入极速模式；更旧的浏览器由 `web/js/legacy.js` 显示换浏览器的提示 |

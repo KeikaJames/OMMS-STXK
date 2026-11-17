@@ -157,13 +157,15 @@
   // ---- 概览 ----
   async function loadOverview() {
     const version = ++versions.overview;
-    const [clubs, regs, time] = await Promise.all([
-      App.request('/api/get_clubs'), App.request('/api/get_registrations'), App.request('/api/check_registration_time')
+    const sent = Date.now();
+    const [clubs, summary, time] = await Promise.all([
+      App.request('/api/get_clubs'), App.request('/api/admin/summary'), App.request('/api/check_registration_time')
     ]);
-    if (version !== versions.overview || !Array.isArray(clubs.data) || !Array.isArray(regs.data) || !time.data) return;
+    if (version !== versions.overview || !Array.isArray(clubs.data) || !summary.data || !time.data) return;
     rememberClubs(clubs.data);
-    const total = regs.data.length;
-    const registered = regs.data.filter(row => row.club_name && row.club_name !== '未报名').length;
+    renderClockSkew(time.data.server_now, sent, Date.now());
+    const total = summary.data.students;
+    const registered = summary.data.registered;
     $('#m-clubs').textContent = clubs.data.length;
     $('#m-students').textContent = total;
     $('#m-reg').textContent = registered;
@@ -205,6 +207,23 @@
     $('#home-phase').textContent = title;
     $('#home-phase-detail').textContent = detail;
     $('#ov-time').textContent = detail;
+  }
+
+  // 旧电脑的主板电池没电时时钟常常不准；报名按服务器时钟开放，相差超过一分钟就提醒。
+  function renderClockSkew(serverNow, sent, received) {
+    const note = $('#home-clock');
+    if (typeof serverNow !== 'number') return;
+    const skew = serverNow - (sent + received) / 2;
+    if (Math.abs(skew) < 60000) {
+      note.hidden = true;
+      return;
+    }
+    const seconds = Math.round(Math.abs(skew) / 1000);
+    const hours = Math.floor(seconds / 3600);
+    const parts = [hours ? hours + ' 小时 ' : '', Math.floor(seconds % 3600 / 60) + ' 分 ', seconds % 60 + ' 秒'];
+    note.textContent = '服务器时钟比这台电脑' + (skew < 0 ? '慢 ' : '快 ') + parts.join('') +
+      '。学生端按服务器时钟开放报名，请先校准服务器时间。';
+    note.hidden = false;
   }
 
   function scheduleOverview() {

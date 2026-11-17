@@ -284,10 +284,18 @@
     }
   }
 
+  // 每 2 秒轮询一次；卡片内容没变时不碰 DOM，旧电脑上滚动和输入不卡。
   function updateCard(card, club) {
-    const info = splitRoom(club.name);
     const left = remaining(club);
     const mine = registeredId() === club.id;
+    const restriction = eligibility(club);
+    const next = actionFor(club, left, restriction, mine);
+    const signature = [club.name, club.location, club.meeting_time, club.advisor_name, club.description,
+      club.image_path, club.max_students, (club.allowed_grades || []).join(','), (club.allowed_classes || []).length,
+      left, mine, restriction, next.key, state.favorites.has(club.id), state.expanded.has(club.id)].join('|');
+    if (card.dataset.signature === signature) return;
+    card.dataset.signature = signature;
+    const info = splitRoom(club.name);
     renderArt(card, club);
     card.classList.toggle('is-mine', mine);
     const fav = card.querySelector('.fav');
@@ -306,7 +314,6 @@
 
     const tags = card.querySelector('.club-tags');
     tags.replaceChildren();
-    const restriction = eligibility(club);
     const grades = club.allowed_grades || [];
     if (grades.length) tags.append(tag('面向' + grades.join('、'), restriction ? 'tag-warn' : 'tag'));
     if ((club.allowed_classes || []).length) tags.append(tag('指定班级', restriction ? 'tag-warn' : 'tag'));
@@ -320,7 +327,6 @@
     meter.querySelector('i').style.width = (club.max_students ? Math.round(left / club.max_students * 100) : 0) + '%';
 
     const action = card.querySelector('.club-action');
-    const next = actionFor(club, left, restriction, mine);
     if (action.dataset.key === next.key) return;
     action.dataset.key = next.key;
     action.replaceChildren();
@@ -378,7 +384,7 @@
 
   function renderClubs() {
     const grid = $('#clubs');
-    grid.setAttribute('aria-busy', 'false');
+    if (grid.getAttribute('aria-busy') !== 'false') grid.setAttribute('aria-busy', 'false');
     grid.querySelectorAll('.sk, .empty').forEach(node => node.remove());
     const ordered = state.catalog
       .filter(visible)
@@ -390,6 +396,7 @@
         if (!clubById(id)) cards.delete(id);
       }
     }
+    let position = 0;
     ordered.forEach(club => {
       let card = cards.get(club.id);
       if (!card) {
@@ -397,7 +404,9 @@
         cards.set(club.id, card);
       }
       updateCard(card, club);
-      grid.append(card);
+      const current = grid.children[position];
+      if (current !== card) grid.insertBefore(card, current || null);
+      position += 1;
     });
     if (!ordered.length) {
       const empty = document.createElement('p');
