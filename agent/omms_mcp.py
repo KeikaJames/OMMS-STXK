@@ -38,6 +38,11 @@ APP_DIR = AGENT_DIR.parent
 RUN_SH = APP_DIR / "run.sh"
 MAIN_PY = APP_DIR / "main.py"
 GUIDE = AGENT_DIR / "AGENTS.md"
+sys.path.insert(0, str(APP_DIR))
+try:
+    import netinfo  # noqa: E402  与控制台共用的局域网地址模块
+except ImportError:  # pragma: no cover
+    netinfo = None
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 EXTRA_PATH = ("/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin")
 PASSWORD_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
@@ -263,8 +268,16 @@ def web_base(host: str) -> str:
 
 
 def addresses() -> dict:
-    base = web_base(lan_ip())
-    return {"学生访问": base, "管理控制台": base + "/admin/dashboard", "本机访问": web_base("127.0.0.1")}
+    """默认路由所在网卡的地址在前；机器同时接有线和无线时，其他网卡的地址另列。"""
+    items = (netinfo.lan_addresses() if netinfo else []) or [{"address": lan_ip(), "label": ""}]
+    base = web_base(items[0]["address"])
+    result = {"学生访问": base, "管理控制台": base + "/admin/dashboard", "本机访问": web_base("127.0.0.1")}
+    if items[0].get("label") and len(items) > 1:
+        result["学生访问所在网卡"] = items[0]["label"]
+    if len(items) > 1:
+        result["其他网卡"] = ["{}{}".format(web_base(item["address"]), "（{}）".format(item["label"]) if item.get("label") else "")
+                          for item in items[1:]]
+    return result
 
 
 def backend_port() -> int:

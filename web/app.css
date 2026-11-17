@@ -404,6 +404,16 @@ body.has-dialog { overflow: hidden; }
 .editor .image-row { margin-bottom: 16px; }
 .admin-clubs .club-desc { max-height: 3.2em; }
 .actions.center { justify-content: center; }
+.access-card .row-head { margin-bottom: 4px; }
+.access-url { display: flex; flex-wrap: wrap; align-items: center; }
+.access-url .mono { margin-right: 12px; font-size: 32px; font-weight: 600; letter-spacing: .01em; word-break: break-all; }
+.access-card .hint { margin-top: 6px; }
+.present { position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 95; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; background: var(--paper); color: var(--ink); text-align: center; cursor: pointer; }
+.present:focus { outline: none; }
+.present-label { color: var(--muted); font-size: 28px; }
+.present-url { margin-top: 12px; font-size: 64px; font-size: 6vw; font-weight: 700; line-height: 1.15; word-break: break-all; }
+.present-more { margin-top: 24px; color: var(--ink-2); font-size: 24px; }
+.present-hint { position: absolute; right: 0; bottom: 24px; left: 0; color: var(--muted); font-size: 14px; }
 .gap { margin: 12px 0; }
 #audit-scope { margin-bottom: 12px; }
 
@@ -435,6 +445,9 @@ body.has-dialog { overflow: hidden; }
   .sheet-foot { padding: 12px; }
   .image-row .club-art { margin-bottom: 12px; }
   .toolbar .input { max-width: none; margin-right: 0; }
+  .access-url .mono { font-size: 18px; font-size: 4.8vw; }
+  .present-label { font-size: 20px; }
+  .present-more { font-size: 18px; }
   .list li { flex-wrap: wrap; }
   .list li > span { flex-basis: 100%; margin: 0 0 8px; }
 }

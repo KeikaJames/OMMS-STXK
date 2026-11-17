@@ -271,6 +271,7 @@
     var key = route.view + '/' + route.pane;
     clearTimeout(refreshTimer);
     if (watching()) refreshOverview();
+    if (route.view === 'home') loadAccess();
     if (route.view === 'students') loadStudents();
     if (key === 'students/accounts') renderCredentials();
     if (key === 'clubs/cards') loadClubs();
@@ -446,6 +447,117 @@
     if (App.hidden()) clearTimeout(refreshTimer);
     else if (watching()) refreshOverview();
   });
+
+  // ---- 学生访问地址：服务器列出各网卡地址，协议和端口沿用当前页面 ----
+  var accessList = [];
+  var FULLSCREEN_EVENTS = ['fullscreenchange', 'webkitfullscreenchange', 'MSFullscreenChange'];
+
+  function hostIsAddress(host) {
+    return host === 'localhost' || /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.charAt(0) === '[';
+  }
+
+  function siteBase(host) {
+    return location.protocol + '//' + host + (location.port ? ':' + location.port : '');
+  }
+
+  function loadAccess() {
+    var version = begin('access');
+    return App.request('/api/admin/addresses').then(function (result) {
+      if (!latest('access', version)) return;
+      var list = [];
+      // 经域名（内网穿透、反向代理）打开控制台时，学生使用同一个域名。
+      if (!hostIsAddress(location.hostname)) list.push({ url: location.protocol + '//' + location.host, label: '' });
+      ((result.ok && result.data && result.data.addresses) || []).forEach(function (item) {
+        list.push({ url: siteBase(item.address), label: item.label || '' });
+      });
+      accessList = list;
+      $('#access-card').hidden = !list.length;
+      if (!list.length) return;
+      $('#access-url').textContent = list[0].url;
+      var tag = $('#access-label');
+      tag.textContent = list[0].label;
+      tag.hidden = !(list.length > 1 && list[0].label);
+      var more = $('#access-more');
+      more.textContent = list.length > 1 ? '其他网卡：' + list.slice(1).map(function (item) {
+        return item.url + (item.label ? '（' + item.label + '）' : '');
+      }).join('，') : '';
+      more.hidden = list.length < 2;
+    });
+  }
+
+  function copyText(text) {
+    if (window.clipboardData && window.clipboardData.setData) return Boolean(window.clipboardData.setData('Text', text));
+    var area = el('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.top = '-1000px';
+    document.body.appendChild(area);
+    area.select();
+    var copied = false;
+    try { copied = document.execCommand('copy'); } catch (error) { copied = false; }
+    document.body.removeChild(area);
+    return copied;
+  }
+
+  function fullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement || null;
+  }
+
+  // 放大显示：整屏大字，便于电子教室的屏幕广播；支持时进入浏览器全屏。
+  function presentAccess() {
+    if (!accessList.length) return;
+    var overlay = el('div', 'present');
+    var closed = false;
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', '学生访问地址');
+    overlay.tabIndex = -1;
+    add(overlay, el('p', 'present-label', '学生访问'), el('p', 'present-url mono', accessList[0].url));
+    if (accessList.length > 1) {
+      overlay.appendChild(el('p', 'present-more', accessList.slice(1).map(function (item) { return item.url; }).join('　')));
+    }
+    overlay.appendChild(el('p', 'present-hint', '点击或按 Esc 返回'));
+    function onKey(event) {
+      var key = event.key || event.keyCode;
+      if (key === 'Escape' || key === 'Esc' || key === 27) close();
+    }
+    function onChange() {
+      if (!fullscreenElement()) close();
+    }
+    function close() {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener('keydown', onKey);
+      FULLSCREEN_EVENTS.forEach(function (name) { document.removeEventListener(name, onChange); });
+      var exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
+      if (fullscreenElement() && exit) {
+        try { exit.call(document); } catch (error) { exit = null; }
+      }
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      $('#access-show').focus();
+    }
+    overlay.addEventListener('click', close);
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay);
+    overlay.focus();
+    var request = overlay.requestFullscreen || overlay.webkitRequestFullscreen || overlay.msRequestFullscreen;
+    if (!request) return;
+    FULLSCREEN_EVENTS.forEach(function (name) { document.addEventListener(name, onChange); });
+    try {
+      var pending = request.call(overlay);
+      if (pending && pending.then) pending.then(null, function () { return null; });
+    } catch (error) {
+      request = null;
+    }
+  }
+
+  $('#access-copy').addEventListener('click', function () {
+    if (!accessList.length) return;
+    if (copyText(accessList[0].url)) App.toast('已拷贝', 'ok');
+    else App.toast('可手动选中地址后拷贝', 'err');
+  });
+  $('#access-show').addEventListener('click', presentAccess);
 
   // ---- 学生名单 ----
   function loadStudents() {

@@ -493,6 +493,17 @@ class MaintenanceTests(unittest.TestCase):
                                          body={"accounts": [{"name": "x"}]})
         self.assertEqual(400, status)
 
+    def test_lan_addresses_for_the_console_need_the_admin(self) -> None:
+        app = self.instance
+        status, body = request_json(app.http_port, "GET", "/api/admin/addresses")
+        self.assertEqual(401, status, body)
+        status, body = request_json(app.http_port, "GET", "/api/admin/addresses", token=self.admin)
+        self.assertEqual(200, status, body)
+        for item in body["addresses"]:
+            self.assertEqual({"address", "label"}, set(item))
+            self.assertRegex(item["address"], r"^\d+\.\d+\.\d+\.\d+$")
+            self.assertFalse(item["address"].startswith("127."), item)
+
     def test_requests_without_the_page_header_are_refused(self) -> None:
         app = self.instance
         conn = http.client.HTTPConnection("127.0.0.1", app.http_port, timeout=10)
