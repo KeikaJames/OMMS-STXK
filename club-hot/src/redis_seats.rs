@@ -391,25 +391,41 @@ impl Seats {
         if members.is_empty() {
             return Ok((0, 0));
         }
-        let parsed: Vec<(i64, String)> = members
-            .iter()
-            .filter_map(|m| {
-                let (student, lease) = m.split_once('|')?;
-                Some((student.parse().ok()?, lease.to_string()))
-            })
-            .collect();
-        let keys: Vec<String> = parsed.iter().map(|(s, _)| self.k_op(*s)).collect();
+        // 成员格式为 学生|租约；格式不对的成员没有对应租约，直接列入待确认。
+        let mut stale: Vec<&String> = Vec::new();
+        let mut parsed: Vec<(&String, i64, &str)> = Vec::new();
+        for member in &members {
+            match member
+                .split_once('|')
+                .and_then(|(student, lease)| Some((student.parse::<i64>().ok()?, lease)))
+            {
+                Some((student, lease)) => parsed.push((member, student, lease)),
+                None => stale.push(member),
+            }
+        }
+        let keys: Vec<String> = parsed.iter().map(|(_, s, _)| self.k_op(*s)).collect();
         let current: Vec<Option<String>> = if keys.is_empty() {
             Vec::new()
         } else {
             self.deadline(conn.mget(keys)).await?
         };
-        let live = parsed
-            .iter()
-            .zip(current.iter())
-            .filter(|((_, lease), value)| value.as_deref() == Some(lease.as_str()))
-            .count();
-        Ok((live, members.len() - live))
+        for ((member, _, lease), value) in parsed.iter().zip(current.iter()) {
+            if value.as_deref() != Some(*lease) {
+                stale.push(member);
+            }
+        }
+        let live = members.len() - stale.len();
+        if stale.is_empty() {
+            return Ok((live, 0));
+        }
+        // 两次读取之间刚确认或撤销的操作已经移出集合，仍在集合里的才算失效。
+        let mut pipe = redis::pipe();
+        for member in &stale {
+            pipe.sismember(self.k_inflight(club), member.as_str());
+        }
+        let present: Vec<bool> = self.deadline(pipe.query_async(&mut conn)).await?;
+        let dead = present.into_iter().filter(|p| *p).count();
+        Ok((live, dead))
     }
 
     /// 取得社团栅栏并等该社团的在途操作完成；超时放弃。
