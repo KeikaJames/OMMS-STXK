@@ -61,7 +61,8 @@ LOGIN_MAX_FAILS = max(1, int(os.environ.get("LOGIN_MAX_FAILS", "10")))
 LOGIN_WINDOW = 60
 DEVICE_TTL = 180 * 24 * 3600
 MAX_BODY = max(1024, int(os.environ.get("MAX_BODY", str(8 * 1024 * 1024))))
-AUTH_CONCURRENCY = max(1, int(os.environ.get("AUTH_CONCURRENCY", str(min(4, CPU_COUNT)))))
+# 口令校验线程：核数的一半，不少于 4、不多于 8，核数更少时取核数；另一半核留给 nginx、Redis 和报名。
+AUTH_CONCURRENCY = max(1, int(os.environ.get("AUTH_CONCURRENCY", str(min(CPU_COUNT, 8, max(4, CPU_COUNT // 2))))))
 AUTH_WAIT = 10.0
 ARGON2_TIME_COST = max(1, int(os.environ.get("ARGON2_TIME_COST", "2")))
 ARGON2_MEMORY_KIB = max(8192, int(os.environ.get("ARGON2_MEMORY_KIB", "19456")))
@@ -1093,6 +1094,16 @@ def deadline_passed(close_at, now_ms=None):
     if close_at is None:
         return False
     return (now_ms if now_ms is not None else time.time() * 1000) >= close_at * 1000
+
+
+# 这些操作会改变报名表的内容；工作台据此判断最近一次导出与备份是否为最新数据。
+DATA_CHANGE_ACTIONS = (
+    "registration.created", "registration.cancelled", "registration.admin_assigned",
+    "registration.admin_removed", "registration.admin_transferred", "registration.lock_updated",
+    "registrations.adjusted", "registrations.cleared", "students.imported", "student.updated",
+    "student.deleted", "students.deleted_all", "clubs.imported", "club.updated", "club.deleted",
+    "clubs.deleted_all",
+)
 
 
 def registration_locked(conn):
@@ -3773,13 +3784,34 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         }, extra=[("Cache-Control", "no-store")])
 
     def _h_admin_summary(self, sess):
-        """工作台每 6 秒刷新一次，只返回人数。"""
+        """工作台每 6 秒刷新一次：人数、开放社团的名额合计，以及最近一次导出、备份和数据变化的时间。"""
+        actions = DATA_CHANGE_ACTIONS + ("registrations.exported", "backup.downloaded")
         with DB_POOL.connection() as conn:
-            students, registered = conn.execute(
-                "SELECT (SELECT COUNT(*) FROM students), (SELECT COUNT(*) FROM registrations)"
+            students, registered, clubs, capacity = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM students), (SELECT COUNT(*) FROM registrations), "
+                "(SELECT COUNT(*) FROM clubs), (SELECT COALESCE(SUM(max_students), 0) FROM clubs WHERE enabled=1)"
             ).fetchone()
-        self._json(200, {"students": students, "registered": registered},
+            latest = dict(conn.execute(
+                "SELECT action, MAX(occurred_at) FROM audit_events WHERE action IN ({}) GROUP BY action".format(
+                    ",".join("?" * len(actions))), actions).fetchall())
+        changed = max((latest.get(action) or 0 for action in DATA_CHANGE_ACTIONS), default=0)
+        self._json(200, {"students": students, "registered": registered, "clubs": clubs, "capacity": capacity,
+                         "last_export": latest.get("registrations.exported"),
+                         "last_backup": latest.get("backup.downloaded"), "last_change": changed or None},
                    extra=[("Cache-Control", "no-store")])
+
+    def _record_download(self, sess, action, metadata):
+        """导出与备份下载记入操作记录，工作台据此判断导出的文件是否为最新数据。"""
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                conn.execute("BEGIN IMMEDIATE")
+                append_audit_event(cur, event_id="download-" + secrets.token_urlsafe(18), actor_role="admin",
+                                   actor_id=sess.get("username", "admin"), action=action, target_type="data",
+                                   metadata=metadata)
+                conn.commit()
+        except sqlite3.Error as exc:
+            log.warning("记录下载失败: %s", exc)
 
     def _h_get_registrations(self, sess):
         with DB_POOL.connection() as conn:
@@ -3809,6 +3841,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         with DB_POOL.connection() as conn:
             rows = conn.execute("SELECT name, class, student_id, username FROM students ORDER BY class, name").fetchall()
         stamp = export_stamp()
+        self._record_download(sess, "students.exported", {"kind": "students_csv"})
         self._csv(rows, ["姓名", "班级", "学号", "用户名"], "学生账号_{}.csv".format(stamp), "students_{}.csv".format(stamp))
 
     @staticmethod
@@ -3826,6 +3859,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         with DB_POOL.connection() as conn:
             rows = self._registration_rows(conn)
         stamp = export_stamp()
+        self._record_download(sess, "registrations.exported", {"kind": "all_csv"})
         self._csv([(name, klass, number, club or "未报名", method, when)
                    for name, klass, number, _club_id, club, method, when in rows],
                   ["姓名", "班级", "学号", "社团", "方式", "报名时间"],
@@ -3838,6 +3872,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 "LEFT JOIN registrations r ON s.id = r.student_id WHERE r.id IS NULL "
                 "ORDER BY s.class, s.student_id, s.name").fetchall()
         stamp = export_stamp()
+        self._record_download(sess, "registrations.exported", {"kind": "unregistered_csv"})
         self._csv(rows, ["姓名", "班级", "学号"], "未报名名单_{}.csv".format(stamp),
                   "unregistered_{}.csv".format(stamp))
 
@@ -3856,6 +3891,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 "JOIN registrations r ON s.id = r.student_id WHERE r.club_id = ? "
                 "ORDER BY s.class, s.student_id, s.name", (club_id,)).fetchall()
         stamp = export_stamp()
+        self._record_download(sess, "registrations.exported", {"kind": "club_csv", "club": club[0]})
         self._csv([(name, klass, number, registration_method(operation), when)
                    for name, klass, number, operation, when in rows],
                   ["姓名", "班级", "学号", "方式", "报名时间"],
@@ -3878,6 +3914,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         if missing:
             sheets.append(("未报名", ["姓名", "班级", "学号"], missing, [10, 12, 14]))
         stamp = export_stamp()
+        self._record_download(sess, "registrations.exported", {"kind": "workbook"})
         self._send(200, xlsx_bytes(sheets),
                    ctype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                    extra=[attachment_header("社团报名表_{}.xlsx".format(stamp), "registrations_{}.xlsx".format(stamp)),
@@ -4024,6 +4061,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     body = source.read()
             except OSError:
                 return self._json(404, {"success": False, "message": "备份不存在"})
+            self._record_download(sess, "backup.downloaded", {"kind": "snapshot", "name": name})
             return self._send(200, body, ctype="application/vnd.sqlite3",
                               extra=[attachment_header(name, name), ("Cache-Control", "no-store")])
         try:
@@ -4032,6 +4070,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             log.error("生成完整备份失败: %s", exc)
             return self._json(500, {"success": False, "message": "生成备份失败"})
         stamp = export_stamp()
+        self._record_download(sess, "backup.downloaded", {"kind": "full"})
         self._send(200, body, ctype="application/zip",
                    extra=[attachment_header("社团报名备份_{}.zip".format(stamp), "omms-backup_{}.zip".format(stamp)),
                           ("Cache-Control", "no-store")])

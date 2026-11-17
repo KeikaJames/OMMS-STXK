@@ -177,9 +177,8 @@
     $('#m-reg').textContent = registered;
     $('#m-unreg').textContent = total - registered;
     $('#m-rate').textContent = total ? Math.round(registered / total * 100) + '%' : '—';
-    $('#home-account-total').textContent = total || '—';
-    $('#home-account-count').textContent = total ? '已为 ' + total + ' 名学生创建账号' : '暂无学生账号';
     renderPhase(time.data);
+    renderFlow(summary.data, time.data);
     const fill = $('#ov-fill');
     fill.replaceChildren();
     if (!clubs.data.length) fill.append(el('p', 'empty', '还没有社团'));
@@ -214,6 +213,75 @@
     $('#home-phase').textContent = title;
     $('#home-phase-detail').textContent = detail;
     $('#ov-time').textContent = detail;
+  }
+
+  // ---- 流程：按使用顺序列出各步骤的状态和入口 ----
+  function shortTime(value) {
+    if (typeof value !== 'number') return value ? value.slice(5, 16) : '';
+    const date = new Date(value);
+    return App.pad(date.getMonth() + 1) + '-' + App.pad(date.getDate()) + ' ' + App.pad(date.getHours()) + ':' + App.pad(date.getMinutes());
+  }
+
+  function renderFlow(summary, time) {
+    const students = summary.students;
+    const registered = summary.registered;
+    const unregistered = students - registered;
+    const short = students - summary.capacity;
+    const isLocked = Boolean(time.registration_locked);
+    const fresh = at => Boolean(at) && (!summary.last_change || at >= summary.last_change);
+    const exported = !summary.last_export ? '报名表未导出'
+      : fresh(summary.last_export) ? '报名表 ' + shortTime(summary.last_export) + ' 已导出' : '报名表导出后数据有变化';
+    const backedUp = !summary.last_backup ? '完整备份未下载'
+      : fresh(summary.last_backup) ? '完整备份 ' + shortTime(summary.last_backup) + ' 已下载' : '完整备份下载后数据有变化';
+    const steps = [
+      { title: '导入学生', done: students > 0,
+        text: students ? students + ' 名学生；账号在“账号发放”中下载或打印' : '从 Excel 粘贴姓名、班级、学号',
+        routes: students ? [['账号发放', 'students:students-accounts']] : [['导入学生', 'students:students-import']] },
+      { title: '添加社团', done: summary.clubs > 0, warn: summary.clubs > 0 && short > 0,
+        text: !summary.clubs ? '填写名称和人数上限'
+          : summary.clubs + ' 个社团，开放报名的名额合计 ' + summary.capacity + (short > 0 ? '，比学生少 ' + short + ' 个' : ''),
+        routes: [['社团管理', 'clubs:clubs-cards']] },
+      { title: '设置时间', done: Boolean(time.start_time),
+        text: !time.start_time ? '设置开放时间；截止时间可不填'
+          : '开放 ' + shortTime(time.start_time) + (time.end_time ? '，截止 ' + shortTime(time.end_time) : isLocked ? '' : '，截止时间未设置'),
+        routes: [['开放与锁定', 'settings:settings-registration']] },
+      { title: '报名', done: isLocked,
+        text: isLocked ? '已截止，报名 ' + registered + ' / ' + students
+          : time.can_register ? '报名中，已报名 ' + registered + ' / ' + students : '到开放时间后开始',
+        routes: [['报名概览', 'overview:overview-summary']] },
+      { title: '调剂', done: isLocked && unregistered === 0,
+        text: !isLocked ? '锁定后安排未报名的学生' : unregistered ? '未报名 ' + unregistered + ' 人' : '全部学生已有社团',
+        routes: [['调剂', 'overview:overview-adjust']] },
+      { title: '导出与备份', done: isLocked && fresh(summary.last_export) && fresh(summary.last_backup),
+        text: exported + '；' + backedUp,
+        routes: [['导出', 'overview:overview-exports'], ['备份', 'settings:settings-backup']] }
+    ];
+    const current = steps.findIndex(step => !step.done);
+    const nav = $$('#seg button[data-v]');
+    const list = $('#home-flow');
+    list.replaceChildren();
+    steps.forEach((step, index) => {
+      const state = step.done ? (step.warn ? 'warn' : 'done') : index === current ? 'current' : 'todo';
+      const item = el('li', state);
+      if (state === 'current') item.setAttribute('aria-current', 'step');
+      const mark = el('span', 'mark', state === 'done' ? '✓' : state === 'warn' ? '!' : String(index + 1));
+      mark.setAttribute('aria-hidden', 'true');
+      const body = el('div');
+      body.append(el('b', '', step.title), el('small', '', step.text));
+      const actions = el('div', 'flow-actions');
+      step.routes.forEach(([label, route]) => {
+        const [nextView, pane] = route.split(':');
+        const button = el('button', 'btn btn-sm ' + (index === current ? 'btn-primary' : 'btn-quiet'), label);
+        button.type = 'button';
+        button.addEventListener('click', () => {
+          const inNav = nav.some(entry => entry.dataset.v === nextView && entry.dataset.pane === pane);
+          activate(nextView, pane, inNav ? { focus: true, primaryPane: pane } : { focus: true });
+        });
+        actions.append(button);
+      });
+      item.append(mark, body, actions);
+      list.append(item);
+    });
   }
 
   // 旧电脑的主板电池没电时时钟常常不准；报名按服务器时钟开放，相差超过一分钟就提醒。
@@ -462,7 +530,13 @@
     'students.imported': '导入学生', 'students.deleted_all': '清空学生',
     'club.updated': '编辑社团', 'club.deleted': '删除社团', 'club.image_uploaded': '更新社团图片', 'club.image_removed': '移除社团图片',
     'clubs.imported': '添加社团', 'clubs.deleted_all': '清空社团', 'admin.password_changed': '修改管理员密码',
-    'registrations.adjusted': '调剂', 'registrations.cleared': '清空报名', 'admin.password_reset': '重置管理员密码'
+    'registrations.adjusted': '调剂', 'registrations.cleared': '清空报名', 'admin.password_reset': '重置管理员密码',
+    'registrations.exported': '导出报名数据', 'students.exported': '导出学生账号表', 'backup.downloaded': '下载备份'
+  };
+  const downloadActions = ['registrations.exported', 'students.exported', 'backup.downloaded'];
+  const downloadLabels = {
+    workbook: '报名表（Excel）', all_csv: '报名总表（CSV）', unregistered_csv: '未报名名单（CSV）', club_csv: '社团名单（CSV）',
+    students_csv: '学生账号表（CSV）', full: '完整备份', snapshot: '自动快照'
   };
 
   function auditTime(ms) {
@@ -499,6 +573,10 @@
     if (event.action === 'registration.end_time_updated') parts.push(after.end_time || '清除');
     if (event.action === 'registration.lock_updated') parts.push(after.locked ? '锁定' : '解除锁定');
     if (event.action === 'registrations.cleared') parts.push('删除 ' + after.cleared + ' 条报名');
+    if (downloadActions.includes(event.action)) {
+      const meta = event.metadata || {};
+      parts.push((downloadLabels[meta.kind] || '') + (meta.club ? ' · ' + meta.club : '') + (meta.name ? ' · ' + meta.name : ''));
+    }
     if (event.action === 'student.updated') {
       [['name', '姓名'], ['class', '班级'], ['student_no', '学号']].forEach(([key, label]) => {
         if (before[key] !== after[key]) parts.push(label + ' ' + before[key] + ' → ' + after[key]);

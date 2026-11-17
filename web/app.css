@@ -194,6 +194,7 @@ textarea.input { min-height: 120px; font-family: var(--mono); font-size: 13px; l
 .login-head img { width: 56px; height: 56px; margin: 0 auto 12px; border-radius: 50%; }
 .login-head h1 { font-size: 26px; }
 .login-head p { color: var(--muted); font-size: 13px; margin-top: 4px; }
+.login-head .login-schedule { margin-top: 10px; color: var(--ink-2); font-size: 14px; }
 .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin-bottom: 18px; border-radius: 999px; background: var(--paper-2); }
 .seg button { min-height: 36px; border: 0; border-radius: 999px; background: none; color: var(--ink-2); font-size: 14px; cursor: pointer; }
 .seg button[aria-pressed="true"] { background: var(--surface-2); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, .08); }
@@ -326,6 +327,19 @@ textarea.input { min-height: 120px; font-family: var(--mono); font-size: 13px; l
 .home-card h2 { font-size: 18px; margin-bottom: 10px; }
 .home-card .big { font-family: var(--serif); font-size: 40px; line-height: 1.1; }
 .home-card .hint { margin: 6px 0 14px; }
+.home-flow { grid-column: span 2; }
+.home-flow h2 { font-size: 18px; margin-bottom: 4px; }
+.flow { list-style: none; margin: 0; padding: 0; }
+.flow li { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
+.flow li:first-child { border-top: 0; }
+.flow .mark { display: flex; align-items: center; justify-content: center; width: 26px; height: 26px; border: 1px solid var(--line-strong); border-radius: 50%; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.flow .done .mark { background: var(--ok-tint); border-color: var(--ok); color: var(--ok); }
+.flow .warn .mark { background: var(--warn-tint); border-color: var(--warn); color: var(--warn); }
+.flow .current .mark { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.flow b { display: block; font-size: 15px; }
+.flow small { display: block; margin-top: 2px; color: var(--muted); font-size: 13px; }
+.flow .warn small { color: var(--warn); }
+.flow-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
 .steps { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; padding: 0; list-style: none; color: var(--muted); font-size: 13px; }
 .steps li { display: flex; align-items: center; gap: 6px; }
 .steps b { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--paper-2); color: var(--ink-2); font-size: 12px; }
@@ -358,6 +372,7 @@ textarea.input { min-height: 120px; font-family: var(--mono); font-size: 13px; l
 @media (max-width: 860px) {
   .admin-head { grid-template-columns: 1fr; }
   .home-grid, .home-banner { grid-template-columns: 1fr; }
+  .home-flow { grid-column: auto; }
   .home-banner img { aspect-ratio: 21 / 6; order: -1; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
@@ -408,6 +423,8 @@ textarea.input { min-height: 120px; font-family: var(--mono); font-size: 13px; l
 
 @media (max-width: 560px) {
   .row2, .row3 { grid-template-columns: 1fr; }
+  .flow li { grid-template-columns: 26px minmax(0, 1fr); }
+  .flow-actions { grid-column: 2; justify-content: flex-start; }
 }
 
 /* 账号条：A4，每行 3 张，每个班级从新的一页开始 */
