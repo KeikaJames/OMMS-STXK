@@ -438,14 +438,29 @@ pub async fn register_club(
             }
             Err(e) => {
                 tracing::error!(student_id = sid, club_id, error = %e, "registration persist failed");
-                if let Err(release_error) =
-                    seats.rollback_reservation(sid, club_id, &reservation).await
-                {
-                    tracing::error!(student_id = sid, club_id, error = %release_error, "reservation rollback failed");
-                    reconcile_requested.store(true, Ordering::Release);
-                }
                 reconcile_requested.store(true, Ordering::Release);
-                RegistrationFinalize::Failed
+                // 结果不明时按操作代际查库：已提交就确认，确定未提交才回滚。
+                match db.registration_by_operation(operation_id.clone()).await {
+                    Ok(Some(registration_id)) => {
+                        let confirmed = seats.confirm(sid, &reservation).await.unwrap_or(false);
+                        RegistrationFinalize::Success {
+                            registration_id,
+                            confirmed,
+                        }
+                    }
+                    Ok(None) => {
+                        if let Err(release_error) =
+                            seats.rollback_reservation(sid, club_id, &reservation).await
+                        {
+                            tracing::error!(student_id = sid, club_id, error = %release_error, "reservation rollback failed");
+                        }
+                        RegistrationFinalize::Failed
+                    }
+                    Err(lookup_error) => {
+                        tracing::error!(student_id = sid, club_id, error = %lookup_error, "registration outcome unknown");
+                        RegistrationFinalize::Unavailable
+                    }
+                }
             }
         }
     });
@@ -753,6 +768,7 @@ pub async fn get_student_info(State(state): State<AppState>, headers: HeaderMap)
             "student_id": info.student_no,
             "username": info.username,
             "registered_club": info.registered_club,
+            "registered_club_id": info.registered_club_id,
             "registration_time": info.registration_time,
         })),
     )
