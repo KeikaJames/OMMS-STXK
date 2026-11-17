@@ -11,9 +11,6 @@
     openText: null,
     locked: false,
     offset: 0,
-    filter: 'all',
-    query: '',
-    favorites: new Set(),
     expanded: new Set(),
     pending: null,
     confirmCancel: false,
@@ -21,17 +18,6 @@
   };
   const cards = new Map();
   const now = () => Date.now() + state.offset;
-
-  // ---- 收藏(只存在本机) ----
-  const favoriteKey = () => 'omms:fav:' + (state.me ? state.me.student_id : '');
-  function loadFavorites() {
-    try { state.favorites = new Set(JSON.parse(localStorage.getItem(favoriteKey()) || '[]')); }
-    catch (error) { state.favorites = new Set(); }
-  }
-  function saveFavorites() {
-    try { localStorage.setItem(favoriteKey(), JSON.stringify(Array.from(state.favorites))); }
-    catch (error) { /* 浏览器禁止存储时收藏只在本页有效 */ }
-  }
 
   // ---- 状态 ----
   function registeredId() {
@@ -50,8 +36,8 @@
     if (!state.me) return null;
     const grades = club.allowed_grades || [];
     const classes = club.allowed_classes || [];
-    if (grades.length && !grades.includes(state.me.grade)) return '面向' + grades.join('、');
-    if (classes.length && !classes.includes(state.me.class)) return '面向指定班级';
+    if (grades.length && !grades.includes(state.me.grade)) return '限' + grades.join('、');
+    if (classes.length && !classes.includes(state.me.class)) return '限指定班级';
     return null;
   }
   const teacher = name => (!name ? '' : /老师$/.test(name) ? name : name + ' 老师');
@@ -62,14 +48,15 @@
   function clubById(id) {
     return state.catalog.find(club => club.id === id) || null;
   }
+  function metaLine(club, info) {
+    return [info.room, club.location, club.meeting_time, teacher(club.advisor_name)].filter(Boolean).join(' · ');
+  }
 
   // ---- 数据 ----
   async function loadMe() {
     const result = await App.request('/api/get_student_info');
     if (!result.ok || !result.data) return;
-    const first = !state.me;
     state.me = result.data;
-    if (first) loadFavorites();
     $('#greeting').textContent = result.data.name + ' · ' + result.data.class;
   }
 
@@ -154,18 +141,20 @@
 
   function renderStatus() {
     const current = phase();
-    const mine = clubById(registeredId());
+    const openText = formatOpenAt();
+    // 已报名时社团名称和退选按钮在下方的“已报名”区域，状态条只写状态。
     const texts = {
-      unset: ['报名时间待定', '老师设置后，这里会显示倒计时'],
-      countdown: ['距离开放', formatOpenAt() ? '开放时间 ' + formatOpenAt() + '，按钮会自动亮起' : '到点后按钮会自动亮起'],
-      open: ['报名进行中', '每人一个，选好后点「报名」'],
-      chosen: ['已选好', (mine ? splitRoom(mine.name).name : (state.me && state.me.registered_club) || '') + ' · 退选后可以重新选择'],
-      locked: ['名单已锁定', '报名和退选已结束']
+      unset: ['开放时间待定', ''],
+      countdown: ['距开放', openText ? '开放时间 ' + openText : ''],
+      open: ['报名中', '每人限报一个社团'],
+      chosen: ['已报名', ''],
+      locked: ['报名已截止', registeredId() ? '' : '未报名的学生由学校统一调剂']
     };
     const [title, detail] = texts[current];
     $('#status').dataset.phase = current;
     $('#status-title').textContent = title;
     $('#status-detail').textContent = detail;
+    $('#status-detail').hidden = !detail;
     tick();
   }
 
@@ -185,7 +174,7 @@
     }
   }
 
-  // ---- 我的社团 ----
+  // ---- 已报名 ----
   function renderMine() {
     const id = registeredId();
     const box = $('#mine');
@@ -199,8 +188,9 @@
     const info = splitRoom(club ? club.name : state.me.registered_club);
     box.hidden = false;
     $('#mine-name').textContent = info.name;
-    const meta = [info.room, club && club.meeting_time, club && club.location, club && club.advisor_name].filter(Boolean);
-    $('#mine-meta').textContent = meta.join(' · ') || '报名时间 ' + (state.me.registration_time || '').slice(0, 16);
+    const meta = club ? metaLine(club, info) : '';
+    $('#mine-meta').textContent = meta;
+    $('#mine-meta').hidden = !meta;
     const actions = $('#mine-actions');
     const key = state.locked ? 'locked' : state.pending && state.pending.kind === 'cancel'
       ? 'busy:' + state.pending.label : state.confirmCancel ? 'confirm' : 'idle';
@@ -209,17 +199,18 @@
     actions.replaceChildren();
     if (state.locked) return;
     if (state.pending && state.pending.kind === 'cancel') {
-      const button = document.createElement('button');
-      button.className = 'btn btn-secondary btn-sm';
-      button.type = 'button';
-      actions.append(button);
-      App.busy(button, state.pending.label);
+      const busy = document.createElement('button');
+      busy.className = 'btn btn-secondary btn-sm';
+      busy.type = 'button';
+      actions.append(busy);
+      App.busy(busy, state.pending.label);
       return;
     }
     if (state.confirmCancel) {
-      const confirm = button('确认退选', 'btn btn-danger btn-sm', cancelRegistration);
-      const keep = button('保留', 'btn btn-quiet btn-sm', () => { state.confirmCancel = false; renderMine(); });
-      actions.append(keep, confirm);
+      actions.append(
+        button('取消', 'btn btn-quiet btn-sm', () => { state.confirmCancel = false; renderMine(); }),
+        button('确认退选', 'btn btn-danger btn-sm', cancelRegistration)
+      );
     } else {
       actions.append(button('退选', 'btn btn-secondary btn-sm', () => { state.confirmCancel = true; renderMine(); }));
     }
@@ -240,19 +231,14 @@
     card.className = 'club';
     card.dataset.id = club.id;
     card.innerHTML =
-      '<div class="club-art"><button class="fav" type="button" aria-pressed="false" aria-label="收藏">☆</button></div>' +
+      '<div class="club-art"></div>' +
       '<div class="club-body">' +
       '<h3 class="club-name"></h3><p class="club-meta"></p><p class="club-desc"></p>' +
-      '<button class="more" type="button" hidden>展开简介</button>' +
+      '<button class="more" type="button" hidden>展开</button>' +
       '<div class="club-tags"></div>' +
-      '<div class="seats"><b class="num"></b><span></span></div><div class="meter"><i></i></div>' +
+      '<div class="seats"><span>剩余名额</span><b class="num"></b><span class="seats-total"></span></div>' +
+      '<div class="meter"><i></i></div>' +
       '<div class="club-action"></div></div>';
-    card.querySelector('.fav').addEventListener('click', () => {
-      if (state.favorites.has(club.id)) state.favorites.delete(club.id);
-      else state.favorites.add(club.id);
-      saveFavorites();
-      renderClubs();
-    });
     card.querySelector('.more').addEventListener('click', () => {
       if (state.expanded.has(club.id)) state.expanded.delete(club.id);
       else state.expanded.add(club.id);
@@ -263,25 +249,11 @@
 
   function renderArt(card, club) {
     const art = card.querySelector('.club-art');
-    const source = typeof club.image_path === 'string' && club.image_path.startsWith('/club-images/') ? club.image_path : null;
-    if (art.dataset.source === String(source)) return;
-    art.dataset.source = String(source);
-    art.querySelectorAll('img, .tile-char').forEach(node => node.remove());
+    const key = ClubArt.key(club);
+    if (art.dataset.key === key) return;
+    art.dataset.key = key;
     art.dataset.tone = String((Number(club.id) % 5) + 1);
-    if (source) {
-      const image = document.createElement('img');
-      image.src = source;
-      image.alt = '';
-      image.loading = 'lazy';
-      image.decoding = 'async';
-      art.prepend(image);
-    } else {
-      const char = document.createElement('span');
-      char.className = 'tile-char';
-      char.setAttribute('aria-hidden', 'true');
-      char.textContent = Array.from(splitRoom(club.name).name || '社')[0];
-      art.prepend(char);
-    }
+    art.replaceChildren(ClubArt.node(club));
   }
 
   // 每 2 秒轮询一次；卡片内容没变时不碰 DOM，旧电脑上滚动和输入不卡。
@@ -292,36 +264,31 @@
     const next = actionFor(club, left, restriction, mine);
     const signature = [club.name, club.location, club.meeting_time, club.advisor_name, club.description,
       club.image_path, club.max_students, (club.allowed_grades || []).join(','), (club.allowed_classes || []).length,
-      left, mine, restriction, next.key, state.favorites.has(club.id), state.expanded.has(club.id)].join('|');
+      left, mine, restriction, next.key, state.expanded.has(club.id)].join('|');
     if (card.dataset.signature === signature) return;
     card.dataset.signature = signature;
     const info = splitRoom(club.name);
     renderArt(card, club);
     card.classList.toggle('is-mine', mine);
-    const fav = card.querySelector('.fav');
-    fav.setAttribute('aria-pressed', String(state.favorites.has(club.id)));
-    fav.textContent = state.favorites.has(club.id) ? '★' : '☆';
     card.querySelector('.club-name').textContent = info.name;
-    card.querySelector('.club-meta').textContent =
-      [info.room, club.location, club.meeting_time, teacher(club.advisor_name)].filter(Boolean).join(' · ') || '时间地点待定';
+    const meta = card.querySelector('.club-meta');
+    meta.textContent = metaLine(club, info);
+    meta.hidden = !meta.textContent;
     const desc = card.querySelector('.club-desc');
     desc.textContent = club.description || '';
     desc.hidden = !club.description;
     desc.classList.toggle('is-open', state.expanded.has(club.id));
     const more = card.querySelector('.more');
     more.hidden = !club.description || club.description.length < 48;
-    more.textContent = state.expanded.has(club.id) ? '收起' : '展开简介';
+    more.textContent = state.expanded.has(club.id) ? '收起' : '展开';
 
     const tags = card.querySelector('.club-tags');
     tags.replaceChildren();
-    const grades = club.allowed_grades || [];
-    if (grades.length) tags.append(tag('面向' + grades.join('、'), restriction ? 'tag-warn' : 'tag'));
-    if ((club.allowed_classes || []).length) tags.append(tag('指定班级', restriction ? 'tag-warn' : 'tag'));
-    if (mine) tags.append(tag('我的选择', 'tag-accent'));
+    if (restriction) tags.append(tag(restriction, 'tag-warn'));
     tags.hidden = !tags.childElementCount;
 
     card.querySelector('.seats b').textContent = String(left);
-    card.querySelector('.seats span').textContent = left > 0 ? '个名额剩余 · 共 ' + club.max_students : '名额已满 · 共 ' + club.max_students;
+    card.querySelector('.seats-total').textContent = '/ ' + club.max_students;
     const meter = card.querySelector('.meter');
     meter.classList.toggle('low', left > 0 && left <= Math.max(3, club.max_students * .1));
     meter.querySelector('i').style.width = (club.max_students ? Math.round(left / club.max_students * 100) : 0) + '%';
@@ -359,41 +326,28 @@
     if (state.pending && state.pending.kind === 'register' && state.pending.clubId === club.id) {
       return { key: 'busy:' + state.pending.label, busy: state.pending.label };
     }
-    if (mine) return { key: 'mine', text: '已选择' };
-    if (state.locked) return { key: 'locked', text: '名单已锁定', off: true };
-    if (registeredId()) return { key: 'other', text: '已选其他社团', off: true };
+    if (mine) return { key: 'mine', text: '已报名' };
+    if (state.locked) return { key: 'locked', text: '已截止', off: true };
+    if (registeredId()) return { key: 'other', text: '已报名其他社团', off: true };
     if (!club.enabled) return { key: 'disabled', text: '暂停报名', off: true };
     if (restriction) return { key: 'restricted', text: restriction, off: true };
     if (club.seat_sync_pending) return { key: 'syncing', text: '名额更新中' };
     if (left <= 0) return { key: 'full', text: '已满', off: true };
-    if (current !== 'open') return { key: 'waiting', text: current === 'countdown' ? '开放后可报名' : '等待开放' };
-    if (state.pending) return { key: 'waiting-other', text: '等待上一项完成' };
+    if (current !== 'open') return { key: 'waiting', text: '待开放' };
+    if (state.pending) return { key: 'waiting-other', text: '处理中' };
     return { key: 'register', register: true };
-  }
-
-  function visible(club) {
-    if (state.query) {
-      const haystack = [club.name, club.advisor_name, club.location, club.meeting_time, club.description].join(' ').toLowerCase();
-      if (!haystack.includes(state.query)) return false;
-    }
-    if (state.filter === 'eligible') return club.enabled && !eligibility(club);
-    if (state.filter === 'open') return club.enabled && remaining(club) > 0;
-    if (state.filter === 'fav') return state.favorites.has(club.id);
-    return true;
   }
 
   function renderClubs() {
     const grid = $('#clubs');
     if (grid.getAttribute('aria-busy') !== 'false') grid.setAttribute('aria-busy', 'false');
     grid.querySelectorAll('.sk, .empty').forEach(node => node.remove());
-    const ordered = state.catalog
-      .filter(visible)
-      .sort((a, b) => Number(state.favorites.has(b.id)) - Number(state.favorites.has(a.id)) || a.id - b.id);
+    const ordered = state.catalog.slice().sort((a, b) => a.id - b.id);
     const live = new Set(ordered.map(club => club.id));
     for (const [id, card] of cards) {
       if (!live.has(id)) {
         card.remove();
-        if (!clubById(id)) cards.delete(id);
+        cards.delete(id);
       }
     }
     let position = 0;
@@ -408,10 +362,11 @@
       if (current !== card) grid.insertBefore(card, current || null);
       position += 1;
     });
+    if (grid.dataset.count !== String(ordered.length)) grid.dataset.count = String(ordered.length);
     if (!ordered.length) {
       const empty = document.createElement('p');
       empty.className = 'empty';
-      empty.textContent = state.catalog.length ? '没有符合条件的社团' : '社团名单正在准备中';
+      empty.textContent = '社团名单待发布';
       grid.append(empty);
     }
   }
@@ -442,7 +397,7 @@
       if (result.status === 0 || result.status === 202 || result.status === 429 || result.status >= 500) {
         if (Date.now() - pending.started > RETRY_WINDOW_MS) {
           state.pending = null;
-          App.toast('网络较忙，请稍后再点一次', 'err');
+          App.toast('提交未完成，请重新报名', 'err');
           await refreshAll();
           return;
         }
@@ -452,7 +407,7 @@
         continue;
       }
       state.pending = null;
-      App.toast((result.data && result.data.message) || '请求未完成，请刷新后重试', 'err');
+      App.toast((result.data && result.data.message) || '提交未完成，请刷新页面', 'err');
       await refreshAll();
       return;
     }
@@ -480,7 +435,7 @@
       if (result.status === 200 && result.data) {
         state.pending = null;
         const done = result.data.success || result.data.code === 'not_registered';
-        App.toast(done ? '已退选，可以重新选择' : result.data.message, done ? 'ok' : 'err');
+        App.toast(done ? '已退选' : result.data.message, done ? 'ok' : 'err');
         await refreshAll();
         return;
       }
@@ -491,7 +446,7 @@
         continue;
       }
       state.pending = null;
-      App.toast((result.data && result.data.message) || '退选未完成，请稍后再试', 'err');
+      App.toast((result.data && result.data.message) || '退选未完成，请重试', 'err');
       await refreshAll();
       return;
     }
@@ -505,18 +460,7 @@
     setTimeout(() => loadSeats().then(render), 1500);
   }
 
-  // ---- 交互与启动 ----
-  $('#search').addEventListener('input', event => {
-    state.query = event.target.value.trim().toLowerCase();
-    renderClubs();
-  });
-  $$('.chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      state.filter = chip.dataset.filter;
-      $$('.chip').forEach(other => other.setAttribute('aria-pressed', String(other === chip)));
-      renderClubs();
-    });
-  });
+  // ---- 启动 ----
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       clearTimeout(pollTimer);

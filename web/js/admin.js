@@ -16,8 +16,9 @@
     ],
     overview: [
       { pane: 'overview-summary', label: '报名概览' },
-      { pane: 'overview-audit', label: '操作记录' },
-      { pane: 'overview-exports', label: '导出' }
+      { pane: 'overview-adjust', label: '调剂' },
+      { pane: 'overview-exports', label: '导出' },
+      { pane: 'overview-audit', label: '操作记录' }
     ],
     settings: [
       { pane: 'settings-registration', label: '开放与锁定' },
@@ -38,11 +39,11 @@
   let openStudentId = null;
   let clubIndex = new Map();
   const audit = { role: 'admin', cursor: null, loading: false };
-  const versions = { overview: 0, students: 0, clubs: 0, audit: 0 };
+  const versions = { overview: 0, students: 0, clubs: 0, audit: 0, adjust: 0 };
   const STUDENT_ROWS_SHOWN = 500;
 
   const ok = result => result.ok && result.data && result.data.success !== false;
-  const message = (result, fallback) => (result.data && result.data.message) || (result.status === 0 ? '网络连接中断，请重试' : fallback);
+  const message = (result, fallback) => (result.data && result.data.message) || (result.status === 0 ? '网络连接中断' : fallback);
   const teacher = name => (!name ? '' : /老师$/.test(name) ? name : name + ' 老师');
   function splitRoom(name) {
     const match = /^(.*?)（\s*([0-9A-Za-z]+)\s*）\s*$/.exec(name || '');
@@ -125,6 +126,7 @@
     if (nextView === 'settings') loadSettings();
     if (selected === 'students-list') loadStudents();
     if (selected === 'overview-audit') loadAudit(true);
+    if (selected === 'overview-adjust') loadAdjust();
     if (options.focus && section && selected) {
       const heading = section.querySelector('[data-pane="' + selected + '"] h2');
       if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
@@ -172,7 +174,7 @@
     $('#m-unreg').textContent = total - registered;
     $('#m-rate').textContent = total ? Math.round(registered / total * 100) + '%' : '—';
     $('#home-account-total').textContent = total || '—';
-    $('#home-account-count').textContent = total ? '已为 ' + total + ' 名学生创建账号' : '导入学生后，这里显示账号数量。';
+    $('#home-account-count').textContent = total ? '已为 ' + total + ' 名学生创建账号' : '暂无学生账号';
     renderPhase(time.data);
     const fill = $('#ov-fill');
     fill.replaceChildren();
@@ -199,11 +201,11 @@
 
   function renderPhase(time) {
     locked = Boolean(time.registration_locked);
-    let title = '还没有设置开放时间';
-    let detail = '在“开放时间与锁定”里设置后，学生端会显示倒计时。';
-    if (locked) { title = '名单已锁定'; detail = '报名和退选已停止，可以导出名单。'; }
-    else if (time.can_register) { title = '报名进行中'; detail = '开放于 ' + time.start_time; }
-    else if (time.start_time) { title = '等待开放'; detail = '开放时间 ' + time.start_time; }
+    let title = '开放时间未设置';
+    let detail = '在“设置 → 开放与锁定”中设置。';
+    if (locked) { title = '名单已锁定'; detail = '可在“报名数据”中调剂和导出。'; }
+    else if (time.can_register) { title = '报名中'; detail = '开放时间 ' + time.start_time; }
+    else if (time.start_time) { title = '待开放'; detail = '开放时间 ' + time.start_time; }
     $('#home-phase').textContent = title;
     $('#home-phase-detail').textContent = detail;
     $('#ov-time').textContent = detail;
@@ -221,8 +223,8 @@
     const seconds = Math.round(Math.abs(skew) / 1000);
     const hours = Math.floor(seconds / 3600);
     const parts = [hours ? hours + ' 小时 ' : '', Math.floor(seconds % 3600 / 60) + ' 分 ', seconds % 60 + ' 秒'];
-    note.textContent = '服务器时钟比这台电脑' + (skew < 0 ? '慢 ' : '快 ') + parts.join('') +
-      '。学生端按服务器时钟开放报名，请先校准服务器时间。';
+    note.textContent = '服务器时间比本机' + (skew < 0 ? '慢 ' : '快 ') + parts.join('') +
+      '。报名按服务器时间开放，请校准服务器时间。';
     note.hidden = false;
   }
 
@@ -244,7 +246,7 @@
     rememberClubs(clubs.data);
     if (!Array.isArray(result.data)) {
       directoryReady = false;
-      $('#stu-tbl').replaceChildren(emptyBody('暂时读取不到学生名单，请稍后刷新'));
+      $('#stu-tbl').replaceChildren(emptyBody('学生名单读取失败，请刷新页面'));
       return;
     }
     studentRows = result.data;
@@ -261,7 +263,7 @@
     table.replaceChildren();
     if (!studentRows.length) {
       count.textContent = '';
-      table.append(emptyBody('导入学生后，名单显示在这里'));
+      table.append(emptyBody('暂无学生'));
       return;
     }
     const query = $('#stu-search').value.trim().toLowerCase();
@@ -270,13 +272,13 @@
         .some(value => String(value || '').toLowerCase().includes(query)));
     const registered = studentRows.filter(student => student.club_id).length;
     count.textContent = (query ? '匹配 ' + matches.length + ' 名 · ' : '') + '共 ' + studentRows.length + ' 名学生，已报名 ' + registered + ' 名' +
-      (matches.length > STUDENT_ROWS_SHOWN ? '；列表显示前 ' + STUDENT_ROWS_SHOWN + ' 名，输入姓名或学号查找其他学生' : '');
+      (matches.length > STUDENT_ROWS_SHOWN ? '；显示前 ' + STUDENT_ROWS_SHOWN + ' 名，可按姓名或学号查找' : '');
     const head = el('thead');
     const headRow = el('tr');
     ['姓名', '班级', '学号', '账号', '社团', ''].forEach(label => headRow.append(el('th', '', label)));
     head.append(headRow);
     if (!matches.length) {
-      table.append(head, emptyBody('请换一个关键词', 6));
+      table.append(head, emptyBody('无匹配结果', 6));
       return;
     }
     const body = el('tbody');
@@ -325,10 +327,10 @@
     const override = el('input');
     override.type = 'checkbox';
     const overrideLabel = el('label', 'check');
-    overrideLabel.append(override, document.createTextNode('允许报名范围之外或已暂停的社团'));
+    overrideLabel.append(override, document.createTextNode('允许安排到报名范围以外或暂停报名的社团'));
     const reason = el('input', 'input');
     reason.maxLength = 200;
-    reason.placeholder = '例如：学生当天请假，班主任确认后代为报名';
+    reason.placeholder = '例如：班主任代报';
     const error = el('p', 'error');
     error.setAttribute('role', 'alert');
     const save = el('button', 'btn btn-primary btn-sm', '保存社团');
@@ -342,7 +344,7 @@
     const actions = el('div', 'actions');
     actions.append(save, reset, remove);
     const columns = el('div', 'row2');
-    columns.append(field('社团', select), field('原因（写入操作记录）', reason));
+    columns.append(field('社团', select), field('原因（记入操作记录）', reason));
     panel.append(columns, overrideLabel, error, actions, output);
     cell.append(panel);
     row.append(cell);
@@ -353,7 +355,7 @@
     save.addEventListener('click', async () => {
       const target = select.value ? Number(select.value) : null;
       const current = student.club_id ? Number(student.club_id) : null;
-      if (target === current) { error.textContent = '请选择新的社团，或选择“未报名”移出当前社团'; return; }
+      if (target === current) { error.textContent = '请选择社团'; return; }
       if (!reason.value.trim()) { error.textContent = '请填写原因'; reason.focus(); return; }
       const body = { student_id: student.id, request_id: ids.move, reason: reason.value.trim() };
       let path = '/api/admin/transfer_registration';
@@ -366,9 +368,9 @@
       const result = await adminRetry(path, body);
       App.busy(save, null);
       if (!ok(result)) {
-        const text = message(result, '保存未完成');
+        const text = message(result, '保存失败');
         error.textContent = target && !override.checked && result.status === 400 && /限制|开放/.test(text)
-          ? text + '。确认需要时，勾选“允许报名范围之外或已暂停的社团”后再保存。' : text;
+          ? text + '。如需安排，请勾选“允许安排到报名范围以外或暂停报名的社团”。' : text;
         return;
       }
       const done = !current ? '已为 ' + student.name + ' 报名 ' + clubLabel(target)
@@ -380,18 +382,18 @@
     });
 
     reset.addEventListener('click', () => {
-      if (!reason.value.trim()) { error.textContent = '重置密码也需要填写原因'; reason.focus(); return; }
+      if (!reason.value.trim()) { error.textContent = '请填写原因'; reason.focus(); return; }
       error.textContent = '';
       confirmInline(reset, async () => {
         const result = await adminRetry('/api/admin/reset_student_password', { student_id: student.id, request_id: ids.reset, reason: reason.value.trim() });
-        if (!ok(result)) throw new Error(message(result, '重置未完成'));
+        if (!ok(result)) throw new Error(message(result, '重置失败'));
         ids.reset = App.requestId();
         output.replaceChildren();
         if (result.data.temporary_password) {
           output.append(document.createTextNode('账号 '), el('b', 'mono', result.data.username), document.createTextNode(' 的临时密码：'),
-            el('b', 'mono', result.data.temporary_password), el('small', '', '这个密码只在这里显示一次，请当面交给学生，并提醒登录后修改。'));
+            el('b', 'mono', result.data.temporary_password), el('small', '', '临时密码仅显示一次，请交给学生本人，登录后修改。'));
         } else {
-          output.append(el('small', '', result.data.message || '重置已完成'));
+          output.append(el('small', '', result.data.message || '密码已重置'));
         }
         output.hidden = false;
       });
@@ -399,7 +401,7 @@
 
     remove.addEventListener('click', () => confirmInline(remove, async () => {
       const deleted = await App.request('/api/delete_student', { method: 'POST', body: { student_id: student.id } });
-      if (!ok(deleted)) throw new Error(message(deleted, '删除未完成'));
+      if (!ok(deleted)) throw new Error(message(deleted, '删除失败'));
       App.toast('已删除 ' + student.name, 'ok');
       openStudentId = null;
       await Promise.all([loadStudents(), loadOverview()]);
@@ -427,7 +429,8 @@
     'student.password_reset': '重置学生密码', 'student.password_changed': '学生修改密码', 'student.deleted': '删除学生',
     'students.imported': '导入学生', 'students.deleted_all': '清空学生',
     'club.updated': '编辑社团', 'club.deleted': '删除社团', 'club.image_uploaded': '更新社团图片', 'club.image_removed': '移除社团图片',
-    'clubs.imported': '添加社团', 'clubs.deleted_all': '清空社团', 'admin.password_changed': '修改管理员密码'
+    'clubs.imported': '添加社团', 'clubs.deleted_all': '清空社团', 'admin.password_changed': '修改管理员密码',
+    'registrations.adjusted': '调剂'
   };
 
   function auditTime(ms) {
@@ -446,6 +449,7 @@
       case 'registration': return clubLabel(after.club_id || before.club_id);
       case 'students': return after.success !== undefined ? after.success + ' 名' : before.students !== undefined ? before.students + ' 名' : '全部学生';
       case 'clubs': return after.success !== undefined ? after.success + ' 个' : '全部社团';
+      case 'registrations': return '未报名学生';
       default: return '';
     }
   }
@@ -459,6 +463,9 @@
     if (event.action === 'registration.admin_transferred') parts.push(clubLabel(before.club_id) + ' → ' + clubLabel(after.club_id));
     if (event.action === 'registration.start_time_updated') parts.push(after.start_time || '');
     if (event.action === 'registration.lock_updated') parts.push(after.locked ? '锁定' : '解除锁定');
+    if (event.action === 'registrations.adjusted') {
+      parts.push('安排 ' + after.assigned + ' 人' + (after.unassigned ? '，' + after.unassigned + ' 人无可用名额' : ''));
+    }
     if (event.reason) parts.push(event.reason);
     return parts.filter(Boolean).join(' · ');
   }
@@ -478,7 +485,7 @@
     const table = $('#audit-tbl');
     const more = $('#audit-more');
     if (!result.data || !Array.isArray(result.data.events)) {
-      table.replaceChildren(emptyBody(message(result, '暂时读取不到操作记录')));
+      table.replaceChildren(emptyBody(message(result, '操作记录读取失败')));
       more.hidden = true;
       return;
     }
@@ -489,7 +496,7 @@
       ['时间', '操作人', '操作', '对象', '说明'].forEach(label => headRow.append(el('th', '', label)));
       head.append(headRow);
       table.replaceChildren(head, el('tbody'));
-      if (!events.length) table.replaceChildren(head, emptyBody('这里会按时间记录每一次修改', 5));
+      if (!events.length) table.replaceChildren(head, emptyBody('暂无记录', 5));
     }
     const body = table.querySelector('tbody');
     events.forEach(event => {
@@ -516,14 +523,14 @@
     if (button.dataset.armed) return;
     const label = button.textContent;
     button.dataset.armed = '1';
-    button.textContent = '再点一次确认';
+    button.textContent = '确认' + label;
     const reset = () => { button.textContent = label; delete button.dataset.armed; };
     const timer = setTimeout(reset, 3000);
     button.addEventListener('click', async () => {
       clearTimeout(timer);
       reset();
       button.disabled = true;
-      try { await action(); } catch (error) { App.toast(error.message || '操作未完成', 'err'); }
+      try { await action(); } catch (error) { App.toast(error.message || '操作失败', 'err'); }
       finally { button.disabled = false; }
     }, { once: true });
   }
@@ -649,8 +656,8 @@
     const note = $('#imp-stu-check');
     const button = $('#imp-stu-go');
     button.disabled = true;
-    if (!importDraft) { note.textContent = '粘贴名单后，这里会显示识别结果。'; button.textContent = '创建账号'; return; }
-    if (pendingCredentials.length) { note.textContent = '上一批账号还没有发放，请先在“账号发放”里下载。'; return; }
+    if (!importDraft) { note.textContent = '粘贴后显示识别结果。'; button.textContent = '创建账号'; return; }
+    if (pendingCredentials.length) { note.textContent = '上一批账号尚未下载，请先在“账号发放”中下载。'; return; }
     if (!directoryReady) { note.textContent = '正在核对已导入的学号'; return; }
     if (!importDraft.confident && !importDraft.confirmed) { note.textContent = '请确认姓名、班级和学号分别在哪一列。'; return; }
     const check = validateDraft(importDraft);
@@ -689,7 +696,7 @@
     }
     progress.querySelector('i').style.width = '100%';
     progressText.textContent = '已创建 ' + created + ' 个账号' + (failed ? '，' + failed + ' 行学号重复未导入' : '');
-    $('#imp-stu-result').textContent = stoppedAt === null ? '' : '从第 ' + (stoppedAt + 1) + ' 名学生开始未导入，已创建的账号可以先下载；剩余名单重新粘贴即可继续。';
+    $('#imp-stu-result').textContent = stoppedAt === null ? '' : '第 ' + (stoppedAt + 1) + ' 名起未导入。已创建的账号可先下载，其余名单重新粘贴后继续导入。';
     App.busy(button, null);
     importing = false;
     if (credentials.length) {
@@ -727,14 +734,14 @@
     const box = $('#imp-stu-out');
     box.replaceChildren();
     if (!pendingCredentials.length) {
-      box.append(el('p', 'empty', '完成一次学生导入后，新账号和初始密码会出现在这里。'));
+      box.append(el('p', 'empty', '暂无待下载的账号。'));
       return;
     }
     const head = el('div', 'actions');
     const download = el('button', 'btn btn-primary', '下载账号密码表');
     download.type = 'button';
     download.addEventListener('click', downloadCredentials);
-    const done = el('button', 'btn btn-quiet', '已发放，清除本页密码');
+    const done = el('button', 'btn btn-quiet', '清除本页密码');
     done.type = 'button';
     done.addEventListener('click', () => {
       pendingCredentials = [];
@@ -769,25 +776,15 @@
     rememberClubs(result.data);
     const box = $('#club-list');
     box.replaceChildren();
-    if (!Array.isArray(result.data)) { box.append(el('p', 'empty', '暂时读取不到社团')); return; }
-    if (!result.data.length) { box.append(el('p', 'empty', '还没有社团，可以在“批量添加”里一次添加多个。')); return; }
+    if (!Array.isArray(result.data)) { box.append(el('p', 'empty', '社团读取失败')); return; }
+    if (!result.data.length) { box.append(el('p', 'empty', '暂无社团。在“批量添加”中添加。')); return; }
     result.data.forEach(club => box.append(clubCard(club)));
   }
 
   function clubArt(club) {
     const art = el('div', 'club-art');
     art.dataset.tone = String((Number(club.id) % 5) + 1);
-    if (typeof club.image_path === 'string' && club.image_path.startsWith('/club-images/')) {
-      const image = el('img');
-      image.src = club.image_path;
-      image.alt = '';
-      image.loading = 'lazy';
-      art.append(image);
-    } else {
-      const char = el('span', 'tile-char', Array.from(splitRoom(club.name).name || '社')[0]);
-      char.setAttribute('aria-hidden', 'true');
-      art.append(char);
-    }
+    art.append(ClubArt.node(club));
     return art;
   }
 
@@ -796,16 +793,17 @@
     const body = el('div', 'club-body');
     const info = splitRoom(club.name);
     body.append(el('h3', 'club-name', info.name));
-    body.append(el('p', 'club-meta', [info.room, club.location, club.meeting_time, teacher(club.advisor_name)].filter(Boolean).join(' · ') || '时间地点待补充'));
+    const meta = [info.room, club.location, club.meeting_time, teacher(club.advisor_name)].filter(Boolean).join(' · ');
+    if (meta) body.append(el('p', 'club-meta', meta));
     if (club.description) body.append(el('p', 'club-desc', club.description));
     const tags = el('div', 'club-tags');
     if (!club.enabled) tags.append(el('span', 'tag tag-warn', '暂停报名'));
-    if ((club.allowed_grades || []).length) tags.append(el('span', 'tag', '面向' + club.allowed_grades.join('、')));
+    if ((club.allowed_grades || []).length) tags.append(el('span', 'tag', '限' + club.allowed_grades.join('、')));
     if ((club.allowed_classes || []).length) tags.append(el('span', 'tag', '限 ' + club.allowed_classes.length + ' 个班级'));
-    if (club.seat_sync_pending) tags.append(el('span', 'tag tag-warn', '名额同步中'));
+    if (club.seat_sync_pending) tags.append(el('span', 'tag tag-warn', '名额更新中'));
     if (tags.childElementCount) body.append(tags);
     const seats = el('div', 'seats');
-    seats.append(el('b', 'num', club.current_students + ' / ' + club.max_students), el('span', '', '已报名'));
+    seats.append(el('span', '', '已报名'), el('b', 'num', String(club.current_students)), el('span', '', '/ ' + club.max_students));
     body.append(seats, meter(club.max_students ? club.current_students / club.max_students : 0, club.max_students - club.current_students <= 3));
     const actions = el('div', 'actions');
     const edit = el('button', 'btn btn-primary btn-sm', '编辑');
@@ -816,7 +814,7 @@
     remove.type = 'button';
     remove.addEventListener('click', () => confirmInline(remove, async () => {
       const result = await App.request('/api/delete_club', { method: 'POST', body: { club_id: club.id } });
-      if (!ok(result)) throw new Error(message(result, '删除未完成'));
+      if (!ok(result)) throw new Error(message(result, '删除失败'));
       App.toast('已删除 ' + info.name, 'ok');
       await Promise.all([loadClubs(), loadOverview()]);
     }));
@@ -873,7 +871,7 @@
     row3.append(field('年级限制', grades), field('班级限制', classes));
     const buttons = el('div', 'actions');
     buttons.append(save, cancel);
-    form.append(row1, field('简介', description), row2, field('地点', location), row3, enabledLabel, field('卡片图片（可选，2 MB 以内）', image), error, buttons);
+    form.append(row1, field('简介', description), row2, field('地点', location), row3, enabledLabel, field('社团照片（可选，2 MB 以内）', image), error, buttons);
     const requestIds = { update: App.requestId(), upload: App.requestId() };
     form.addEventListener('input', () => { requestIds.update = App.requestId(); });
     cancel.addEventListener('click', () => { editingClub = null; loadClubs(); });
@@ -898,7 +896,7 @@
       const result = await App.request('/api/update_club', { method: 'POST', body: payload });
       if (!ok(result)) {
         App.busy(save, null);
-        error.textContent = message(result, '保存未完成');
+        error.textContent = message(result, '保存失败');
         return;
       }
       const file = image.files && image.files[0];
@@ -908,7 +906,7 @@
         const upload = await App.request('/api/upload_club_image?' + params, { method: 'POST', headers: { 'Content-Type': file.type }, body: file });
         if (!ok(upload)) {
           App.busy(save, null);
-          error.textContent = '社团信息已保存；' + message(upload, '图片上传未完成');
+          error.textContent = '社团信息已保存；' + message(upload, '照片上传失败');
           return;
         }
       }
@@ -937,9 +935,74 @@
     App.busy(button, null);
     const added = Number(result.data && result.data.success) || 0;
     const failed = Number(result.data && result.data.failed) || 0;
-    $('#imp-club-out').textContent = result.data ? '已添加 ' + added + ' 个社团' + (failed ? '，' + failed + ' 行名称重复或人数无效' : '') : message(result, '添加未完成');
+    $('#imp-club-out').textContent = result.data ? '已添加 ' + added + ' 个社团' + (failed ? '，' + failed + ' 行名称重复或人数无效' : '') : message(result, '添加失败');
     if (added) { $('#imp-club').value = ''; loadClubs(); loadOverview(); }
   });
+
+  // ---- 调剂 ----
+  async function loadAdjust() {
+    const version = ++versions.adjust;
+    const result = await App.request('/api/admin/adjustment');
+    if (version !== versions.adjust) return;
+    const box = $('#adjust-body');
+    box.replaceChildren();
+    const plan = result.data;
+    if (!result.ok || !plan) { box.append(el('p', 'empty', '读取失败，请刷新页面')); return; }
+    const metrics = el('div', 'metrics metrics-3');
+    [['未报名', plan.unregistered + ' 人'], ['空余名额', plan.seats + ' 个'], ['可安排', plan.assignable + ' 人']].forEach(([label, value]) => {
+      const item = el('div', 'metric');
+      item.append(el('small', '', label), el('b', 'num', value));
+      metrics.append(item);
+    });
+    box.append(metrics);
+    if (plan.clubs.length) {
+      const table = el('table', 'tbl');
+      const head = el('tr');
+      ['社团', '空余名额', '将安排'].forEach(text => head.append(el('th', '', text)));
+      const thead = el('thead');
+      thead.append(head);
+      const body = el('tbody');
+      plan.clubs.forEach(club => {
+        const row = el('tr');
+        row.append(el('td', '', splitRoom(club.name).name), el('td', 'num', String(club.remaining)), el('td', 'num', String(club.assign)));
+        body.append(row);
+      });
+      table.append(thead, body);
+      const wrap = el('div', 'table-wrap');
+      wrap.append(table);
+      box.append(wrap);
+    }
+    const actions = el('div', 'actions');
+    if (!plan.unregistered) {
+      box.append(el('p', 'hint', '全部学生均已安排社团。'));
+    } else if (!plan.locked) {
+      box.append(el('p', 'hint', '名单锁定后可以调剂。'));
+      const go = el('button', 'btn btn-secondary btn-sm', '前往锁定');
+      go.type = 'button';
+      go.addEventListener('click', () => activate('settings', 'settings-registration'));
+      actions.append(go);
+    } else {
+      if (plan.assignable < plan.unregistered) {
+        box.append(el('p', 'warn-note', (plan.unregistered - plan.assignable) + ' 人无符合条件的空余名额，需先提高社团人数上限或调整报名范围。'));
+      }
+      if (plan.assignable) {
+        const run = el('button', 'btn btn-primary btn-sm', '调剂 ' + plan.assignable + ' 人');
+        run.type = 'button';
+        const requestId = App.requestId();
+        run.addEventListener('click', () => confirmInline(run, async () => {
+          const result = await adminRetry('/api/admin/adjust_registrations', { request_id: requestId });
+          if (!ok(result)) throw new Error(message(result, '调剂失败'));
+          App.toast('已调剂 ' + result.data.assigned + ' 人', 'ok');
+          await Promise.all([loadAdjust(), loadOverview()]);
+        }));
+        actions.append(run);
+      }
+    }
+    const download = el('a', 'btn btn-secondary btn-sm', '下载报名表');
+    download.href = '/api/export_workbook';
+    actions.append(download);
+    box.append(actions);
+  }
 
   // ---- 设置 ----
   async function loadSettings() {
@@ -947,7 +1010,7 @@
     if (!result.data) return;
     if (result.data.start_time) $('#open-at').value = result.data.start_time.slice(0, 16).replace(' ', 'T');
     locked = Boolean(result.data.registration_locked);
-    $('#lock-state').textContent = locked ? '名单已锁定：学生不能报名或退选。' : '名单未锁定：开放时间内学生可以报名和退选。';
+    $('#lock-state').textContent = locked ? '名单已锁定，报名与退选已停止。未报名的学生在“报名数据 → 调剂”中安排。' : '名单未锁定。';
     $('#toggle-lock').textContent = locked ? '解除锁定' : '锁定名单';
   }
 
@@ -955,7 +1018,7 @@
     const value = $('#open-at').value;
     if (!value) { App.toast('请选择开放时间', 'err'); return; }
     const result = await App.request('/api/update_registration_time', { method: 'POST', body: { start_time: value.replace('T', ' ') + ':00' } });
-    App.toast(ok(result) ? '开放时间已保存' : message(result, '保存未完成'), ok(result) ? 'ok' : 'err');
+    App.toast(ok(result) ? '开放时间已保存' : message(result, '保存失败'), ok(result) ? 'ok' : 'err');
     loadOverview();
   });
 
@@ -966,7 +1029,7 @@
     App.busy(button, '保存中');
     const result = await App.request('/api/update_registration_lock', { method: 'POST', body: { locked: !locked, reason, request_id: App.requestId() } });
     App.busy(button, null);
-    App.toast(ok(result) ? (locked ? '已解除锁定' : '名单已锁定') : message(result, '保存未完成'), ok(result) ? 'ok' : 'err');
+    App.toast(ok(result) ? (locked ? '已解除锁定' : '名单已锁定') : message(result, '保存失败'), ok(result) ? 'ok' : 'err');
     if (ok(result)) $('#lock-reason').value = '';
     await loadSettings();
     loadOverview();
@@ -977,13 +1040,13 @@
     const next = $('#ap-new').value;
     if (!current || next.length < 8) { App.toast('请填写当前密码，新密码至少 8 位', 'err'); return; }
     const result = await App.request('/api/admin_change_password', { method: 'POST', body: { current, new: next } });
-    App.toast(ok(result) ? '密码已修改，请重新登录' : message(result, '修改未完成'), ok(result) ? 'ok' : 'err');
+    App.toast(ok(result) ? '密码已修改，请重新登录' : message(result, '修改失败'), ok(result) ? 'ok' : 'err');
     if (ok(result)) setTimeout(() => { location.href = '/'; }, 900);
   });
 
   $('#del-all-stu').addEventListener('click', () => confirmInline($('#del-all-stu'), async () => {
     const result = await App.request('/api/delete_all_students', { method: 'POST', body: { confirm: true } });
-    if (!ok(result)) throw new Error(message(result, '清空未完成'));
+    if (!ok(result)) throw new Error(message(result, '清空失败'));
     App.toast('已清空全部学生', 'ok');
     await Promise.all([loadStudents(), loadOverview()]);
   }));

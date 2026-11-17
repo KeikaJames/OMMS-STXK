@@ -7,15 +7,16 @@
 <meta name="force-rendering" content="webkit">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#F4EFE6">
-<title>选课 · 社团选课</title>
+<title>社团报名 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=18">
+<link rel="stylesheet" href="/app.css?v=21">
 <script src="/js/legacy.js?v=18" defer></script>
 <script src="/js/common.js?v=18" defer></script>
-<script src="/js/student.js?v=18" defer></script>
+<script src="/js/club-art.js?v=1" defer></script>
+<script src="/js/student.js?v=20" defer></script>
 </head>
 <body>
-<div class="legacy-note" id="legacy" hidden>这个浏览器版本太旧，打不开选课页面。请换用新版 Edge、Chrome 或 Firefox；360、QQ、搜狗浏览器请点地址栏右侧的图标切换到“极速模式”。</div>
+<div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
 <a class="skip" href="#main">跳到主内容</a>
 <header class="topbar">
   <a class="brand" href="/student/dashboard"><img src="/img/school-emblem.webp" alt="" width="34" height="34"><span><b>社团选课</b><small>鄂尔多斯市实验中学</small></span></a>
@@ -27,47 +28,33 @@
 </header>
 
 <main class="page" id="main">
-  <section class="intro">
-    <div>
-      <p class="eyebrow" id="greeting">本学期社团</p>
-      <h1>选一个想去的社团</h1>
-      <p class="lede">每人可以报名一个社团，退选后可以重新选择。</p>
-    </div>
-    <img class="intro-art" src="/img/hero-grassland.webp" alt="" width="960" height="541" decoding="async">
-  </section>
+  <div class="page-head">
+    <p class="eyebrow" id="greeting"></p>
+    <h1>社团报名</h1>
+  </div>
 
   <section class="status" id="status" data-phase="loading" aria-live="polite">
     <div class="status-main">
-      <strong><span class="dot" aria-hidden="true"></span><span id="status-title">正在读取</span></strong>
-      <span id="status-detail">正在同步开放时间与名额</span>
+      <strong><span class="dot" aria-hidden="true"></span><span id="status-title">读取中</span></strong>
+      <span id="status-detail"></span>
     </div>
     <div class="status-clock"><small id="clock-label">当前时间</small><span class="clock" id="clock">--:--:--</span></div>
   </section>
 
   <section class="card mine" id="mine" hidden>
     <div>
-      <p class="eyebrow">我的社团</p>
+      <p class="eyebrow">已报名</p>
       <h2 id="mine-name"></h2>
       <p id="mine-meta"></p>
     </div>
     <div class="mine-actions" id="mine-actions"></div>
   </section>
 
-  <section aria-labelledby="catalog-title">
-    <div class="section-title"><h2 id="catalog-title">全部社团</h2><p id="updated-at"></p></div>
-    <div class="toolbar">
-      <label class="sr-only" for="search">搜索社团</label>
-      <input class="input" id="search" type="search" placeholder="搜索社团、老师或地点" autocomplete="off">
-      <div class="chips" role="group" aria-label="筛选">
-        <button class="chip" type="button" data-filter="all" aria-pressed="true">全部</button>
-        <button class="chip" type="button" data-filter="eligible" aria-pressed="false">我能报名</button>
-        <button class="chip" type="button" data-filter="open" aria-pressed="false">还有名额</button>
-        <button class="chip" type="button" data-filter="fav" aria-pressed="false">收藏</button>
-      </div>
-    </div>
+  <section aria-label="社团">
     <div class="club-grid" id="clubs" aria-busy="true">
       <div class="sk"></div><div class="sk"></div><div class="sk"></div>
     </div>
+    <p class="updated" id="updated-at"></p>
   </section>
 </main>
 
