@@ -1129,7 +1129,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 1)))
         transfer_status, transferred = self._request_json(
             "POST", "/api/admin/transfer_registration", token=admin_token,
-            body={"student_id": 1, "club_id": 2, "request_id": "transfer-0001", "reason": "调剂到第二社团"},
+            body={"student_id": 1, "club_id": 2, "request_id": "transfer-0001", "reason": "调整到第二社团"},
         )
         self.assertEqual(200, transfer_status, transferred)
         self.assertEqual("2", redis_command(self.redis_port, "GET", key("stock", 1)))
