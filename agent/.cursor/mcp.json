@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "omms": {
+      "command": "python3",
+      "args": ["${workspaceFolder}/omms_mcp.py"]
+    }
+  }
+}

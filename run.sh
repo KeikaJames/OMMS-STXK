@@ -5,11 +5,31 @@
 #   OMMS_PYTHON_ONLY=1 bash run.sh   不编译 Rust，由 Python 服务全部接口
 #   TLS_CERT=证书 TLS_KEY=私钥 bash run.sh      在 TLS_PORT（默认 8443）上提供 HTTPS，8080 跳转到 HTTPS
 #   REAL_IP_FROM=127.0.0.1 bash run.sh         经内网穿透或反向代理访问时，按 REAL_IP_HEADER 取学生的真实地址
+#   HTTP_PORT=80 bash run.sh         改用 80 端口，学生访问地址里不用写端口
+# 上述参数也可以写在 deploy/omms.env（每行 键=值）；启动命令里给出的同名变量优先。
 # 没有 cargo、Rust 版本过旧或首次编译失败时，自动改用只运行 Python 的模式。
 set -o pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+# deploy/omms.env 只读取下列运行参数，其余键留给 systemd 部署使用。
+SETTINGS_FILE="${OMMS_SETTINGS:-$DIR/deploy/omms.env}"
+if [ -r "$SETTINGS_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        key=${line%%=*}
+        value=${line#*=}
+        [ "$key" = "$line" ] && continue
+        case "$key" in
+            HTTP_PORT|TLS_CERT|TLS_KEY|TLS_PORT|REAL_IP_FROM|REAL_IP_HEADER|APP_UTC_OFFSET|OMMS_PYTHON_ONLY|\
+            OMMS_OPEN_BROWSER|PYTHON|BACKUP_KEEP|MAX_IMPORT_STUDENTS|SESSION_TTL|LOGIN_MAX_FAILS|AUTH_CONCURRENCY|\
+            MAX_HTTP_WORKERS|SEATS_CACHE_MS|LOG_LEVEL)
+                printenv "$key" >/dev/null 2>&1 || export "$key=$value"
+                ;;
+        esac
+    done < "$SETTINGS_FILE"
+fi
 RUN_DIR="${OMMS_RUN_DIR:-$DIR/run}"
+HTTP_PORT="${HTTP_PORT:-8080}"
 PYTHON="${PYTHON:-python3}"
 PYTHON_ONLY="${OMMS_PYTHON_ONLY:-0}"
 export DB_PATH="${DB_PATH:-$DIR/club_system.db}"
@@ -108,6 +128,13 @@ if [ "${1:-}" = "stop" ]; then
 fi
 # ---- 预检：在旧服务仍在线时完成，失败不影响旧服务 ----
 raise_open_files
+case "$HTTP_PORT" in
+    ''|*[!0-9]*) say "[nginx] HTTP_PORT 应为 1–65535 的端口号"; exit 1 ;;
+esac
+if [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+    say "[nginx] HTTP_PORT 应为 1–65535 的端口号"
+    exit 1
+fi
 if [ -n "${TLS_CERT:-}${TLS_KEY:-}" ]; then
     if [ ! -r "${TLS_CERT:-}" ] || [ ! -r "${TLS_KEY:-}" ]; then
         say "[nginx] TLS_CERT 与 TLS_KEY 需指向可读的证书与私钥文件"
@@ -134,7 +161,7 @@ if [ "$PYTHON_ONLY" != "1" ]; then
         cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
         [ "$build_jobs" -gt "$cores" ] && build_jobs=$cores
         [ "$build_jobs" -lt 1 ] && build_jobs=1
-        say "[build] 编译 Rust 热服务（并行 $build_jobs；首次编译在旧电脑上需要几分钟）"
+        say "[build] 编译 Rust 热服务（并行 ${build_jobs}；首次编译在旧电脑上需要几分钟）"
         if ! cargo build --release --jobs "$build_jobs" --manifest-path "$DIR/club-hot/Cargo.toml" > "$RUN_DIR/build.log" 2>&1; then
             if [ -x "$RUST_BIN" ]; then
                 say "[build] Rust 构建失败，旧服务保持不变（日志 $RUN_DIR/build.log）"
@@ -212,6 +239,10 @@ then
     say "[nginx] 生成 HTTPS 或来源地址配置失败，旧服务保持不变"
     exit 1
 fi
+if [ "$HTTP_PORT" != 8080 ]; then
+    sed -i.bak -e "s/listen 8080/listen $HTTP_PORT/" "$NGINX_CONF.new"
+    rm -f "$NGINX_CONF.new.bak"
+fi
 if ! nginx -t -p "$RUN_DIR" -c "$NGINX_CONF.new" >/dev/null 2>&1; then
     nginx -t -p "$RUN_DIR" -c "$NGINX_CONF.new"
     say "[nginx] 新配置校验失败，旧服务保持不变"
@@ -261,11 +292,15 @@ fi
 
 # ---- 访问地址与管理员账号 ----
 scheme=http
-port=8080
+port=$HTTP_PORT
 if [ -n "${TLS_CERT:-}" ]; then
     scheme=https
     port=${TLS_PORT:-8443}
 fi
+case "$scheme:$port" in
+    http:80|https:443) port_suffix="" ;;
+    *) port_suffix=":$port" ;;
+esac
 lan_ip=""
 case "$(uname -s)" in
     Darwin)
@@ -276,8 +311,8 @@ case "$(uname -s)" in
         lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
         ;;
 esac
-local_base="$scheme://127.0.0.1:$port"
-public_base="$scheme://${lan_ip:-127.0.0.1}:$port"
+local_base="$scheme://127.0.0.1$port_suffix"
+public_base="$scheme://${lan_ip:-127.0.0.1}$port_suffix"
 admin_user=""
 admin_password=""
 login_url=""
