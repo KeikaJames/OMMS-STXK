@@ -14,6 +14,7 @@ const App = {
   async request(path, options = {}) {
     // Chrome 72、Safari 12.1 以前的 fetch 默认不带 Cookie，这里显式声明。
     const init = Object.assign({ cache: 'no-cache', credentials: 'same-origin' }, options);
+    init.headers = Object.assign({ 'X-Requested-With': 'XMLHttpRequest' }, init.headers || {});
     if (init.body && typeof init.body !== 'string' && !(init.body instanceof Blob)) {
       init.body = JSON.stringify(init.body);
       init.headers = Object.assign({ 'Content-Type': 'application/json' }, init.headers || {});

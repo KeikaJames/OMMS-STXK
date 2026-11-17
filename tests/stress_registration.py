@@ -413,6 +413,7 @@ async def register_once(
             "POST /api/register_club HTTP/1.1\r\n"
             f"Host: 127.0.0.1:{port}\r\n"
             "Content-Type: application/json\r\n"
+            "X-Requested-With: XMLHttpRequest\r\n"
             f"Content-Length: {len(body)}\r\n"
             f"Cookie: session={token}\r\n"
             "Connection: close\r\n\r\n"

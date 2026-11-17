@@ -10,7 +10,6 @@ import io
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -18,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -42,12 +42,27 @@ def request(port: int, method: str, path: str, *, token: str | None = None,
     if token:
         headers["Cookie"] = f"session={token}"
     if method == "POST":
-        headers.update({"Content-Type": "application/json", "Content-Length": str(len(encoded))})
+        headers.update({"Content-Type": "application/json", "Content-Length": str(len(encoded)),
+                        "X-Requested-With": "XMLHttpRequest"})
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20.0)
     try:
         conn.request(method, path, body=encoded if method == "POST" else None, headers=headers)
         response = conn.getresponse()
         return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+    finally:
+        conn.close()
+
+
+def upload(port: int, path: str, token: str, data: bytes, filename: str) -> tuple[int, dict]:
+    headers = {"Connection": "close", "Cookie": f"session={token}", "X-Requested-With": "XMLHttpRequest",
+               "Content-Type": "application/octet-stream", "Content-Length": str(len(data)),
+               "X-File-Name": urllib.parse.quote(filename)}
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60.0)
+    try:
+        conn.request("POST", path, body=data, headers=headers)
+        response = conn.getresponse()
+        raw = response.read()
+        return response.status, json.loads(raw) if raw else {}
     finally:
         conn.close()
 
@@ -292,28 +307,32 @@ class MaintenanceTests(unittest.TestCase):
             status, _body = request_json(app.http_port, "GET", "/api/admin/backup?name=" + name, token=self.admin)
             self.assertEqual(400, status)
 
-        app.stop()
+        student_token = write_session(app.client, 2)
         app.sql("DELETE FROM registrations")
         app.sql("DELETE FROM students")
         (image_dir / photo).unlink()
-        app.client.set(key("sess", "stale-session"), "{}")
-        result = app.cli("restore", str(backup_file))
-        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertIn("已恢复：学生 3 名，社团 1 个，报名 1 条，照片 1 张。", result.stdout)
+        status, restored = upload(app.http_port, "/api/admin/restore_upload", self.admin, raw, "full.zip")
+        self.assertEqual(200, status, restored)
+        self.assertEqual((3, 1, 1), (restored["students"], restored["clubs"], restored["registrations"]))
         self.assertEqual((3, 1, 1), counts(app.db_path))
         self.assertEqual(b"photo-bytes", (image_dir / photo).read_bytes())
-        self.assertIsNone(app.client.get(key("sess", "stale-session")))
-        before = [name for name in os.listdir(app.backups) if name.endswith("-before-restore.db")]
-        self.assertEqual(1, len(before))
-        self.assertEqual((0, 1, 0), counts(app.backups / before[0]))
-        app.start()
+        self.assertEqual((0, 1, 0), counts(app.backups / restored["backup"]))
         self.assertEqual("4", app.client.get(key("stock", 1)))
+        self.assertEqual(401, request_json(app.http_port, "GET", "/api/get_student_info", token=student_token)[0])
+        self.assertEqual(200, request_json(app.http_port, "GET", "/api/admin/summary", token=self.admin)[0])
+        self.assertEqual([("backup.restored",)], app.sql(
+            "SELECT action FROM audit_events WHERE action='backup.restored'"))
 
-        broken = app.workdir / "broken.db"
-        broken.write_bytes(b"not a database")
-        result = app.cli("restore", str(broken))
-        self.assertEqual(1, result.returncode)
-        self.assertIn("备份文件不可用", result.stdout)
+        status, again = app.post(self.admin, "/api/admin/restore", {"name": restored["backup"]})
+        self.assertEqual(200, status, again)
+        self.assertEqual((0, 1, 0), counts(app.db_path))
+        names = [row[0] for row in app.sql("SELECT name FROM sqlite_master WHERE type='trigger'")]
+        self.assertIn("registrations_capacity_guard", names)
+
+        status, body = upload(app.http_port, "/api/admin/restore_upload", self.admin, b"not a database", "x.db")
+        self.assertEqual((400, "备份无效"), (status, body.get("message")))
+        status, body = app.post(self.admin, "/api/admin/restore", {"name": "../club_system.db"})
+        self.assertEqual(400, status)
 
     def test_close_time_stops_registration_and_locks_the_list(self) -> None:
         app = self.instance
@@ -417,20 +436,74 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual([("registrations.exported",), ("backup.downloaded",)], app.sql(
             "SELECT action FROM audit_events WHERE action IN ('registrations.exported', 'backup.downloaded') ORDER BY id"))
 
-    def test_reset_admin_password_from_the_command_line(self) -> None:
+    def test_launch_prints_the_admin_password_and_a_one_time_console_link(self) -> None:
         app = self.instance
-        result = app.cli("reset-admin-password")
+        secret = app.workdir / "admin-password.txt"
+        result = app.cli("admin-login", "http://127.0.0.1:{}".format(app.http_port))
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        password = re.search(r"新密码 (\S+)", result.stdout).group(1)
-        status, _body = request_json(app.http_port, "GET", "/api/admin/summary", token=self.admin)
-        self.assertEqual(401, status)
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        self.assertEqual("admin", values["ADMIN_USER"])
+        self.assertEqual(values["ADMIN_PASSWORD"], secret.read_text(encoding="utf-8").strip())
+        self.assertEqual(0o600, secret.stat().st_mode & 0o777)
+        self.assertEqual([("系统",)], app.sql("SELECT actor_id FROM audit_events WHERE action='admin.password_reset'"))
         status, _headers, _raw = request(app.http_port, "POST", "/api/admin_login",
-                                         body={"username": "admin", "password": "admin-password"})
-        self.assertEqual(401, status)
-        status, _headers, _raw = request(app.http_port, "POST", "/api/admin_login",
-                                         body={"username": "admin", "password": password})
+                                         body={"username": "admin", "password": values["ADMIN_PASSWORD"]})
         self.assertEqual(200, status)
-        self.assertEqual([("命令行",)], app.sql("SELECT actor_id FROM audit_events WHERE action='admin.password_reset'"))
+
+        again = app.cli("admin-login", "http://127.0.0.1:{}".format(app.http_port))
+        repeated = dict(line.split("=", 1) for line in again.stdout.splitlines() if "=" in line)
+        self.assertEqual(values["ADMIN_PASSWORD"], repeated["ADMIN_PASSWORD"])
+
+        link = repeated["LOGIN_URL"]
+        path = link[link.index("/admin/login"):]
+        status, headers, _raw = request(app.http_port, "GET", path)
+        self.assertEqual((303, "/admin/dashboard"), (status, headers["location"]))
+        session = headers["set-cookie"].split(";", 1)[0].split("=", 1)[1]
+        self.assertEqual(200, request_json(app.http_port, "GET", "/api/admin/summary", token=session)[0])
+        status, headers, _raw = request(app.http_port, "GET", path)
+        self.assertEqual((303, "/"), (status, headers["location"]))
+        self.assertNotIn("set-cookie", headers)
+
+    def test_roster_upload_is_parsed_for_review_then_accounts_come_back_as_a_workbook(self) -> None:
+        app = self.instance
+        roster = "序号,姓名,班级\n1,学生1,高一1班\n2,新同学,高一（2）班\n,合计,\n".encode("gb18030")
+        status, parsed = upload(app.http_port, "/api/admin/import/parse", self.admin, roster, "名单.csv")
+        self.assertEqual(200, status, parsed)
+        self.assertEqual([("学生1", "高一1班", ["已导入"]), ("新同学", "高一2班", [])],
+                         [(row["name"], row["class"], row["notes"]) for row in parsed["rows"]])
+        self.assertEqual(3, len(app.sql("SELECT id FROM students")))
+        status, body = upload(app.http_port, "/api/admin/import/parse", self.admin, b"\x00\x01", "x.xlsx")
+        self.assertEqual(400, status, body)
+
+        status, created = app.post(self.admin, "/api/import_students",
+                                   {"students": [{"name": "新同学", "class": "高一2班"}]})
+        self.assertEqual((200, 1), (status, created["success"]), created)
+        account = created["credentials"][0]
+        self.assertEqual([("新同学", "高一2班", "高一", account["username"])],
+                         app.sql("SELECT name, class, grade, student_id FROM students WHERE name='新同学'"))
+        status, headers, raw = request(app.http_port, "POST", "/api/admin/accounts_workbook", token=self.admin,
+                                       body={"accounts": created["credentials"]})
+        self.assertEqual(200, status)
+        self.assertIn("filename*=UTF-8''", headers["content-disposition"])
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        for text in ("姓名", "班级", "账号", "密码", "新同学", account["username"], account["password"]):
+            self.assertIn(text, sheet)
+        status, _headers, _raw = request(app.http_port, "POST", "/api/admin/accounts_workbook", token=self.admin,
+                                         body={"accounts": [{"name": "x"}]})
+        self.assertEqual(400, status)
+
+    def test_requests_without_the_page_header_are_refused(self) -> None:
+        app = self.instance
+        conn = http.client.HTTPConnection("127.0.0.1", app.http_port, timeout=10)
+        try:
+            body = json.dumps({"username": "admin", "password": "admin-password"})
+            conn.request("POST", "/api/admin_login", body=body, headers={"Content-Type": "text/plain"})
+            response = conn.getresponse()
+            self.assertEqual(403, response.status)
+            self.assertEqual("forbidden", json.loads(response.read())["code"])
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

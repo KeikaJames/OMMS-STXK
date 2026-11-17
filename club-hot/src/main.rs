@@ -20,7 +20,10 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
-use axum::http::StatusCode;
+use axum::extract::Request;
+use axum::http::{Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use deadpool_redis::{
     Config as RedisConfig, PoolConfig as RedisPoolConfig, Runtime as RedisRuntime,
@@ -116,6 +119,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/get_student_info", get(handlers::get_student_info))
         .with_state(state)
+        .layer(middleware::from_fn(require_page_request))
         // 超过总并发上限时立即返回 503；单个请求超时同样返回 503。
         .layer(
             ServiceBuilder::new()
@@ -147,6 +151,19 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
     serve_result?;
     Ok(())
+}
+
+/// 页面脚本发出的请求都带 X-Requested-With；跨站表单无法设置自定义请求头。
+async fn require_page_request(request: Request, next: Next) -> Response {
+    let from_page = request
+        .headers()
+        .get("x-requested-with")
+        .and_then(|value| value.to_str().ok())
+        == Some("XMLHttpRequest");
+    if request.method() == Method::POST && !from_page {
+        return messages::reply(StatusCode::FORBIDDEN, "forbidden", false);
+    }
+    next.run(request).await
 }
 
 /// 把 SQLite 中的开放时间与锁定状态同步到 Redis。

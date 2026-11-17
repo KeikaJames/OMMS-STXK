@@ -335,6 +335,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
                 {
                     "Content-Type": "application/json",
                     "Content-Length": str(len(encoded)),
+                    "X-Requested-With": "XMLHttpRequest",
                 }
             )
         if cookie_header is not None:
@@ -575,7 +576,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertEqual(200, status)
         conn = http.client.HTTPConnection("127.0.0.1", self.http_port, timeout=10)
         conn.request("POST", "/api/login", body=json.dumps({"username": "race1", "password": "device-password"}),
-                     headers={"Content-Type": "application/json"})
+                     headers={"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"})
         response = conn.getresponse()
         response.read()
         device = next(value.split(";", 1)[0] for name, value in response.getheaders()
@@ -782,6 +783,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
             cookie = f"Cookie: session={token}\r\n" if token else ""
             first = (
                 f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\n"
+                f"X-Requested-With: XMLHttpRequest\r\n"
                 f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
                 f"{cookie}Connection: keep-alive\r\n\r\n"
             ).encode("ascii") + body
@@ -815,18 +817,20 @@ class PythonRaceRegressionTests(unittest.TestCase):
 
         logout = (
             f"POST /api/logout HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\n"
+            f"X-Requested-With: XMLHttpRequest\r\n"
             f"Content-Type: application/json\r\nContent-Length: 2\r\n"
             f"Cookie: session={token}\r\nCookie: theme=dark\r\nConnection: close\r\n\r\n{{}}"
         ).encode("ascii")
         self.assertEqual(200, self._one_raw_request(logout)[0])
         self.assertEqual(200, self._request_json("GET", "/api/get_student_info", token=token)[0])
 
-    def test_new_login_revokes_old_token_and_password_change_revokes_current_token(self) -> None:
+    def test_new_login_revokes_old_token_and_password_reset_revokes_current_token(self) -> None:
         """F5: only the most recent session generation remains usable."""
         self._seed_scenario(users=1, capacity=1, redis_stock=1)
         with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute("UPDATE students SET password='temporary-password' WHERE id=1")
             conn.commit()
+        admin_token = self._admin_token()
 
         first_status, first_payload, first_headers = self._request_json_with_headers(
             "POST", "/api/login", body={"username": "race1", "password": "temporary-password"}
@@ -842,14 +846,11 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertEqual(401, self._request_json("GET", "/api/get_student_info", token=first_token)[0])
         self.assertEqual(200, self._request_json("GET", "/api/get_student_info", token=second_token)[0])
 
-        changed_status, changed_payload, changed_headers = self._request_json_with_headers(
-            "POST",
-            "/api/change_password",
-            token=second_token,
-            body={"current": "temporary-password", "new": "new-temporary-password"},
+        reset_status, reset_payload = self._request_json(
+            "POST", "/api/admin/reset_student_password", token=admin_token,
+            body={"student_id": 1, "request_id": "revoke-reset-01", "reason": "test"},
         )
-        self.assertEqual(200, changed_status, changed_payload)
-        self.assertIn("Max-Age=0", changed_headers.get("set-cookie", ""))
+        self.assertEqual(200, reset_status, reset_payload)
         self.assertEqual(401, self._request_json("GET", "/api/get_student_info", token=second_token)[0])
 
     def test_deleted_student_token_is_rejected_before_registration_side_effects(self) -> None:
@@ -877,7 +878,6 @@ class PythonRaceRegressionTests(unittest.TestCase):
             ("GET", "/api/get_student_info", None),
             ("POST", "/api/register_club", {"club_id": 1}),
             ("POST", "/api/cancel_registration", {}),
-            ("POST", "/api/change_password", {"current": "x", "new": "abcdef"}),
         ]:
             status, _payload = self._request_json(method, path, token=student_token, body=body)
             self.assertEqual(401, status, (method, path, status))
@@ -1093,7 +1093,9 @@ class PythonRaceRegressionTests(unittest.TestCase):
                 book = openpyxl.load_workbook(io.BytesIO(workbook_bytes))
                 self.assertEqual(["总表", "3D打印", "传媒", "木工", "未报名"], book.sheetnames)
                 summary = [[cell.value for cell in row] for row in book["总表"].iter_rows(min_row=2)]
-                methods = {row[0]: row[4] for row in summary}
+                self.assertEqual(["姓名", "班级", "社团", "方式", "报名时间"],
+                                 [cell.value for cell in book["总表"][1]])
+                methods = {row[0]: row[3] for row in summary}
                 self.assertEqual(("自选", "管理员安排", "调剂"), (methods["学生1"], methods["学生3"], methods["学生7"]))
                 self.assertEqual(3, book["木工"].max_row - 1)
                 self.assertEqual(1, book["未报名"].max_row - 1)
@@ -1104,7 +1106,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
             header_line = response.read().decode("utf-8-sig").splitlines()[0]
             disposition = response.getheader("Content-Disposition") or ""
             conn.close()
-            self.assertEqual("姓名,班级,学号,社团,方式,报名时间", header_line)
+            self.assertEqual("姓名,班级,社团,方式,报名时间", header_line)
             self.assertIn("%E6%8A%A5%E5%90%8D%E6%80%BB%E8%A1%A8", disposition)
         finally:
             self._request_json("POST", "/api/update_registration_lock", token=admin_token,
@@ -1174,7 +1176,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
             request = (
                 f"POST /api/upload_club_image?club_id=1&expected_revision={revision}&request_id={request_id}"
                 f"&reason=upload HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\n"
-                "Content-Type: image/png\r\n"
+                "Content-Type: image/png\r\nX-Requested-With: XMLHttpRequest\r\n"
                 f"Content-Length: {len(raw)}\r\nCookie: session={admin_token}\r\nConnection: close\r\n\r\n"
             ).encode("ascii") + raw
             status, headers, body = self._one_raw_request(request)

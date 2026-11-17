@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # 一键编排：Redis + Python(:2001) + Rust(:2002) + nginx(:8080)，macOS 与 Linux 通用。
-#   bash run.sh                      启动；已在运行时平滑重启
+#   bash run.sh                      启动（已在运行时平滑重启），打印访问地址与管理员账号，在本机打开控制台
 #   bash run.sh stop                 停止
-#   bash run.sh reset-admin          重置管理员密码，新密码只输出一次
-#   bash run.sh restore 备份文件      停止服务，从完整备份（.zip）或数据库快照（.db）恢复后重新启动
 #   OMMS_PYTHON_ONLY=1 bash run.sh   不编译 Rust，由 Python 服务全部接口
 #   TLS_CERT=证书 TLS_KEY=私钥 bash run.sh      在 TLS_PORT（默认 8443）上提供 HTTPS，8080 跳转到 HTTPS
 #   REAL_IP_FROM=127.0.0.1 bash run.sh         经内网穿透或反向代理访问时，按 REAL_IP_HEADER 取学生的真实地址
@@ -58,19 +56,6 @@ raise_open_files() {
     ulimit -n "$want" 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 }
 
-# 开放瞬间的连接先进入内核队列，队列上限低于 1024 时提示调高（需要管理员权限，重启后恢复默认）。
-check_backlog() {
-    local current="" command=""
-    case "$(uname -s)" in
-        Darwin) current=$(sysctl -n kern.ipc.somaxconn 2>/dev/null); command="sudo sysctl -w kern.ipc.somaxconn=2048" ;;
-        Linux) current=$(cat /proc/sys/net/core/somaxconn 2>/dev/null); command="sudo sysctl -w net.core.somaxconn=2048" ;;
-    esac
-    case "$current" in ''|*[!0-9]*) return 0 ;; esac
-    if [ "$current" -lt 1024 ]; then
-        say "[系统] 连接队列上限为 $current，开放报名前执行：$command"
-    fi
-}
-
 wait_until() {
     # wait_until 秒数 命令...：在限定时间内等待命令成功
     local limit=$1
@@ -121,21 +106,6 @@ if [ "${1:-}" = "stop" ]; then
     say "[stop] 已停止"
     exit 0
 fi
-if [ "${1:-}" = "reset-admin" ]; then
-    exec "$PYTHON" "$DIR/main.py" reset-admin-password
-fi
-if [ "${1:-}" = "restore" ]; then
-    if [ ! -f "${2:-}" ]; then
-        say "[restore] 用法：bash run.sh restore 备份文件"
-        exit 1
-    fi
-    stop_all
-    if ! "$PYTHON" "$DIR/main.py" restore "$2"; then
-        say "[restore] 未恢复，服务保持停止；重新启动：bash run.sh"
-        exit 1
-    fi
-fi
-
 # ---- 预检：在旧服务仍在线时完成，失败不影响旧服务 ----
 raise_open_files
 if [ -n "${TLS_CERT:-}${TLS_KEY:-}" ]; then
@@ -284,15 +254,52 @@ if [ "$PYTHON_ONLY" != "1" ]; then
     fi
 fi
 
-if nginx -p "$RUN_DIR" -c "$NGINX_CONF"; then
-    if [ -n "${TLS_CERT:-}" ]; then
-        say "[nginx] https://127.0.0.1:${TLS_PORT:-8443} 就绪，http://127.0.0.1:8080 跳转到 HTTPS"
-    else
-        say "[nginx] http://127.0.0.1:8080 就绪"
-    fi
-    check_backlog
-else
+if ! nginx -p "$RUN_DIR" -c "$NGINX_CONF"; then
     say "[nginx] 启动失败，可直接访问 http://127.0.0.1:2001"
     exit 1
 fi
-say "停止：bash run.sh stop"
+
+# ---- 访问地址与管理员账号 ----
+scheme=http
+port=8080
+if [ -n "${TLS_CERT:-}" ]; then
+    scheme=https
+    port=${TLS_PORT:-8443}
+fi
+lan_ip=""
+case "$(uname -s)" in
+    Darwin)
+        iface=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
+        [ -n "$iface" ] && lan_ip=$(ipconfig getifaddr "$iface" 2>/dev/null)
+        ;;
+    Linux)
+        lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        ;;
+esac
+local_base="$scheme://127.0.0.1:$port"
+public_base="$scheme://${lan_ip:-127.0.0.1}:$port"
+admin_user=""
+admin_password=""
+login_url=""
+while IFS='=' read -r key value; do
+    case "$key" in
+        ADMIN_USER) admin_user=$value ;;
+        ADMIN_PASSWORD) admin_password=$value ;;
+        LOGIN_URL) login_url=$value ;;
+    esac
+done < <("$PYTHON" "$DIR/main.py" admin-login "$local_base" 2>/dev/null)
+say ""
+say "学生访问     $public_base"
+say "管理控制台   $public_base/admin/dashboard"
+if [ -n "$admin_password" ]; then
+    say "管理员账号   ${admin_user:-admin}"
+    say "管理员密码   $admin_password"
+fi
+if [ "${OMMS_OPEN_BROWSER:-1}" = "1" ]; then
+    target=${login_url:-$local_base/}
+    if [ "$(uname -s)" = Darwin ] && command -v open >/dev/null 2>&1; then
+        open "$target" >/dev/null 2>&1 || true
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$target" >/dev/null 2>&1 || true
+    fi
+fi

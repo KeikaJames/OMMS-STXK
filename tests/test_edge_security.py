@@ -299,6 +299,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         if cookie:
             headers["Cookie"] = cookie
         if method == "POST":
+            headers["X-Requested-With"] = "XMLHttpRequest"
             headers["Content-Type"] = "application/json"
             headers["Content-Length"] = str(len(encoded))
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
@@ -392,6 +393,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         body = b"GET / HTTP/1.1\r\nHost: smuggled\r\n\r\n"
         first = (
             f"POST /api/not_a_route HTTP/1.1\r\nHost: 127.0.0.1:{self.edge_port}\r\n"
+            f"X-Requested-With: XMLHttpRequest\r\n"
             f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
             "Connection: keep-alive\r\n\r\n"
         ).encode("ascii") + body
@@ -419,7 +421,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         raw = out.getvalue()
         upload = (
             f"POST /api/upload_club_image?club_id=1&expected_revision=0&request_id=edge-image-0001&reason=upload "
-            f"HTTP/1.1\r\nHost: 127.0.0.1:{self.edge_port}\r\nContent-Type: image/png\r\n"
+            f"HTTP/1.1\r\nHost: 127.0.0.1:{self.edge_port}\r\nContent-Type: image/png\r\nX-Requested-With: XMLHttpRequest\r\n"
             f"Content-Length: {len(raw)}\r\nCookie: session={admin_token}\r\nConnection: close\r\n\r\n"
         ).encode("ascii") + raw
         status, _headers, body = self._raw_edge_request(upload)
@@ -569,6 +571,22 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             )
             self.assertEqual(200, status)
             self.assertEqual("ineligible_grade", json.loads(body).get("code"))
+        self.assertEqual("3", self.redis.get(key("stock", 1)))
+
+    def test_python_and_rust_refuse_posts_without_the_page_header(self) -> None:
+        self._reset_state()
+        student_token = self._login(self.python_port, "edge1", "student-password")
+        for port in (self.python_port, self.rust_port, self.edge_port):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+            try:
+                conn.request("POST", "/api/register_club", body='{"club_id":1}',
+                             headers={"Content-Type": "text/plain", "Cookie": f"session={student_token}",
+                                      "Connection": "close"})
+                response = conn.getresponse()
+                self.assertEqual(403, response.status, port)
+                self.assertEqual("forbidden", json.loads(response.read())["code"])
+            finally:
+                conn.close()
         self.assertEqual("3", self.redis.get(key("stock", 1)))
 
     def test_python_and_rust_treat_an_unset_opening_time_as_not_open(self) -> None:

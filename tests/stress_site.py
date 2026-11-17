@@ -272,7 +272,7 @@ async def request(port: int, method: str, path: str, *, body: object = None, tok
         data = json.dumps(body).encode() if body is not None else b""
         lines = [f"{method} {path} HTTP/1.1", "Host: 127.0.0.1", "Connection: close", f"X-Forwarded-For: {ip}"]
         if data:
-            lines += ["Content-Type: application/json", f"Content-Length: {len(data)}"]
+            lines += ["Content-Type: application/json", f"Content-Length: {len(data)}", "X-Requested-With: XMLHttpRequest"]
         if token:
             lines.append(f"Cookie: session={token}")
         lines += [f"{key}: {value}" for key, value in (headers or {}).items()]

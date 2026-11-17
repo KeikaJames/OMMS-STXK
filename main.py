@@ -4,7 +4,6 @@
 import collections
 import http.server
 import random
-import shutil
 import socketserver
 import json
 import sqlite3
@@ -28,7 +27,9 @@ import importlib.util
 import warnings
 import zipfile
 from datetime import datetime, timedelta, timezone
-from xml.sax.saxutils import escape as xml_escape
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sheets as tables  # noqa: E402
 
 # ---- 可选重依赖(有 fallback 不致命) -------------------------------------
 try:
@@ -101,6 +102,14 @@ MAX_CLUB_GIF_FRAMES = 120
 MAX_CLUB_GIF_DURATION_MS = 30_000
 MAX_CLUB_GIF_DECODED_PIXELS = 12_000_000
 IMAGE_PROCESS_SLOTS = threading.BoundedSemaphore(1)
+MAX_TABLE_BYTES = 10 * 1024 * 1024
+MAX_RESTORE_BYTES = 64 * 1024 * 1024
+MAX_ACCOUNT_ROWS = 5000
+ADMIN_LOGIN_TTL = 120
+ADMIN_SECRET_FILE = os.path.abspath(os.environ.get(
+    "ADMIN_SECRET_FILE", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "admin-password.txt"),
+))
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0").strip().lower() in {"1", "true", "yes", "on"}
 NGINX_ACCESS_LOG = os.environ.get("NGINX_ACCESS_LOG", "/tmp/club_nginx_access.log")
 METRICS_WINDOW_SECONDS = 60
@@ -596,6 +605,17 @@ class RedisGate:
             self._call("delete", K_CLOSE_AT)
         else:
             self._call("set", K_CLOSE_AT, int(epoch))
+
+    def take(self, key):
+        """读取并删除一个键，键不存在时返回 None。"""
+        try:
+            pipe = self._r.pipeline(transaction=True)
+            pipe.get(key)
+            pipe.delete(key)
+            value, _deleted = pipe.execute()
+            return value
+        except Exception:  # noqa: BLE001
+            return None
 
     def locked_get(self):
         try:
@@ -1333,104 +1353,8 @@ def plan_adjustment(conn, rng=None):
 # ==========================================================================
 # 导出：Excel（标准库生成）与 CSV
 # ==========================================================================
-_SHEET_NAME_BAD = re.compile(r"[\\/?*\[\]:]")
-
-
-def _column_letter(index):
-    letters = ""
-    index += 1
-    while index:
-        index, rest = divmod(index - 1, 26)
-        letters = chr(65 + rest) + letters
-    return letters
-
-
-def xlsx_bytes(sheets):
-    """sheets：[(表名, 表头, 行, 列宽)]。单元格一律写成文本，学号前导零原样保留。"""
-    names, used = [], set()
-    for title, *_rest in sheets:
-        base = _SHEET_NAME_BAD.sub(" ", str(title)).strip()[:28] or "Sheet"
-        name, n = base, 2
-        while name in used:
-            name, n = "{} ({})".format(base, n), n + 1
-        used.add(name)
-        names.append(name)
-
-    def cell(ref, value, style):
-        text = xml_escape("" if value is None else str(value))
-        return '<c r="{}" t="inlineStr"{}><is><t xml:space="preserve">{}</t></is></c>'.format(
-            ref, ' s="1"' if style else "", text)
-
-    def sheet_xml(header, rows, widths):
-        cols = "".join('<col min="{0}" max="{0}" width="{1}" customWidth="1"/>'.format(i + 1, w)
-                       for i, w in enumerate(widths))
-        lines = ['<row r="1">' + "".join(cell(_column_letter(i) + "1", v, True) for i, v in enumerate(header)) + "</row>"]
-        for r, row in enumerate(rows, start=2):
-            lines.append('<row r="{}">'.format(r) + "".join(
-                cell(_column_letter(i) + str(r), v, False) for i, v in enumerate(row)) + "</row>")
-        return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-                '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
-                'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
-                '<cols>{}</cols><sheetData>{}</sheetData></worksheet>').format(cols, "".join(lines))
-
-    overrides = "".join(
-        '<Override PartName="/xl/worksheets/sheet{}.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'.format(i + 1)
-        for i in range(len(sheets)))
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/xl/workbook.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/styles.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-        + overrides + "</Types>")
-    root_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
-        'officeDocument" Target="xl/workbook.xml"/></Relationships>')
-    workbook = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
-        + "".join('<sheet name="{}" sheetId="{}" r:id="rId{}"/>'.format(xml_escape(name, {'"': "&quot;"}), i + 1, i + 1)
-                  for i, name in enumerate(names))
-        + "</sheets></workbook>")
-    workbook_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        + "".join('<Relationship Id="rId{0}" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
-                  'relationships/worksheet" Target="worksheets/sheet{0}.xml"/>'.format(i + 1)
-                  for i in range(len(sheets)))
-        + '<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
-          'styles" Target="styles.xml"/></Relationships>'.format(len(sheets) + 1))
-    styles = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<fonts count="2"><font><sz val="11"/><name val="宋体"/></font>'
-        '<font><b/><sz val="11"/><name val="宋体"/></font></fonts>'
-        '<fills count="2"><fill><patternFill patternType="none"/></fill>'
-        '<fill><patternFill patternType="gray125"/></fill></fills>'
-        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
-        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
-        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
-        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
-        '</styleSheet>')
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types)
-        archive.writestr("_rels/.rels", root_rels)
-        archive.writestr("xl/workbook.xml", workbook)
-        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
-        archive.writestr("xl/styles.xml", styles)
-        for i, (_title, header, rows, widths) in enumerate(sheets):
-            archive.writestr("xl/worksheets/sheet{}.xml".format(i + 1), sheet_xml(header, rows, widths))
-    return out.getvalue()
+_FILE_NAME_BAD = re.compile(r'[\\/?*\[\]:"<>|]')
+xlsx_bytes = tables.write_xlsx
 
 
 def attachment_header(filename, fallback):
@@ -1444,9 +1368,28 @@ def export_stamp():
 
 
 def gen_admin_password():
-    # 字母表去掉易混淆字符。
+    # 字母表只含容易辨认的字符。
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
     return "".join(secrets.choice(alphabet) for _ in range(12))
+
+
+def read_admin_secret():
+    try:
+        with open(ADMIN_SECRET_FILE, encoding="utf-8") as source:
+            return source.read().strip() or None
+    except OSError:
+        return None
+
+
+def write_admin_secret(password):
+    """管理员密码存于数据库旁的文件（仅本机账户可读），启动脚本每次打印。"""
+    directory = os.path.dirname(ADMIN_SECRET_FILE)
+    os.makedirs(directory, exist_ok=True)
+    partial = ADMIN_SECRET_FILE + ".part"
+    descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+        target.write(password + "\n")
+    os.replace(partial, ADMIN_SECRET_FILE)
 
 
 # ==========================================================================
@@ -1456,7 +1399,7 @@ BACKUP_DIR = os.path.abspath(os.environ.get(
     "BACKUP_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups"),
 ))
 BACKUP_KEEP = max(1, int(os.environ.get("BACKUP_KEEP", "30")))
-BACKUP_NAME_RE = re.compile(r"(\d{8}-\d{6})-([a-z-]+)\.db")
+BACKUP_NAME_RE = re.compile(r"(\d{8}-\d{6})-([a-z]+(?:-[a-z]+)*)(?:-\d+)?\.db")
 BACKUP_LABELS = {
     "locked": "名单锁定", "before-adjust": "调剂前", "before-clear": "清空报名前",
     "before-delete-students": "清空学生前", "before-delete-clubs": "清空社团前", "before-restore": "恢复前",
@@ -1489,7 +1432,10 @@ def list_snapshots():
 def snapshot_database(label):
     """把当前数据库存入备份目录，返回文件名；只保留最近 BACKUP_KEEP 份。"""
     os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
-    name = "{}-{}.db".format(datetime.now(APP_TZ).strftime("%Y%m%d-%H%M%S"), label)
+    stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M%S")
+    name, number = "{}-{}.db".format(stamp, label), 2
+    while os.path.exists(os.path.join(BACKUP_DIR, name)):
+        name, number = "{}-{}-{}.db".format(stamp, label, number), number + 1
     path = os.path.join(BACKUP_DIR, name)
     partial = path + ".part"
     try:
@@ -1535,97 +1481,40 @@ def database_counts(path):
         conn.close()
 
 
-def flush_redis_state():
-    """删除本系统在 Redis 中的全部键（会话、名额、镜像），服务启动时按 SQLite 重新发布。"""
-    deleted = 0
-    batch = []
-    for name in RG.r.scan_iter(match=REDIS_PREFIX + "*", count=1000):
-        batch.append(name)
-        if len(batch) >= 500:
-            deleted += RG.r.delete(*batch)
-            batch = []
-    if batch:
-        deleted += RG.r.delete(*batch)
-    return deleted
-
-
-def cli_restore(path):
-    """从完整备份（.zip）或数据库快照（.db）恢复，需先停止服务。"""
-    if not os.path.isfile(path):
-        print("找不到备份文件：" + path)
-        return 1
-    with tempfile.TemporaryDirectory(prefix="omms-restore-") as tmp:
-        images = None
-        source = path
-        if zipfile.is_zipfile(path):
-            with zipfile.ZipFile(path) as archive:
-                names = archive.namelist()
-                if BACKUP_DB_NAME not in names:
-                    print("备份中没有 " + BACKUP_DB_NAME)
-                    return 1
-                source = os.path.join(tmp, BACKUP_DB_NAME)
-                with archive.open(BACKUP_DB_NAME) as src, open(source, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                images = {}
-                for name in names:
-                    base = name[len("club-images/"):] if name.startswith("club-images/") else ""
-                    if _CLUB_IMAGE_NAME.fullmatch(base):
-                        images[base] = archive.read(name)
-        try:
-            students, clubs, registrations = database_counts(source)
-        except (ValueError, sqlite3.Error) as exc:
-            print("备份文件不可用：{}".format(exc))
-            return 1
-        saved = snapshot_database("before-restore") if os.path.exists(DB_PATH) else None
-        copy_database(source, DB_PATH)
-        if images is not None:
-            os.makedirs(CLUB_IMAGE_DIR, mode=0o700, exist_ok=True)
-            for entry in os.listdir(CLUB_IMAGE_DIR):
-                if _CLUB_IMAGE_NAME.fullmatch(entry):
-                    os.remove(os.path.join(CLUB_IMAGE_DIR, entry))
-            for base, data in images.items():
-                descriptor = os.open(os.path.join(CLUB_IMAGE_DIR, base), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(descriptor, "wb") as target:
-                    target.write(data)
-    try:
-        flush_redis_state()
-    except Exception:  # noqa: BLE001
-        print("Redis 未连接：会话与名额在下次启动时重新发布。")
-    print("已恢复：学生 {} 名，社团 {} 个，报名 {} 条{}。".format(
-        students, clubs, registrations, "，照片 {} 张".format(len(images)) if images is not None else ""))
-    if saved:
-        print("恢复前的数据库已保存为 " + os.path.join(BACKUP_DIR, saved))
-    return 0
-
-
-def cli_reset_admin_password():
+def cli_admin_login(base_url):
+    """启动脚本调用：核对密码文件与数据库，必要时生成新密码；签发一次性登录链接。"""
     if not os.path.isfile(DB_PATH):
-        print("找不到数据库：" + DB_PATH)
+        print("ERROR=数据库不存在")
         return 1
-    password = gen_admin_password()
-    password_hash = hash_password(password)
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        cur = conn.cursor()
-        row = cur.execute("SELECT id, admin_username FROM settings ORDER BY id DESC LIMIT 1").fetchone()
+        row = conn.execute(
+            "SELECT id, admin_username, admin_password FROM settings ORDER BY id DESC LIMIT 1").fetchone()
         if not row:
-            conn.rollback()
-            print("数据库中没有系统设置，请先启动一次服务。")
+            print("ERROR=数据库没有系统设置")
             return 1
-        cur.execute("UPDATE settings SET admin_password=? WHERE id=?", (password_hash, row[0]))
-        append_audit_event(
-            cur, event_id="admin-password-reset-" + secrets.token_urlsafe(18), actor_role="admin",
-            actor_id="命令行", action="admin.password_reset", target_type="settings", target_id=row[0],
-            after={"password_reset": True},
-        )
-        conn.commit()
+        password = read_admin_secret()
+        if not password or not verify_and_upgrade(row[2], password)[0]:
+            password = gen_admin_password()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("UPDATE settings SET admin_password=? WHERE id=?", (hash_password(password), row[0]))
+            append_audit_event(
+                conn.cursor(), event_id="admin-password-reset-" + secrets.token_urlsafe(18), actor_role="admin",
+                actor_id="系统", action="admin.password_reset", target_type="settings", target_id=row[0],
+                after={"password_reset": True},
+            )
+            conn.commit()
+            write_admin_secret(password)
     finally:
         conn.close()
+    url = ""
+    token = secrets.token_urlsafe(32)
     with contextlib.suppress(Exception):
-        RG.session_revoke_role("admin")
-    print("管理员账号 {}，新密码 {}".format(row[1] or "admin", password))
-    print("该密码仅输出一次，原有的管理员登录已失效。")
+        RG.r.set(rk("admin_login", token), "1", ex=ADMIN_LOGIN_TTL)
+        url = base_url.rstrip("/") + "/admin/login?token=" + token
+    print("ADMIN_USER=" + (row[1] or "admin"))
+    print("ADMIN_PASSWORD=" + password)
+    print("LOGIN_URL=" + url)
     return 0
 
 
@@ -1935,6 +1824,204 @@ def gen_username(name, cursor, seen):
 # ==========================================================================
 # 建库 + 启动自愈 + 口令迁移 + Redis 名额重建
 # ==========================================================================
+def ensure_schema(conn):
+    """建表、在线迁移与触发器；启动时和恢复备份后各执行一次，事务由调用方提交。"""
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL, class TEXT NOT NULL,
+            student_id TEXT NOT NULL UNIQUE, username TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL,
+            grade TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS clubs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            max_students INTEGER NOT NULL CHECK(max_students > 0),
+            current_students INTEGER DEFAULT 0,
+            description TEXT NOT NULL DEFAULT '',
+            advisor_name TEXT NOT NULL DEFAULT '',
+            meeting_time TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            image_path TEXT,
+            allowed_grades TEXT NOT NULL DEFAULT '[]',
+            allowed_classes TEXT NOT NULL DEFAULT '[]',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            revision INTEGER NOT NULL DEFAULT 0,
+            seat_revision INTEGER NOT NULL DEFAULT 0,
+            seat_sync_pending INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS registrations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL, club_id INTEGER NOT NULL,
+            registration_time TEXT NOT NULL,
+            operation_id TEXT,
+            FOREIGN KEY (student_id) REFERENCES students (id),
+            FOREIGN KEY (club_id) REFERENCES clubs (id),
+            UNIQUE (student_id));
+        CREATE INDEX IF NOT EXISTS idx_registrations_club_id ON registrations(club_id);
+        CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            registration_start_time TEXT,
+            registration_locked INTEGER NOT NULL DEFAULT 0,
+            admin_username TEXT DEFAULT 'admin',
+            admin_password TEXT DEFAULT NULL);
+        CREATE TABLE IF NOT EXISTS audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            occurred_at INTEGER NOT NULL,
+            actor_role TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id TEXT,
+            request_id TEXT,
+            reason TEXT,
+            before_json TEXT,
+            after_json TEXT,
+            metadata_json TEXT);
+        CREATE INDEX IF NOT EXISTS idx_audit_events_time
+            ON audit_events(occurred_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_events_target
+            ON audit_events(target_type, target_id, occurred_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_request
+            ON audit_events(actor_role, actor_id, action, request_id)
+            WHERE request_id IS NOT NULL;
+        """
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    def ensure_column(table, name, definition):
+        cur.execute("PRAGMA table_info({})".format(table))
+        if name not in {row[1] for row in cur.fetchall()}:
+            cur.execute("ALTER TABLE {} ADD COLUMN {}".format(table, definition))
+
+    ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")
+    ensure_column("settings", "registration_locked", "registration_locked INTEGER NOT NULL DEFAULT 0")
+    ensure_column("settings", "registration_end_time", "registration_end_time TEXT")
+    for name, definition in (
+        ("description", "description TEXT NOT NULL DEFAULT ''"),
+        ("advisor_name", "advisor_name TEXT NOT NULL DEFAULT ''"),
+        ("meeting_time", "meeting_time TEXT NOT NULL DEFAULT ''"),
+        ("location", "location TEXT NOT NULL DEFAULT ''"),
+        ("image_path", "image_path TEXT"),
+        ("allowed_grades", "allowed_grades TEXT NOT NULL DEFAULT '[]'"),
+        ("allowed_classes", "allowed_classes TEXT NOT NULL DEFAULT '[]'"),
+        ("enabled", "enabled INTEGER NOT NULL DEFAULT 1"),
+        ("revision", "revision INTEGER NOT NULL DEFAULT 0"),
+        ("seat_revision", "seat_revision INTEGER NOT NULL DEFAULT 0"),
+        ("seat_sync_pending", "seat_sync_pending INTEGER NOT NULL DEFAULT 0"),
+    ):
+        ensure_column("clubs", name, definition)
+    # 旧库在线迁移:operation_id 用来让 Redis confirm/cancel 精确匹配同一代操作。
+    cur.execute("PRAGMA table_info(registrations)")
+    if "operation_id" not in {r[1] for r in cur.fetchall()}:
+        cur.execute("ALTER TABLE registrations ADD COLUMN operation_id TEXT")
+    cur.execute(
+        "UPDATE registrations SET operation_id = lower(hex(randomblob(16))) "
+        "WHERE operation_id IS NULL OR operation_id = ''"
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_registrations_operation_id "
+        "ON registrations(operation_id) WHERE operation_id IS NOT NULL"
+    )
+    # Redis 是快速准入层；SQLite trigger 是跨 Python/Rust 的最终容量保险。
+    # 即使库存因运维或故障漂移，第 max+1 条 registration 也无法落库。
+    cur.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS registrations_capacity_guard
+        BEFORE INSERT ON registrations
+        FOR EACH ROW
+        BEGIN
+          SELECT CASE WHEN
+            (SELECT COUNT(*) FROM registrations WHERE club_id = NEW.club_id) >=
+            (SELECT max_students FROM clubs WHERE id = NEW.club_id)
+          THEN RAISE(ABORT, 'club full') END;
+        END
+        """
+    )
+    cur.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS registrations_capacity_guard_update
+        BEFORE UPDATE OF club_id ON registrations
+        FOR EACH ROW WHEN NEW.club_id != OLD.club_id
+        BEGIN
+          SELECT CASE WHEN
+            (SELECT COUNT(*) FROM registrations WHERE club_id = NEW.club_id) >=
+            (SELECT max_students FROM clubs WHERE id = NEW.club_id)
+          THEN RAISE(ABORT, 'club full') END;
+        END
+        """
+    )
+    # `clubs.max_students` is business data, but it still needs a durable
+    # bound: Python integers are unbounded while SQLite INTEGER is signed
+    # 64-bit.  Without this guard one malformed import rolls back a whole
+    # otherwise valid batch with OverflowError.
+    cur.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS clubs_capacity_limit_insert
+        BEFORE INSERT ON clubs
+        FOR EACH ROW WHEN NEW.max_students < 1 OR NEW.max_students > {MAX_CLUB_CAPACITY}
+        BEGIN
+          SELECT RAISE(ABORT, 'invalid club capacity');
+        END
+        """
+    )
+    cur.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS clubs_capacity_limit_update
+        BEFORE UPDATE OF max_students ON clubs
+        FOR EACH ROW WHEN NEW.max_students < 1 OR NEW.max_students > {MAX_CLUB_CAPACITY}
+        BEGIN
+          SELECT RAISE(ABORT, 'invalid club capacity');
+        END
+        """
+    )
+    cur.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS clubs_capacity_registration_guard
+        BEFORE UPDATE OF max_students ON clubs
+        FOR EACH ROW WHEN NEW.max_students <
+            (SELECT COUNT(*) FROM registrations WHERE club_id = OLD.id)
+        BEGIN
+          SELECT RAISE(ABORT, 'club capacity below registrations');
+        END
+        """
+    )
+    cur.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS audit_events_append_only_update
+        BEFORE UPDATE ON audit_events
+        BEGIN
+          SELECT RAISE(ABORT, 'audit events are append-only');
+        END
+        """
+    )
+    cur.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS audit_events_append_only_delete
+        BEFORE DELETE ON audit_events
+        BEGIN
+          SELECT RAISE(ABORT, 'audit events are append-only');
+        END
+        """
+    )
+    cur.execute(
+        """
+        UPDATE students
+        SET grade = CASE
+            WHEN class LIKE '高一%' THEN '高一'
+            WHEN class LIKE '高二%' THEN '高二'
+            WHEN class LIKE '高三%' THEN '高三'
+            WHEN class LIKE '初一%' THEN '初一'
+            WHEN class LIKE '初二%' THEN '初二'
+            WHEN class LIKE '初三%' THEN '初三'
+            ELSE grade
+        END
+        WHERE grade = ''
+        """
+    )
+
+
 def init_db():
     global DB_POOL
     if _PH is None:
@@ -1943,210 +2030,15 @@ def init_db():
     try:
         cur = conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL")
-        cur.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS students (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL, class TEXT NOT NULL,
-                student_id TEXT NOT NULL UNIQUE, username TEXT NOT NULL UNIQUE,
-                password TEXT NOT NULL,
-                grade TEXT NOT NULL DEFAULT '');
-            CREATE TABLE IF NOT EXISTS clubs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                max_students INTEGER NOT NULL CHECK(max_students > 0),
-                current_students INTEGER DEFAULT 0,
-                description TEXT NOT NULL DEFAULT '',
-                advisor_name TEXT NOT NULL DEFAULT '',
-                meeting_time TEXT NOT NULL DEFAULT '',
-                location TEXT NOT NULL DEFAULT '',
-                image_path TEXT,
-                allowed_grades TEXT NOT NULL DEFAULT '[]',
-                allowed_classes TEXT NOT NULL DEFAULT '[]',
-                enabled INTEGER NOT NULL DEFAULT 1,
-                revision INTEGER NOT NULL DEFAULT 0,
-                seat_revision INTEGER NOT NULL DEFAULT 0,
-                seat_sync_pending INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS registrations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                student_id INTEGER NOT NULL, club_id INTEGER NOT NULL,
-                registration_time TEXT NOT NULL,
-                operation_id TEXT,
-                FOREIGN KEY (student_id) REFERENCES students (id),
-                FOREIGN KEY (club_id) REFERENCES clubs (id),
-                UNIQUE (student_id));
-            CREATE INDEX IF NOT EXISTS idx_registrations_club_id ON registrations(club_id);
-            CREATE TABLE IF NOT EXISTS settings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                registration_start_time TEXT,
-                registration_locked INTEGER NOT NULL DEFAULT 0,
-                admin_username TEXT DEFAULT 'admin',
-                admin_password TEXT DEFAULT NULL);
-            CREATE TABLE IF NOT EXISTS audit_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL UNIQUE,
-                occurred_at INTEGER NOT NULL,
-                actor_role TEXT NOT NULL,
-                actor_id TEXT NOT NULL,
-                action TEXT NOT NULL,
-                target_type TEXT NOT NULL,
-                target_id TEXT,
-                request_id TEXT,
-                reason TEXT,
-                before_json TEXT,
-                after_json TEXT,
-                metadata_json TEXT);
-            CREATE INDEX IF NOT EXISTS idx_audit_events_time
-                ON audit_events(occurred_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_audit_events_target
-                ON audit_events(target_type, target_id, occurred_at DESC);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_request
-                ON audit_events(actor_role, actor_id, action, request_id)
-                WHERE request_id IS NOT NULL;
-            """
-        )
-        conn.execute("BEGIN IMMEDIATE")
-        def ensure_column(table, name, definition):
-            cur.execute("PRAGMA table_info({})".format(table))
-            if name not in {row[1] for row in cur.fetchall()}:
-                cur.execute("ALTER TABLE {} ADD COLUMN {}".format(table, definition))
-
-        ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")
-        ensure_column("settings", "registration_locked", "registration_locked INTEGER NOT NULL DEFAULT 0")
-        ensure_column("settings", "registration_end_time", "registration_end_time TEXT")
-        for name, definition in (
-            ("description", "description TEXT NOT NULL DEFAULT ''"),
-            ("advisor_name", "advisor_name TEXT NOT NULL DEFAULT ''"),
-            ("meeting_time", "meeting_time TEXT NOT NULL DEFAULT ''"),
-            ("location", "location TEXT NOT NULL DEFAULT ''"),
-            ("image_path", "image_path TEXT"),
-            ("allowed_grades", "allowed_grades TEXT NOT NULL DEFAULT '[]'"),
-            ("allowed_classes", "allowed_classes TEXT NOT NULL DEFAULT '[]'"),
-            ("enabled", "enabled INTEGER NOT NULL DEFAULT 1"),
-            ("revision", "revision INTEGER NOT NULL DEFAULT 0"),
-            ("seat_revision", "seat_revision INTEGER NOT NULL DEFAULT 0"),
-            ("seat_sync_pending", "seat_sync_pending INTEGER NOT NULL DEFAULT 0"),
-        ):
-            ensure_column("clubs", name, definition)
-        # 旧库在线迁移:operation_id 用来让 Redis confirm/cancel 精确匹配同一代操作。
-        cur.execute("PRAGMA table_info(registrations)")
-        if "operation_id" not in {r[1] for r in cur.fetchall()}:
-            cur.execute("ALTER TABLE registrations ADD COLUMN operation_id TEXT")
-        cur.execute(
-            "UPDATE registrations SET operation_id = lower(hex(randomblob(16))) "
-            "WHERE operation_id IS NULL OR operation_id = ''"
-        )
-        cur.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_registrations_operation_id "
-            "ON registrations(operation_id) WHERE operation_id IS NOT NULL"
-        )
-        # Redis 是快速准入层；SQLite trigger 是跨 Python/Rust 的最终容量保险。
-        # 即使库存因运维或故障漂移，第 max+1 条 registration 也无法落库。
-        cur.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS registrations_capacity_guard
-            BEFORE INSERT ON registrations
-            FOR EACH ROW
-            BEGIN
-              SELECT CASE WHEN
-                (SELECT COUNT(*) FROM registrations WHERE club_id = NEW.club_id) >=
-                (SELECT max_students FROM clubs WHERE id = NEW.club_id)
-              THEN RAISE(ABORT, 'club full') END;
-            END
-            """
-        )
-        cur.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS registrations_capacity_guard_update
-            BEFORE UPDATE OF club_id ON registrations
-            FOR EACH ROW WHEN NEW.club_id != OLD.club_id
-            BEGIN
-              SELECT CASE WHEN
-                (SELECT COUNT(*) FROM registrations WHERE club_id = NEW.club_id) >=
-                (SELECT max_students FROM clubs WHERE id = NEW.club_id)
-              THEN RAISE(ABORT, 'club full') END;
-            END
-            """
-        )
-        # `clubs.max_students` is business data, but it still needs a durable
-        # bound: Python integers are unbounded while SQLite INTEGER is signed
-        # 64-bit.  Without this guard one malformed import rolls back a whole
-        # otherwise valid batch with OverflowError.
-        cur.execute(
-            f"""
-            CREATE TRIGGER IF NOT EXISTS clubs_capacity_limit_insert
-            BEFORE INSERT ON clubs
-            FOR EACH ROW WHEN NEW.max_students < 1 OR NEW.max_students > {MAX_CLUB_CAPACITY}
-            BEGIN
-              SELECT RAISE(ABORT, 'invalid club capacity');
-            END
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TRIGGER IF NOT EXISTS clubs_capacity_limit_update
-            BEFORE UPDATE OF max_students ON clubs
-            FOR EACH ROW WHEN NEW.max_students < 1 OR NEW.max_students > {MAX_CLUB_CAPACITY}
-            BEGIN
-              SELECT RAISE(ABORT, 'invalid club capacity');
-            END
-            """
-        )
-        cur.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS clubs_capacity_registration_guard
-            BEFORE UPDATE OF max_students ON clubs
-            FOR EACH ROW WHEN NEW.max_students <
-                (SELECT COUNT(*) FROM registrations WHERE club_id = OLD.id)
-            BEGIN
-              SELECT RAISE(ABORT, 'club capacity below registrations');
-            END
-            """
-        )
-        cur.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS audit_events_append_only_update
-            BEFORE UPDATE ON audit_events
-            BEGIN
-              SELECT RAISE(ABORT, 'audit events are append-only');
-            END
-            """
-        )
-        cur.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS audit_events_append_only_delete
-            BEFORE DELETE ON audit_events
-            BEGIN
-              SELECT RAISE(ABORT, 'audit events are append-only');
-            END
-            """
-        )
-        cur.execute(
-            """
-            UPDATE students
-            SET grade = CASE
-                WHEN class LIKE '高一%' THEN '高一'
-                WHEN class LIKE '高二%' THEN '高二'
-                WHEN class LIKE '高三%' THEN '高三'
-                WHEN class LIKE '初一%' THEN '初一'
-                WHEN class LIKE '初二%' THEN '初二'
-                WHEN class LIKE '初三%' THEN '初三'
-                ELSE grade
-            END
-            WHERE grade = ''
-            """
-        )
+        ensure_schema(conn)
         # 初始化 settings
         cur.execute("SELECT id, admin_password FROM settings LIMIT 1")
         row = cur.fetchone()
         if row is None:
-            # 首次启动生成随机管理员口令，只在日志里输出一次。
+            # 首次启动生成管理员密码，写入本机密码文件，由启动脚本打印。
             init_admin_pw = gen_admin_password()
             cur.execute("INSERT INTO settings (admin_password) VALUES (?)", (hash_password(init_admin_pw),))
-            log.warning("=" * 60)
-            log.warning("首次启动：管理员账号 admin，初始密码 %s", init_admin_pw)
-            log.warning("该密码仅输出一次，请登录后在“设置”中修改；忘记时在服务器上执行 bash run.sh reset-admin。")
-            log.warning("=" * 60)
+            write_admin_secret(init_admin_pw)
         else:
             # 管理员口令一次性迁移成 argon2
             sid, apw = row
@@ -2352,7 +2244,6 @@ POST_ROUTES = {
     "/api/logout": ("_h_logout", ROLE_PUBLIC),
     "/api/register_club": ("_h_register_club", ROLE_STUDENT),
     "/api/cancel_registration": ("_h_cancel_registration", ROLE_STUDENT),
-    "/api/change_password": ("_h_change_password", ROLE_STUDENT),
     "/api/admin_change_password": ("_h_admin_change_password", ROLE_ADMIN),
     "/api/import_students": ("_h_import_students", ROLE_ADMIN),
     "/api/import_clubs": ("_h_import_clubs", ROLE_ADMIN),
@@ -2372,15 +2263,18 @@ POST_ROUTES = {
     "/api/admin/update_student": ("_h_update_student", ROLE_ADMIN),
     "/api/admin/reset_class_passwords": ("_h_reset_class_passwords", ROLE_ADMIN),
     "/api/remove_club_image": ("_h_remove_club_image", ROLE_ADMIN),
+    "/api/admin/restore": ("_h_restore", ROLE_ADMIN),
+    "/api/admin/accounts_workbook": ("_h_accounts_workbook", ROLE_ADMIN),
 }
 RAW_POST_ROUTES = {
-    "/api/upload_club_image": ("_h_upload_club_image", ROLE_ADMIN),
+    "/api/upload_club_image": ("_h_upload_club_image", ROLE_ADMIN, MAX_CLUB_IMAGE_BYTES),
+    "/api/admin/import/parse": ("_h_import_parse", ROLE_ADMIN, MAX_TABLE_BYTES),
+    "/api/admin/restore_upload": ("_h_restore_upload", ROLE_ADMIN, MAX_RESTORE_BYTES),
 }
 WEB_DIR = os.environ.get("WEB_DIR", "web")  # 前端资源目录
 PAGES = {
     "/": "login.html",
     "/student/dashboard": "student_dashboard.html",
-    "/student/profile": "student_profile.html",
     "/admin/dashboard": "admin_dashboard.html",
 }
 STATIC_TYPES = {
@@ -2575,6 +2469,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         if self._reject_get_body():
             return
         path = self.path.split("?")[0]
+        if path == "/admin/login":
+            return self._token_login()
         if path in PAGES:
             return self._serve_page(PAGES[path])
         if path.startswith("/club-images/"):
@@ -2599,15 +2495,19 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        # 页面脚本发出的请求都带这个头；跨站表单无法设置自定义请求头。
+        if self.headers.get("X-Requested-With") != "XMLHttpRequest":
+            self.close_connection = True
+            return self._reply(403, "forbidden")
         route = POST_ROUTES.get(path)
         raw_route = RAW_POST_ROUTES.get(path)
         try:
-            raw = self._read_raw_body(MAX_CLUB_IMAGE_BYTES if raw_route is not None else None)
+            raw = self._read_raw_body(raw_route[2] if raw_route is not None else None)
         except RequestBodyError as e:
             return self._json(e.status, {"success": False, "code": "bad_request",
                                          "message": "请求格式错误：{}".format(e)})
         if raw_route is not None:
-            name, role = raw_route
+            name, role, _limit = raw_route
             sess = self._require(role)
             if sess is False:
                 return
@@ -3246,59 +3146,6 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 log.error("退选落库失败 sid=%s: %s", sid, e)
                 return "unavailable"
 
-    def _h_change_password(self, sess, data):
-        sid = sess["student_id"]
-        cur_pw = data.get("current") or ""
-        new_pw = data.get("new") or ""
-        if not isinstance(cur_pw, str) or not isinstance(new_pw, str):
-            return self._json(400, {"success": False, "message": "密码格式错误"})
-        if len(new_pw) < 6 or len(new_pw) > MAX_PASSWORD or len(cur_pw) > MAX_PASSWORD:
-            return self._json(400, {"success": False, "message": "新密码须为 6–256 位"})
-        with DB_POOL.connection() as conn:
-            c = conn.cursor()
-            c.execute("SELECT password FROM students WHERE id = ?", (sid,))
-            row = c.fetchone()
-        if not row:
-            return self._json(404, {"success": False, "message": "用户不存在"})
-        verified = AUTH.run(verify_and_replace, row[0], cur_pw, new_pw)
-        if isinstance(verified, AuthBusy):
-            return self._auth_busy(verified)
-        ok, new_hash = verified
-        if not ok:
-            return self._json(400, {"success": False, "message": "当前密码不正确"})
-        try:
-            mutation_lock = RG.session_begin_mutation("student", str(sid))
-        except RuntimeError:
-            return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
-        if not mutation_lock:
-            return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
-        try:
-            # The mutation lock is visible to the session-create Lua before
-            # this generation changes, and stays until SQLite has committed.
-            # A concurrent old-password login therefore cannot mint a current
-            # token between revoke and UPDATE.
-            RG.session_revoke_identity("student", str(sid))
-            with DB_POOL.connection() as conn:
-                cur = conn.cursor()
-                conn.execute("BEGIN IMMEDIATE")
-                cur.execute("UPDATE students SET password = ? WHERE id = ?", (new_hash, sid))
-                append_audit_event(
-                    cur, event_id="student-password-change-" + secrets.token_urlsafe(18),
-                    actor_role="student", actor_id=sid, action="student.password_changed",
-                    target_type="student", target_id=sid,
-                    before=None, after={"password_changed": True},
-                )
-                conn.commit()
-            self._json(200, {"success": True, "message": "密码已修改，请重新登录"},
-                       extra=[self._clear_cookie()])
-        except RuntimeError:
-            self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
-        finally:
-            RG.session_end_mutation(mutation_lock)
-
-    # ======================================================================
-    # 管理端点(均 admin 鉴权)
-    # ======================================================================
     def _h_admin_change_password(self, sess, data):
         cur_pw = data.get("current") or ""
         new_pw = data.get("new") or ""
@@ -3329,6 +3176,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 cur = conn.cursor()
                 conn.execute("BEGIN IMMEDIATE")
                 cur.execute("UPDATE settings SET admin_password = ? WHERE id = ?", (new_hash, row[0]))
+                write_admin_secret(new_pw)
                 append_audit_event(
                     cur, event_id="admin-password-change-" + secrets.token_urlsafe(18),
                     actor_role="admin", actor_id=uname, action="admin.password_changed",
@@ -3423,8 +3271,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         name = clean_text(data.get("name"))
         klass = clean_text(data.get("class"))
         number = clean_text(data.get("student_no"), maxlen=40)
-        if request_id is None or not name or not klass or not number:
-            return self._json(400, {"success": False, "message": "请填写姓名、班级和学号"})
+        if request_id is None or not name or not klass:
+            return self._json(400, {"success": False, "message": "请填写姓名和班级"})
         actor = sess.get("username", "admin")
         replay = self._admin_replay(actor, "student.updated", request_id)
         if replay:
@@ -3440,6 +3288,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 if not row:
                     conn.rollback()
                     return self._json(404, {"success": False, "message": "学生不存在"})
+                number = number or row[2]
                 if (name, klass, number) == tuple(row):
                     conn.rollback()
                     return self._json(200, {"success": True, "changed": False})
@@ -4254,41 +4103,41 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
 
     def _h_export_students_csv(self, sess):
         with DB_POOL.connection() as conn:
-            rows = conn.execute("SELECT name, class, student_id, username FROM students ORDER BY class, name").fetchall()
+            rows = conn.execute("SELECT name, class, username FROM students ORDER BY class, name, id").fetchall()
         stamp = export_stamp()
         self._record_download(sess, "students.exported", {"kind": "students_csv"})
-        self._csv(rows, ["姓名", "班级", "学号", "用户名"], "学生账号_{}.csv".format(stamp), "students_{}.csv".format(stamp))
+        self._csv(rows, ["姓名", "班级", "账号"], "学生账号_{}.csv".format(stamp), "students_{}.csv".format(stamp))
 
     @staticmethod
     def _registration_rows(conn):
-        """每名学生一行：姓名、班级、学号、社团编号、社团、方式、报名时间。"""
+        """每名学生一行：姓名、班级、社团编号、社团、方式、报名时间。"""
         rows = conn.execute(
-            "SELECT s.name, s.class, s.student_id, c.id, c.name, r.operation_id, r.registration_time "
+            "SELECT s.name, s.class, c.id, c.name, r.operation_id, r.registration_time "
             "FROM students s LEFT JOIN registrations r ON s.id = r.student_id "
-            "LEFT JOIN clubs c ON r.club_id = c.id ORDER BY s.class, s.student_id, s.name"
+            "LEFT JOIN clubs c ON r.club_id = c.id ORDER BY s.class, s.name, s.id"
         ).fetchall()
-        return [(name, klass, number, club_id, club, registration_method(operation) if club_id else "", when or "")
-                for name, klass, number, club_id, club, operation, when in rows]
+        return [(name, klass, club_id, club, registration_method(operation) if club_id else "", when or "")
+                for name, klass, club_id, club, operation, when in rows]
 
     def _h_export_all_data(self, sess):
         with DB_POOL.connection() as conn:
             rows = self._registration_rows(conn)
         stamp = export_stamp()
         self._record_download(sess, "registrations.exported", {"kind": "all_csv"})
-        self._csv([(name, klass, number, club or "未报名", method, when)
-                   for name, klass, number, _club_id, club, method, when in rows],
-                  ["姓名", "班级", "学号", "社团", "方式", "报名时间"],
+        self._csv([(name, klass, club or "未报名", method, when)
+                   for name, klass, _club_id, club, method, when in rows],
+                  ["姓名", "班级", "社团", "方式", "报名时间"],
                   "报名总表_{}.csv".format(stamp), "registrations_{}.csv".format(stamp))
 
     def _h_export_unregistered(self, sess):
         with DB_POOL.connection() as conn:
             rows = conn.execute(
-                "SELECT s.name, s.class, s.student_id FROM students s "
+                "SELECT s.name, s.class FROM students s "
                 "LEFT JOIN registrations r ON s.id = r.student_id WHERE r.id IS NULL "
-                "ORDER BY s.class, s.student_id, s.name").fetchall()
+                "ORDER BY s.class, s.name, s.id").fetchall()
         stamp = export_stamp()
         self._record_download(sess, "registrations.exported", {"kind": "unregistered_csv"})
-        self._csv(rows, ["姓名", "班级", "学号"], "未报名名单_{}.csv".format(stamp),
+        self._csv(rows, ["姓名", "班级"], "未报名名单_{}.csv".format(stamp),
                   "unregistered_{}.csv".format(stamp))
 
     def _h_export_club_data(self, sess):
@@ -4302,15 +4151,15 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             if not club:
                 return self._json(404, {"success": False, "message": "社团不存在"})
             rows = conn.execute(
-                "SELECT s.name, s.class, s.student_id, r.operation_id, r.registration_time FROM students s "
+                "SELECT s.name, s.class, r.operation_id, r.registration_time FROM students s "
                 "JOIN registrations r ON s.id = r.student_id WHERE r.club_id = ? "
-                "ORDER BY s.class, s.student_id, s.name", (club_id,)).fetchall()
+                "ORDER BY s.class, s.name, s.id", (club_id,)).fetchall()
         stamp = export_stamp()
         self._record_download(sess, "registrations.exported", {"kind": "club_csv", "club": club[0]})
-        self._csv([(name, klass, number, registration_method(operation), when)
-                   for name, klass, number, operation, when in rows],
-                  ["姓名", "班级", "学号", "方式", "报名时间"],
-                  "{}_名单_{}.csv".format(_SHEET_NAME_BAD.sub(" ", club[0]).strip() or club_id, stamp),
+        self._csv([(name, klass, registration_method(operation), when)
+                   for name, klass, operation, when in rows],
+                  ["姓名", "班级", "方式", "报名时间"],
+                  "{}_名单_{}.csv".format(_FILE_NAME_BAD.sub(" ", club[0]).strip() or club_id, stamp),
                   "club_{}_{}.csv".format(club_id, stamp))
 
     def _h_export_workbook(self, sess):
@@ -4318,20 +4167,19 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         with DB_POOL.connection() as conn:
             rows = self._registration_rows(conn)
             clubs = conn.execute("SELECT id, name FROM clubs ORDER BY id").fetchall()
-        summary = [(name, klass, number, club or "未报名", method, when)
-                   for name, klass, number, _club_id, club, method, when in rows]
-        sheets = [("总表", ["姓名", "班级", "学号", "社团", "方式", "报名时间"], summary, [10, 12, 14, 16, 10, 20])]
+        summary = [(name, klass, club or "未报名", method, when)
+                   for name, klass, _club_id, club, method, when in rows]
+        book = [("总表", ["姓名", "班级", "社团", "方式", "报名时间"], summary, [10, 12, 16, 10, 20])]
         for club_id, club_name in clubs:
-            members = [(name, klass, number, method, when)
-                       for name, klass, number, member_club, _club, method, when in rows if member_club == club_id]
-            sheets.append((club_name, ["姓名", "班级", "学号", "方式", "报名时间"], members, [10, 12, 14, 10, 20]))
-        missing = [(name, klass, number) for name, klass, number, club_id, *_rest in rows if not club_id]
+            members = [(name, klass, method, when)
+                       for name, klass, member_club, _club, method, when in rows if member_club == club_id]
+            book.append((club_name, ["姓名", "班级", "方式", "报名时间"], members, [10, 12, 10, 20]))
+        missing = [(name, klass) for name, klass, club_id, *_rest in rows if not club_id]
         if missing:
-            sheets.append(("未报名", ["姓名", "班级", "学号"], missing, [10, 12, 14]))
+            book.append(("未报名", ["姓名", "班级"], missing, [10, 12]))
         stamp = export_stamp()
         self._record_download(sess, "registrations.exported", {"kind": "workbook"})
-        self._send(200, xlsx_bytes(sheets),
-                   ctype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        self._send(200, xlsx_bytes(book), ctype=XLSX_TYPE,
                    extra=[attachment_header("社团报名表_{}.xlsx".format(stamp), "registrations_{}.xlsx".format(stamp)),
                           ("Cache-Control", "no-store")])
 
@@ -4464,6 +4312,166 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         finally:
             RG.maintenance_end(maintenance)
 
+    def _token_login(self):
+        """启动脚本在本机打开的一次性链接：校验后签发管理员会话并转到控制台。"""
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        token = (qs.get("token") or [""])[0]
+        target, cookies = "/", []
+        try:
+            local = ipaddress.ip_address(self._client_ip()).is_loopback
+        except ValueError:
+            local = False
+        if local and re.fullmatch(r"[A-Za-z0-9_-]{40,64}", token) and RG.take(rk("admin_login", token)):
+            with DB_POOL.connection() as conn:
+                row = conn.execute("SELECT admin_username FROM settings ORDER BY id DESC LIMIT 1").fetchone()
+            username = (row[0] if row else None) or "admin"
+            try:
+                session = RG.session_create({"role": "admin", "username": username},
+                                            RG.session_role_epoch("admin"),
+                                            RG.session_principal_version("admin", username))
+            except RuntimeError:
+                session = None
+            if session:
+                cookies.append(self._set_session_cookie(session))
+                target = "/admin/dashboard"
+        self._send(303, b"", ctype="text/plain; charset=utf-8",
+                   extra=[("Location", target), ("Cache-Control", "no-store"),
+                          ("Referrer-Policy", "no-referrer")] + cookies)
+
+    def _h_import_parse(self, sess, raw):
+        """解析上传的名单表格，逐行返回供管理员核对，不写数据库。"""
+        filename = urllib.parse.unquote(self.headers.get("X-File-Name") or "")[:200]
+        if not raw:
+            return self._json(400, {"success": False, "message": "文件为空"})
+        try:
+            parsed = tables.parse_roster(filename, raw)
+        except tables.TableError as exc:
+            return self._json(400, {"success": False, "message": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("名单解析失败 file=%s error=%r", filename, exc)
+            return self._json(400, {"success": False, "message": "表格格式无法识别"})
+        with DB_POOL.connection() as conn:
+            existing = set(conn.execute("SELECT name, class FROM students").fetchall())
+        for row in parsed["rows"]:
+            if (row["name"], row["class"]) in existing:
+                row["notes"].append("已导入")
+        self._json(200, dict(parsed, success=True), extra=[("Cache-Control", "no-store")])
+
+    def _h_accounts_workbook(self, sess, data):
+        """把本页的新账号写成 Excel：姓名、班级、账号、密码。"""
+        accounts = data.get("accounts")
+        if not isinstance(accounts, list) or not 0 < len(accounts) <= MAX_ACCOUNT_ROWS:
+            return self._json(400, {"success": False, "message": "账号列表无效"})
+        keys = ("name", "class", "username", "password")
+        rows = []
+        for item in accounts:
+            values = [item.get(key) for key in keys] if isinstance(item, dict) else []
+            if len(values) != 4 or not all(isinstance(value, str) and 0 < len(value) <= 80 for value in values):
+                return self._json(400, {"success": False, "message": "账号列表无效"})
+            rows.append(dict(zip(keys, values)))
+        stamp = export_stamp()
+        self._record_download(sess, "students.exported", {"kind": "accounts_xlsx", "count": len(rows)})
+        self._send(200, tables.accounts_xlsx(rows), ctype=XLSX_TYPE,
+                   extra=[attachment_header("学生账号_{}.xlsx".format(stamp), "accounts_{}.xlsx".format(stamp)),
+                          ("Cache-Control", "no-store")])
+
+    def _h_restore(self, sess, data):
+        name = data.get("name")
+        if not isinstance(name, str) or not BACKUP_NAME_RE.fullmatch(name):
+            return self._json(400, {"success": False, "message": "备份无效"})
+        path = os.path.join(BACKUP_DIR, name)
+        if not os.path.isfile(path):
+            return self._json(404, {"success": False, "message": "备份不存在"})
+        with tempfile.TemporaryDirectory(prefix="omms-restore-") as tmp:
+            source = os.path.join(tmp, BACKUP_DB_NAME)
+            copy_database(path, source)
+            self._restore_from(sess, source, BACKUP_LABELS.get(BACKUP_NAME_RE.fullmatch(name).group(2), name))
+
+    def _h_restore_upload(self, sess, raw):
+        label = urllib.parse.unquote(self.headers.get("X-File-Name") or "")[:120] or "上传的备份"
+        images = {}
+        with tempfile.TemporaryDirectory(prefix="omms-restore-") as tmp:
+            source = os.path.join(tmp, BACKUP_DB_NAME)
+            try:
+                if raw.startswith(b"PK\x03\x04"):
+                    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                        info = archive.getinfo(BACKUP_DB_NAME)
+                        if info.file_size > MAX_RESTORE_BYTES * 4:
+                            raise ValueError("too large")
+                        with archive.open(info) as src, open(source, "wb") as dst:
+                            dst.write(src.read(MAX_RESTORE_BYTES * 4 + 1))
+                        for entry in archive.infolist():
+                            base = entry.filename[len("club-images/"):] if entry.filename.startswith("club-images/") else ""
+                            if _CLUB_IMAGE_NAME.fullmatch(base) and entry.file_size <= MAX_CLUB_IMAGE_OUTPUT_BYTES:
+                                with archive.open(entry) as src:
+                                    images[base] = src.read(MAX_CLUB_IMAGE_OUTPUT_BYTES + 1)[:MAX_CLUB_IMAGE_OUTPUT_BYTES]
+                elif raw.startswith(b"SQLite format 3\x00"):
+                    with open(source, "wb") as dst:
+                        dst.write(raw)
+                else:
+                    raise ValueError("unknown format")
+            except (KeyError, ValueError, OSError, zipfile.BadZipFile):
+                return self._json(400, {"success": False, "message": "备份无效"})
+            self._restore_from(sess, source, label, images)
+
+    def _restore_from(self, sess, source, label, images=None):
+        """在线恢复：维护期间整库替换，保留当前管理员账号，学生需重新登录。"""
+        try:
+            students, clubs, registrations = database_counts(source)
+        except (ValueError, sqlite3.Error):
+            return self._json(400, {"success": False, "message": "备份无效"})
+        maintenance = RG.maintenance_begin()
+        if not maintenance:
+            return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        try:
+            with DB_POOL.connection() as conn:
+                admin = conn.execute(
+                    "SELECT admin_username, admin_password FROM settings ORDER BY id DESC LIMIT 1").fetchone()
+            saved = self._snapshot_before("before-restore")
+            if saved is None:
+                return
+            copy_database(source, DB_PATH)
+            if images:
+                os.makedirs(CLUB_IMAGE_DIR, mode=0o700, exist_ok=True)
+                for base, content in images.items():
+                    descriptor = os.open(os.path.join(CLUB_IMAGE_DIR, base),
+                                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(descriptor, "wb") as target:
+                        target.write(content)
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            try:
+                for kind, name in conn.execute(
+                        "SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view')").fetchall():
+                    conn.execute('DROP {} IF EXISTS "{}"'.format(kind.upper(), name.replace('"', '""')))
+                conn.commit()
+                ensure_schema(conn)
+                if admin:
+                    conn.execute("UPDATE settings SET admin_username=?, admin_password=?", admin)
+                conn.execute("DELETE FROM registrations WHERE student_id NOT IN (SELECT id FROM students) "
+                             "OR club_id NOT IN (SELECT id FROM clubs)")
+                conn.execute("UPDATE clubs SET current_students = "
+                             "(SELECT COUNT(*) FROM registrations r WHERE r.club_id = clubs.id)")
+                append_audit_event(
+                    conn.cursor(), event_id="restore-" + secrets.token_urlsafe(18), actor_role="admin",
+                    actor_id=sess.get("username", "admin"), action="backup.restored", target_type="data",
+                    before={"backup": saved},
+                    after={"source": label, "students": students, "clubs": clubs, "registrations": registrations},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            with contextlib.suppress(RuntimeError):
+                RG.session_revoke_role("student")
+            CATALOG_CACHE.invalidate()
+            SEATS_CACHE.invalidate()
+            if not rebuild_all(maintenance):
+                RECONCILE_REQUESTED.set()
+            self._json(200, {"success": True, "students": students, "clubs": clubs,
+                             "registrations": registrations, "backup": saved})
+        finally:
+            RG.maintenance_end(maintenance)
+
     def _h_backup(self, sess):
         """不带参数时生成完整备份；name 指定时下载该份自动快照。"""
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -4521,7 +4529,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             name = clean_text(st.get("name"))
             klass = clean_text(st.get("class"))
             student_no = clean_text(st.get("student_id"), maxlen=40)
-            if not name or not klass or not student_no:
+            if not name or not klass:
                 results["failed"] += 1
                 continue
             rows.append((name, klass, derive_grade(klass), student_no, gen_password()))
@@ -4540,7 +4548,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         cur.execute(
                             "INSERT INTO students (name, class, grade, student_id, username, password) "
                             "VALUES (?,?,?,?,?,?)",
-                            (name, klass, grade, student_no, username, password_hash))
+                            (name, klass, grade, student_no or username, username, password_hash))
                         results["success"] += 1
                         credentials.append({"name": name, "class": klass, "username": username,
                                             "password": plain})
@@ -5019,11 +5027,9 @@ def main():
 
 if __name__ == "__main__":
     arguments = sys.argv[1:]
-    if arguments == ["reset-admin-password"]:
-        sys.exit(cli_reset_admin_password())
-    if len(arguments) == 2 and arguments[0] == "restore":
-        sys.exit(cli_restore(arguments[1]))
+    if len(arguments) == 2 and arguments[0] == "admin-login":
+        sys.exit(cli_admin_login(arguments[1]))
     if arguments:
-        print("用法：python3 main.py [reset-admin-password | restore 备份文件]")
+        print("用法：python3 main.py [admin-login 控制台地址]")
         sys.exit(2)
     main()
