@@ -19,5 +19,7 @@ target/
 .DS_Store
 *.log
 
-# 运行目录
+# 运行目录、社团照片与备份
 run/
+club-images/
+backups/

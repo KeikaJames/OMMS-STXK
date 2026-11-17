@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import contextlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -131,6 +134,17 @@ class Instance:
         token = write_session(self.client, student_id)
         return request_json(self.http_port, "POST", "/api/register_club", token=token, body={"club_id": 1})
 
+    def post(self, token: str, path: str, body: dict) -> tuple[int, dict]:
+        return request_json(self.http_port, "POST", path, token=token, body=body)
+
+    def cli(self, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(MAIN_PY), *arguments], cwd=REPO_ROOT, env=self.env(),
+                              capture_output=True, text=True, timeout=60)
+
+    @property
+    def backups(self) -> Path:
+        return self.workdir / "backups"
+
 
 @unittest.skipIf(redis is None or shutil.which("redis-server") is None, "redis unavailable")
 class FreshInstallTests(unittest.TestCase):
@@ -180,6 +194,133 @@ class FreshInstallTests(unittest.TestCase):
         app.client.set(key("open_at"), 0)
         app.start()
         self.assertIsNone(app.client.get(key("open_at")))
+
+
+
+def counts(path: Path) -> tuple[int, int, int]:
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        return tuple(conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+                     for table in ("students", "clubs", "registrations"))
+
+
+@unittest.skipIf(redis is None or shutil.which("redis-server") is None, "redis unavailable")
+class MaintenanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="omms-maintenance-")
+        self.instance = Instance(Path(self.tmp.name))
+        self.instance.start()
+        self.instance.sql("UPDATE settings SET registration_start_time='2000-01-01 00:00:00'")
+        self.instance.seed(students=3, capacity=5)
+        self.admin = self.instance.admin_token()
+
+    def tearDown(self) -> None:
+        self.instance.close()
+        self.tmp.cleanup()
+
+    def lock(self, locked: bool = True) -> dict:
+        status, body = self.instance.post(self.admin, "/api/update_registration_lock",
+                                          {"locked": locked, "reason": "测试", "request_id": os.urandom(8).hex()})
+        self.assertEqual(200, status, body)
+        return body
+
+    def test_clearing_registrations_needs_the_lock_backs_up_and_republishes_seats(self) -> None:
+        app = self.instance
+        for student in (1, 2):
+            status, body = app.register(student)
+            self.assertTrue(body.get("success"), body)
+        self.assertEqual("3", app.client.get(key("stock", 1)))
+        status, body = app.post(self.admin, "/api/admin/clear_registrations", {"request_id": "clear-request-1"})
+        self.assertEqual((409, "请先锁定名单"), (status, body.get("message")))
+
+        locked = self.lock()
+        self.assertRegex(locked["backup"], r"^\d{8}-\d{6}-locked\.db$")
+        self.assertEqual(2, counts(app.backups / locked["backup"])[2])
+
+        status, body = app.post(self.admin, "/api/admin/clear_registrations", {"request_id": "clear-request-1"})
+        self.assertEqual(200, status, body)
+        self.assertEqual(2, body["cleared"])
+        self.assertEqual((3, 1, 2), counts(app.backups / body["backup"]))
+        self.assertEqual((3, 1, 0), counts(app.db_path))
+        self.assertEqual([(0,)], app.sql("SELECT current_students FROM clubs"))
+        self.assertEqual("5", app.client.get(key("stock", 1)))
+        self.assertIsNone(app.client.get(key("reg", 1)))
+
+        status, again = app.post(self.admin, "/api/admin/clear_registrations", {"request_id": "clear-request-1"})
+        self.assertEqual(200, status, again)
+        self.assertTrue(again["replayed"])
+        self.assertEqual(body["backup"], again["backup"])
+        self.assertEqual([(1,)], app.sql("SELECT COUNT(*) FROM audit_events WHERE action='registrations.cleared'"))
+
+        self.lock(False)
+        status, body = app.register(3)
+        self.assertTrue(body.get("success"), body)
+
+    def test_full_backup_downloads_and_restores_database_and_photos(self) -> None:
+        app = self.instance
+        app.register(1)
+        image_dir = app.workdir / "club-images"
+        image_dir.mkdir(exist_ok=True)
+        photo = "1-" + "a" * 32 + ".jpg"
+        (image_dir / photo).write_bytes(b"photo-bytes")
+        app.sql("UPDATE clubs SET image_path=?", ("/club-images/" + photo,))
+
+        status, headers, raw = request(app.http_port, "GET", "/api/admin/backup", token=self.admin)
+        self.assertEqual(200, status)
+        self.assertEqual("application/zip", headers["content-type"])
+        self.assertIn("filename*=UTF-8''", headers["content-disposition"])
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            self.assertEqual(["club_system.db", "club-images/" + photo], archive.namelist())
+        backup_file = app.workdir / "full.zip"
+        backup_file.write_bytes(raw)
+
+        locked = self.lock()
+        status, listing = request_json(app.http_port, "GET", "/api/admin/backups", token=self.admin)
+        self.assertEqual(200, status)
+        self.assertEqual([(locked["backup"], "名单锁定")], [(item["name"], item["label"]) for item in listing["backups"]])
+        status, _headers, snapshot = request(app.http_port, "GET", "/api/admin/backup?name=" + locked["backup"],
+                                             token=self.admin)
+        self.assertEqual((200, (app.backups / locked["backup"]).read_bytes()), (status, snapshot))
+        for name in ("../club_system.db", "x.db"):
+            status, _body = request_json(app.http_port, "GET", "/api/admin/backup?name=" + name, token=self.admin)
+            self.assertEqual(400, status)
+
+        app.stop()
+        app.sql("DELETE FROM registrations")
+        app.sql("DELETE FROM students")
+        (image_dir / photo).unlink()
+        app.client.set(key("sess", "stale-session"), "{}")
+        result = app.cli("restore", str(backup_file))
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("已恢复：学生 3 名，社团 1 个，报名 1 条，照片 1 张。", result.stdout)
+        self.assertEqual((3, 1, 1), counts(app.db_path))
+        self.assertEqual(b"photo-bytes", (image_dir / photo).read_bytes())
+        self.assertIsNone(app.client.get(key("sess", "stale-session")))
+        before = [name for name in os.listdir(app.backups) if name.endswith("-before-restore.db")]
+        self.assertEqual(1, len(before))
+        self.assertEqual((0, 1, 0), counts(app.backups / before[0]))
+        app.start()
+        self.assertEqual("4", app.client.get(key("stock", 1)))
+
+        broken = app.workdir / "broken.db"
+        broken.write_bytes(b"not a database")
+        result = app.cli("restore", str(broken))
+        self.assertEqual(1, result.returncode)
+        self.assertIn("备份文件不可用", result.stdout)
+
+    def test_reset_admin_password_from_the_command_line(self) -> None:
+        app = self.instance
+        result = app.cli("reset-admin-password")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        password = re.search(r"新密码 (\S+)", result.stdout).group(1)
+        status, _body = request_json(app.http_port, "GET", "/api/admin/summary", token=self.admin)
+        self.assertEqual(401, status)
+        status, _headers, _raw = request(app.http_port, "POST", "/api/admin_login",
+                                         body={"username": "admin", "password": "admin-password"})
+        self.assertEqual(401, status)
+        status, _headers, _raw = request(app.http_port, "POST", "/api/admin_login",
+                                         body={"username": "admin", "password": password})
+        self.assertEqual(200, status)
+        self.assertEqual([("命令行",)], app.sql("SELECT actor_id FROM audit_events WHERE action='admin.password_reset'"))
 
 
 if __name__ == "__main__":

@@ -4,9 +4,12 @@
 import collections
 import http.server
 import random
+import shutil
 import socketserver
 import json
 import sqlite3
+import sys
+import tempfile
 import urllib.parse
 import os
 import secrets
@@ -1390,6 +1393,192 @@ def export_stamp():
     return datetime.now(APP_TZ).strftime("%Y%m%d_%H%M")
 
 
+def gen_admin_password():
+    # 字母表去掉易混淆字符。
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(12))
+
+
+# ==========================================================================
+# 备份：危险操作前与锁定时自动保存数据库快照；完整备份含数据库与社团照片
+# ==========================================================================
+BACKUP_DIR = os.path.abspath(os.environ.get(
+    "BACKUP_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups"),
+))
+BACKUP_KEEP = max(1, int(os.environ.get("BACKUP_KEEP", "30")))
+BACKUP_NAME_RE = re.compile(r"(\d{8}-\d{6})-([a-z-]+)\.db")
+BACKUP_LABELS = {
+    "locked": "名单锁定", "before-adjust": "调剂前", "before-clear": "清空报名前",
+    "before-delete-students": "清空学生前", "before-delete-clubs": "清空社团前", "before-restore": "恢复前",
+}
+BACKUP_DB_NAME = "club_system.db"
+BACKUP_TABLES = {"settings", "students", "clubs", "registrations"}
+
+
+def copy_database(source_path, target_path):
+    """用 SQLite 备份接口复制：源库同时被写入时，得到的是某一时刻的完整状态。"""
+    source = sqlite3.connect(source_path, timeout=30.0)
+    try:
+        target = sqlite3.connect(target_path, timeout=30.0)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+def list_snapshots():
+    try:
+        names = os.listdir(BACKUP_DIR)
+    except OSError:
+        return []
+    return sorted((name for name in names if BACKUP_NAME_RE.fullmatch(name)), reverse=True)
+
+
+def snapshot_database(label):
+    """把当前数据库存入备份目录，返回文件名；只保留最近 BACKUP_KEEP 份。"""
+    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    name = "{}-{}.db".format(datetime.now(APP_TZ).strftime("%Y%m%d-%H%M%S"), label)
+    path = os.path.join(BACKUP_DIR, name)
+    partial = path + ".part"
+    try:
+        copy_database(DB_PATH, partial)
+        os.replace(partial, path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(partial)
+    for stale in list_snapshots()[BACKUP_KEEP:]:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(BACKUP_DIR, stale))
+    return name
+
+
+def backup_archive():
+    """完整备份：数据库与当前的社团照片，打成 zip。"""
+    out = io.BytesIO()
+    with tempfile.TemporaryDirectory(prefix="omms-backup-") as tmp:
+        database = os.path.join(tmp, BACKUP_DB_NAME)
+        copy_database(DB_PATH, database)
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(database, BACKUP_DB_NAME)
+            with contextlib.suppress(OSError):
+                for entry in sorted(os.listdir(CLUB_IMAGE_DIR)):
+                    if _CLUB_IMAGE_NAME.fullmatch(entry):
+                        archive.write(os.path.join(CLUB_IMAGE_DIR, entry), "club-images/" + entry,
+                                      compress_type=zipfile.ZIP_STORED)
+    return out.getvalue()
+
+
+def database_counts(path):
+    conn = sqlite3.connect(path, timeout=30.0)
+    try:
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("数据库文件损坏")
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = BACKUP_TABLES - tables
+        if missing:
+            raise ValueError("缺少数据表：" + "、".join(sorted(missing)))
+        return tuple(conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+                     for table in ("students", "clubs", "registrations"))
+    finally:
+        conn.close()
+
+
+def flush_redis_state():
+    """删除本系统在 Redis 中的全部键（会话、名额、镜像），服务启动时按 SQLite 重新发布。"""
+    deleted = 0
+    batch = []
+    for name in RG.r.scan_iter(match=REDIS_PREFIX + "*", count=1000):
+        batch.append(name)
+        if len(batch) >= 500:
+            deleted += RG.r.delete(*batch)
+            batch = []
+    if batch:
+        deleted += RG.r.delete(*batch)
+    return deleted
+
+
+def cli_restore(path):
+    """从完整备份（.zip）或数据库快照（.db）恢复，需先停止服务。"""
+    if not os.path.isfile(path):
+        print("找不到备份文件：" + path)
+        return 1
+    with tempfile.TemporaryDirectory(prefix="omms-restore-") as tmp:
+        images = None
+        source = path
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                names = archive.namelist()
+                if BACKUP_DB_NAME not in names:
+                    print("备份中没有 " + BACKUP_DB_NAME)
+                    return 1
+                source = os.path.join(tmp, BACKUP_DB_NAME)
+                with archive.open(BACKUP_DB_NAME) as src, open(source, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                images = {}
+                for name in names:
+                    base = name[len("club-images/"):] if name.startswith("club-images/") else ""
+                    if _CLUB_IMAGE_NAME.fullmatch(base):
+                        images[base] = archive.read(name)
+        try:
+            students, clubs, registrations = database_counts(source)
+        except (ValueError, sqlite3.Error) as exc:
+            print("备份文件不可用：{}".format(exc))
+            return 1
+        saved = snapshot_database("before-restore") if os.path.exists(DB_PATH) else None
+        copy_database(source, DB_PATH)
+        if images is not None:
+            os.makedirs(CLUB_IMAGE_DIR, mode=0o700, exist_ok=True)
+            for entry in os.listdir(CLUB_IMAGE_DIR):
+                if _CLUB_IMAGE_NAME.fullmatch(entry):
+                    os.remove(os.path.join(CLUB_IMAGE_DIR, entry))
+            for base, data in images.items():
+                descriptor = os.open(os.path.join(CLUB_IMAGE_DIR, base), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(descriptor, "wb") as target:
+                    target.write(data)
+    try:
+        flush_redis_state()
+    except Exception:  # noqa: BLE001
+        print("Redis 未连接：会话与名额在下次启动时重新发布。")
+    print("已恢复：学生 {} 名，社团 {} 个，报名 {} 条{}。".format(
+        students, clubs, registrations, "，照片 {} 张".format(len(images)) if images is not None else ""))
+    if saved:
+        print("恢复前的数据库已保存为 " + os.path.join(BACKUP_DIR, saved))
+    return 0
+
+
+def cli_reset_admin_password():
+    if not os.path.isfile(DB_PATH):
+        print("找不到数据库：" + DB_PATH)
+        return 1
+    password = gen_admin_password()
+    password_hash = hash_password(password)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        row = cur.execute("SELECT id, admin_username FROM settings ORDER BY id DESC LIMIT 1").fetchone()
+        if not row:
+            conn.rollback()
+            print("数据库中没有系统设置，请先启动一次服务。")
+            return 1
+        cur.execute("UPDATE settings SET admin_password=? WHERE id=?", (password_hash, row[0]))
+        append_audit_event(
+            cur, event_id="admin-password-reset-" + secrets.token_urlsafe(18), actor_role="admin",
+            actor_id="命令行", action="admin.password_reset", target_type="settings", target_id=row[0],
+            after={"password_reset": True},
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with contextlib.suppress(Exception):
+        RG.session_revoke_role("admin")
+    print("管理员账号 {}，新密码 {}".format(row[1] or "admin", password))
+    print("该密码仅输出一次，原有的管理员登录已失效。")
+    return 0
+
+
 def restriction_code(grade, klass, allowed_grades, allowed_classes):
     """资格不符时返回提示码，符合返回 None。"""
     grades = strict_text_list(allowed_grades)
@@ -1897,13 +2086,12 @@ def init_db():
         cur.execute("SELECT id, admin_password FROM settings LIMIT 1")
         row = cur.fetchone()
         if row is None:
-            # 首次启动生成随机管理员口令，只在日志里输出一次；字母表去掉易混淆字符。
-            _pw_alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
-            init_admin_pw = "".join(secrets.choice(_pw_alphabet) for _ in range(12))
+            # 首次启动生成随机管理员口令，只在日志里输出一次。
+            init_admin_pw = gen_admin_password()
             cur.execute("INSERT INTO settings (admin_password) VALUES (?)", (hash_password(init_admin_pw),))
             log.warning("=" * 60)
             log.warning("首次启动：管理员账号 admin，初始密码 %s", init_admin_pw)
-            log.warning("该密码仅输出一次，请登录后在“设置”中修改。")
+            log.warning("该密码仅输出一次，请登录后在“设置”中修改；忘记时在服务器上执行 bash run.sh reset-admin。")
             log.warning("=" * 60)
         else:
             # 管理员口令一次性迁移成 argon2
@@ -2054,6 +2242,8 @@ GET_ROUTES = {
     "/api/admin/summary": ("_h_admin_summary", ROLE_ADMIN),
     "/api/admin/adjustment": ("_h_adjustment_plan", ROLE_ADMIN),
     "/api/export_workbook": ("_h_export_workbook", ROLE_ADMIN),
+    "/api/admin/backup": ("_h_backup", ROLE_ADMIN),
+    "/api/admin/backups": ("_h_backups", ROLE_ADMIN),
     "/api/admin/preflight_plan": ("_h_preflight_plan", ROLE_ADMIN),
 }
 POST_ROUTES = {
@@ -2078,6 +2268,7 @@ POST_ROUTES = {
     "/api/admin/remove_registration": ("_h_admin_remove_registration", ROLE_ADMIN),
     "/api/admin/transfer_registration": ("_h_admin_transfer_registration", ROLE_ADMIN),
     "/api/admin/adjust_registrations": ("_h_adjust_registrations", ROLE_ADMIN),
+    "/api/admin/clear_registrations": ("_h_clear_registrations", ROLE_ADMIN),
     "/api/remove_club_image": ("_h_remove_club_image", ROLE_ADMIN),
 }
 RAW_POST_ROUTES = {
@@ -3496,6 +3687,15 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return None
         return student_id, club_id, request_id, reason, bool(data.get("override_eligibility", False))
 
+    def _snapshot_before(self, label):
+        """危险操作前保存快照；失败时直接回复并返回 None。"""
+        try:
+            return snapshot_database(label)
+        except (OSError, sqlite3.Error) as exc:
+            log.error("自动备份失败: %s", exc)
+            self._json(500, {"success": False, "message": "自动备份失败，操作未执行"})
+            return None
+
     def _admin_replay(self, actor, action, request_id):
         with DB_POOL.connection() as conn:
             return conn.execute(
@@ -3930,6 +4130,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                               extra=[("Retry-After", "2")])
         try:
             with DB_POOL.connection() as conn:
+                locked_now = registration_locked(conn)
+            if not locked_now:
+                return self._json(409, {"success": False, "message": "请先锁定名单"})
+            backup = self._snapshot_before("before-adjust")
+            if backup is None:
+                return
+            with DB_POOL.connection() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     if not registration_locked(conn):
@@ -3953,7 +4160,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         action="registrations.adjusted", target_type="registrations", request_id=request_id,
                         before={"unregistered": len(pairs) + len(unplaced)},
                         after=dict(summary, students=[[student, club] for student, club in pairs]),
-                        metadata={"batch": batch},
+                        metadata={"batch": batch, "backup": backup},
                     )
                     conn.commit()
                 except sqlite3.Error as e:
@@ -3964,9 +4171,96 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 RECONCILE_REQUESTED.set()
                 return self._json(503, dict(summary, success=False, message="调剂已保存，名额稍后发布"),
                                   extra=[("Retry-After", "2")])
+            self._json(200, dict(summary, success=True, backup=backup))
+        finally:
+            RG.maintenance_end(maintenance)
+
+    def _h_clear_registrations(self, sess, data):
+        """名单锁定后删除全部报名，学生与社团保留；清空前自动备份。"""
+        request_id = admin_request_id(data)
+        if request_id is None:
+            return self._json(400, {"success": False, "message": "请求编号无效"})
+        actor = sess.get("username", "admin")
+        replay = self._admin_replay(actor, "registrations.cleared", request_id)
+        if replay:
+            return self._json(200, dict(json.loads(replay[3] or "{}"), success=True, replayed=True))
+        maintenance = RG.maintenance_begin()
+        if not maintenance:
+            return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        try:
+            with DB_POOL.connection() as conn:
+                locked_now = registration_locked(conn)
+            if not locked_now:
+                return self._json(409, {"success": False, "message": "请先锁定名单"})
+            backup = self._snapshot_before("before-clear")
+            if backup is None:
+                return
+            with DB_POOL.connection() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur = conn.cursor()
+                    by_club = dict(cur.execute(
+                        "SELECT club_id, COUNT(*) FROM registrations GROUP BY club_id").fetchall())
+                    summary = {"cleared": sum(by_club.values()), "backup": backup}
+                    cur.execute("DELETE FROM registrations")
+                    cur.execute("UPDATE clubs SET current_students = 0")
+                    append_audit_event(
+                        cur, event_id="clear-" + secrets.token_urlsafe(18), actor_role="admin", actor_id=actor,
+                        action="registrations.cleared", target_type="registrations", request_id=request_id,
+                        before={"registrations": summary["cleared"],
+                                "by_club": {str(club): count for club, count in sorted(by_club.items())}},
+                        after=summary,
+                    )
+                    conn.commit()
+                except sqlite3.Error as e:
+                    conn.rollback()
+                    log.error("清空报名失败: %s", e)
+                    return self._json(500, {"success": False, "message": "清空失败"})
+            if not rebuild_all(maintenance):
+                RECONCILE_REQUESTED.set()
+                return self._json(503, dict(summary, success=False, message="报名已清空，名额稍后发布"),
+                                  extra=[("Retry-After", "2")])
             self._json(200, dict(summary, success=True))
         finally:
             RG.maintenance_end(maintenance)
+
+    def _h_backup(self, sess):
+        """不带参数时生成完整备份；name 指定时下载该份自动快照。"""
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        name = (qs.get("name") or [""])[0]
+        if name:
+            if not BACKUP_NAME_RE.fullmatch(name):
+                return self._json(400, {"success": False, "message": "备份名称无效"})
+            try:
+                with open(os.path.join(BACKUP_DIR, name), "rb") as source:
+                    body = source.read()
+            except OSError:
+                return self._json(404, {"success": False, "message": "备份不存在"})
+            return self._send(200, body, ctype="application/vnd.sqlite3",
+                              extra=[attachment_header(name, name), ("Cache-Control", "no-store")])
+        try:
+            body = backup_archive()
+        except (OSError, sqlite3.Error) as exc:
+            log.error("生成完整备份失败: %s", exc)
+            return self._json(500, {"success": False, "message": "生成备份失败"})
+        stamp = export_stamp()
+        self._send(200, body, ctype="application/zip",
+                   extra=[attachment_header("社团报名备份_{}.zip".format(stamp), "omms-backup_{}.zip".format(stamp)),
+                          ("Cache-Control", "no-store")])
+
+    def _h_backups(self, sess):
+        items = []
+        for name in list_snapshots():
+            stamp, label = BACKUP_NAME_RE.fullmatch(name).groups()
+            try:
+                size = os.path.getsize(os.path.join(BACKUP_DIR, name))
+            except OSError:
+                continue
+            items.append({"name": name, "label": BACKUP_LABELS.get(label, label), "size": size,
+                          "time": datetime.strptime(stamp, "%Y%m%d-%H%M%S").strftime(TIME_FORMAT)})
+        self._json(200, {"success": True, "backups": items, "keep": BACKUP_KEEP, "directory": BACKUP_DIR},
+                   extra=[("Cache-Control", "no-store")])
 
     def _h_import_students(self, sess, data):
         students = data.get("students", [])
@@ -4185,6 +4479,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         payload = {"success": True, "locked": locked, "changed": changed, "request_id": request_id}
         if event_id:
             payload["event_id"] = event_id
+            if locked:
+                try:
+                    payload["backup"] = snapshot_database("locked")
+                except (OSError, sqlite3.Error) as exc:
+                    log.error("锁定后自动备份失败: %s", exc)
         self._json(200, payload)
 
     def _h_delete_student(self, sess, data):
@@ -4253,6 +4552,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                               extra=[("Retry-After", "2")])
         session_lock = None
         try:
+            if self._snapshot_before("before-delete-students") is None:
+                return
             try:
                 session_lock = RG.session_begin_mutation("student")
                 if not session_lock:
@@ -4341,6 +4642,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
                               extra=[("Retry-After", "2")])
         try:
+            if self._snapshot_before("before-delete-clubs") is None:
+                return
             with DB_POOL.connection() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
@@ -4438,4 +4741,12 @@ def main():
 
 
 if __name__ == "__main__":
+    arguments = sys.argv[1:]
+    if arguments == ["reset-admin-password"]:
+        sys.exit(cli_reset_admin_password())
+    if len(arguments) == 2 and arguments[0] == "restore":
+        sys.exit(cli_restore(arguments[1]))
+    if arguments:
+        print("用法：python3 main.py [reset-admin-password | restore 备份文件]")
+        sys.exit(2)
     main()

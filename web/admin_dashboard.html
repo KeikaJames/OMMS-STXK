@@ -13,7 +13,7 @@
 <script src="/js/legacy.js?v=18" defer></script>
 <script src="/js/common.js?v=18" defer></script>
 <script src="/js/club-art.js?v=1" defer></script>
-<script src="/js/admin.js?v=22" defer></script>
+<script src="/js/admin.js?v=23" defer></script>
 </head>
 <body>
 <div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
@@ -155,6 +155,11 @@
       <div id="adjust-body"><p class="hint">读取中</p></div>
     </article>
 
+    <article class="card danger-card" data-pane="overview-clear" hidden>
+      <div class="pane-head"><h2>清空报名</h2><p>删除全部报名记录，学生账号和社团保留，用于演练后重新开放或下一轮选课。名单锁定后可以清空，清空前自动备份。</p></div>
+      <div id="clear-body"><p class="hint">读取中</p></div>
+    </article>
+
     <article class="card" data-pane="overview-exports" hidden>
       <div class="pane-head"><h2>导出</h2><p>报名表含总表、各社团名单和未报名名单，“方式”一列区分自选、调剂和管理员安排。</p></div>
       <div class="table-wrap">
@@ -175,6 +180,13 @@
       <p class="hint" id="lock-state">读取中</p>
       <div class="field"><label for="lock-reason">原因（记入操作记录）</label><input class="input" id="lock-reason" maxlength="200" placeholder="例如：报名截止"></div>
       <div class="actions"><button class="btn btn-secondary" id="toggle-lock" type="button">锁定名单</button></div>
+    </article>
+
+    <article class="card" data-pane="settings-backup" hidden>
+      <div class="pane-head"><h2>备份</h2><p>完整备份包含数据库和社团照片，下载后保存到另一台电脑。名单锁定时，以及调剂、清空报名、清空学生、清空社团之前，系统自动保存数据库快照。</p></div>
+      <div class="actions"><a class="btn btn-primary" href="/api/admin/backup">下载完整备份</a></div>
+      <div class="table-wrap"><table class="tbl" id="backup-tbl"><tbody><tr><td>读取中</td></tr></tbody></table></div>
+      <p class="hint" id="backup-note"></p>
     </article>
 
     <article class="card" data-pane="settings-security" hidden>

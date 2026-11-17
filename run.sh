@@ -2,6 +2,8 @@
 # 一键编排：Redis + Python(:2001) + Rust(:2002) + nginx(:8080)，macOS 与 Linux 通用。
 #   bash run.sh                      启动；已在运行时平滑重启
 #   bash run.sh stop                 停止
+#   bash run.sh reset-admin          重置管理员密码，新密码只输出一次
+#   bash run.sh restore 备份文件      停止服务，从完整备份（.zip）或数据库快照（.db）恢复后重新启动
 #   OMMS_PYTHON_ONLY=1 bash run.sh   不编译 Rust，由 Python 服务全部接口
 # 没有 cargo、Rust 版本过旧或首次编译失败时，自动改用只运行 Python 的模式。
 set -o pipefail
@@ -93,6 +95,20 @@ if [ "${1:-}" = "stop" ]; then
     stop_all
     say "[stop] 已停止"
     exit 0
+fi
+if [ "${1:-}" = "reset-admin" ]; then
+    exec "$PYTHON" "$DIR/main.py" reset-admin-password
+fi
+if [ "${1:-}" = "restore" ]; then
+    if [ ! -f "${2:-}" ]; then
+        say "[restore] 用法：bash run.sh restore 备份文件"
+        exit 1
+    fi
+    stop_all
+    if ! "$PYTHON" "$DIR/main.py" restore "$2"; then
+        say "[restore] 未恢复，服务保持停止；重新启动：bash run.sh"
+        exit 1
+    fi
 fi
 
 # ---- 预检：在旧服务仍在线时完成，失败不影响旧服务 ----
