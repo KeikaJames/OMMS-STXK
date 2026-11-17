@@ -71,14 +71,24 @@
 
 ## 备份与恢复
 
-- **自动快照**：名单锁定时，以及调剂、清空报名、清空学生、清空社团之前，用 SQLite 备份接口把数据库复制到 `BACKUP_DIR`，文件名为 `年月日-时分秒-原因.db`，保留最近 `BACKUP_KEEP` 份。危险操作的快照失败时，操作不执行。
-- **完整备份**：`GET /api/admin/backup` 返回 zip，内含 `club_system.db`；`?name=` 下载指定的自动快照。
-- **恢复**：`bash run.sh restore 文件` 先停止服务，再由 `main.py restore` 校验文件（`integrity_check` 和四张数据表），把当前数据库存为 `before-restore` 快照，复制备份中的数据库。随后删除本系统在 Redis 中的全部键，服务启动时按 SQLite 重新发布名额，原有会话失效。
-- **管理员密码**：`bash run.sh reset-admin` 生成新密码、写入哈希、使管理员会话失效，并记入操作记录。
+- **自动快照**：名单锁定时，以及调剂、清空报名、清空学生、清空社团、恢复之前，用 SQLite 备份接口把数据库复制到 `BACKUP_DIR`，文件名为 `年月日-时分秒-原因.db`（同一秒内重名时加序号），保留最近 `BACKUP_KEEP` 份。危险操作的快照失败时，操作不执行。
+- **完整备份**：`GET /api/admin/backup` 返回 zip，内含 `club_system.db` 和 `club-images/` 下的社团图片；`?name=` 下载指定的自动快照。
+- **在线恢复**：`POST /api/admin/restore`（参数 `name`，自动快照）或 `POST /api/admin/restore_upload`（请求体为 zip 或 SQLite 文件）。先校验文件（`integrity_check` 和四张数据表），取得全局维护标记，把当前数据库存为 `before-restore` 快照，再用 SQLite 备份接口整库替换；删除旧库的触发器与视图后按当前版本重建表结构，保留当前管理员账号与密码，zip 备份同时写回社团图片。随后吊销全部学生会话，按 SQLite 重新发布名额与报名镜像。
+- **管理员密码**：明文保存在数据库旁的 `admin-password.txt`（0600）。`main.py admin-login 地址` 核对该文件与数据库中的哈希，不一致或文件缺失时生成新密码；随后签发 2 分钟有效、只能使用一次的登录令牌。`run.sh` 每次启动调用它，打印账号、密码和登录链接。`GET /admin/login?token=` 只接受本机回环地址，校验令牌后签发管理员会话并跳转到控制台。控制台修改密码时同步写入该文件。
+
+## 名单导入
+
+`sheets.py` 只用标准库读取表格：xlsx（拒绝 DOCTYPE 与实体声明，限制解压大小）、xls（复合文档 + BIFF8，处理共享字符串跨记录、合并单元格、公式结果）、csv（BOM、UTF-8、GB18030，自动识别分隔符）、网页表格和 XML 表格 2003。
+
+`POST /api/admin/import/parse` 接收原始文件，逐个工作表定位含“姓名”的表头行，班级取自“班级”列，或“年级”与“班号”两列拼接；该列为空时依次取班级标题行、工作表名（如“高二3班”）、上一行，并逐行标注：缺少班级、姓名有误、班级沿用上一行、班级取自工作表名、同班同名；合计、小计行跳过。数据库中已有同名同班学生的行标注“已导入”。接口只返回结果，不写数据库。
+
+管理员在核对页改正后，前端按每批 200 人调用 `POST /api/import_students`，汇总各批返回的明文密码，再调用 `POST /api/admin/accounts_workbook` 生成账号表。明文密码只出现在这两次响应和浏览器内存里，数据库只存哈希。
 
 ## 导出
 
-`GET /api/export_workbook` 生成 Excel 报名表（只用标准库）：总表、每个社团一张表、未报名名单（有未报名学生时）。所有单元格按文本写入，学号前导零原样保留。“方式”一列由操作代际得出：`adjust-` 为调剂，`admin-` 为管理员安排，其余为自选。CSV 导出（报名总表、未报名名单、单个社团名单、学生账号表）使用同样的列，文件名为中文，同时附带 ASCII 备用名。
+`GET /api/export_workbook` 生成 Excel 报名表（只用标准库）：总表、每个社团一张表、未报名名单（有未报名学生时）。所有单元格按文本写入。“方式”一列由操作代际得出：`adjust-` 为调剂，`admin-` 为管理员安排，其余为自选。CSV 导出（报名总表、未报名名单、单个社团名单、学生账号表）使用同样的列，文件名为中文，同时附带 ASCII 备用名。
+
+账号表（`accounts_xlsx`）按班级自然顺序排列，表头为姓名、班级、账号、密码；每行 32 磅高、加框线，每个班级从新的一页开始，打印时每页重复表头、按页宽缩放。
 
 ## 工作台流程
 
@@ -125,6 +135,7 @@
 ## 会话与登录
 
 - 会话保存在 `sess:{token}`，Cookie 为 HttpOnly、SameSite=Strict，`COOKIE_SECURE=1` 时加 Secure。
+- 所有 POST 请求要求 `X-Requested-With: XMLHttpRequest`，Python 与 Rust 两个服务都在路由前检查，缺少时返回 403。跨站表单无法设置这个请求头，旧浏览器不支持 SameSite 时同样有效。
 - 修改密码、重置密码、删除学生时提升该账号的会话代际，旧会话随之失效。
 - 口令使用 Argon2id，参数可配置。哈希集中在 `AUTH_CONCURRENCY` 个专用线程里按到达顺序计算，同时占用的内存不超过线程数 × `ARGON2_MEMORY_KIB`。
 - 排队请求数达到 `AUTH_QUEUE`，或按最近耗时估算要等 8 秒以上时，新的登录请求立即得到 503 `login_queued`。服务器按单次校验的耗时给这些请求依次约定回来的时间，写在 `Retry-After` 里，回来时队列正好有空位。登录页按这个时间自动重试，最长 2 分钟。
@@ -159,13 +170,16 @@
 
 - 没有 cargo、Rust 版本过旧或首次编译失败时，`run.sh` 只运行 Python 服务，nginx 配置去掉 Rust 上游和到 Python 的长连接，Python 的线程只在处理请求时占用。也可以用 `OMMS_PYTHON_ONLY=1` 指定。接口与 Rust 版本一致。
 - 编译 Rust 时按内存决定并行数，每个编译进程按 1 GB 计。
-- Python 服务启动时只加载必需的模块：pypinyin 在导入学生时加载，并且只加载单字表。空闲内存约 62 MB。
+- Python 服务启动时只加载必需的模块：pypinyin 在导入学生时加载，并且只加载单字表；Pillow 在上传社团图片时加载。空闲内存约 62 MB。
 - `ARGON2_MEMORY_KIB`、`AUTH_CONCURRENCY`、`MAX_HTTP_WORKERS`、`DB_POOL_SIZE` 按内存和核数下调。
 - Rust 从连接池取 Redis 连接最多等 1 秒（`REDIS_POOL_WAIT_MS`），建立和校验连接按 `REDIS_TIMEOUT`；Redis 稍慢时请求继续等待。
 - `SQLITE_SYNCHRONOUS=NORMAL` 配合 WAL；数据盘较慢时同样适用。
 - `deploy/redis.conf` 关闭持久化、限制 256 MB 内存并使用 `noeviction`，名额以 SQLite 为准，重启后自动重建。
 - `run.sh` 每次启动保留上一次的服务日志（`python.log.1`、`rust.log.1`），访问日志超过 64 MB 时换新文件。
-- 前端为原生 HTML、CSS、JS；登录页与工作台插画为 WebP（单张 21–56 KB），社团默认插图和管理端图标为内嵌 SVG。页面使用纯色顶栏和小范围阴影，适合集成显卡。
+- 前端为原生 HTML、CSS 和 ES5 脚本，`tools/check_es5.js` 按 ES5 语法解析全部脚本；`common.js` 补齐 Promise、`Object.assign`、`find`、`closest` 等接口，请求用 XHR，下载在 IE 上用 `msSaveOrOpenBlob`。`tools/css_fallbacks.py` 为每条使用 CSS 变量的声明生成固定颜色的回退样式（`app-fallback.css`，先于 `app.css` 加载）；布局以 flexbox 为主，网格放在 `@supports` 内。
+- 登录页插画为 WebP，社团默认插图和管理端图标为内嵌 SVG。页面使用纯色顶栏和小范围阴影，适合集成显卡。
+- 带版本号的脚本与样式由 nginx 缓存 7 天，页面每次重新校验。
+- 社团图片上传后按 EXIF 方向摆正，缩到长边 960 像素，带透明通道的存 PNG，其余存 JPEG（质量 82），每张约 70–160 KB；文件名随每次上传变化，响应带一年的 `immutable` 缓存。
 - 管理端工作台比较服务器与管理员电脑的时钟，相差超过一分钟时提示校准。
 
 `tests/stress_site.py` 用来在目标机器上测量登录高峰、抢课和轮询，见 [tests/README.md](../tests/README.md)。

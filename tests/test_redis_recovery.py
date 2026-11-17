@@ -130,7 +130,8 @@ def http_json(port: int, method: str, path: str, *, token: str | None = None,
     if token:
         headers["Cookie"] = f"session={token}"
     if method == "POST":
-        headers.update({"Content-Type": "application/json", "Content-Length": str(len(encoded))})
+        headers.update({"Content-Type": "application/json", "Content-Length": str(len(encoded)),
+                        "X-Requested-With": "XMLHttpRequest"})
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10.0)
     try:
         conn.request(method, path, body=encoded if method == "POST" else None, headers=headers)

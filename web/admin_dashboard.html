@@ -9,200 +9,191 @@
 <meta name="theme-color" content="#F4EFE6">
 <title>管理控制台 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=23">
-<script src="/js/legacy.js?v=18" defer></script>
-<script src="/js/common.js?v=18" defer></script>
-<script src="/js/club-art.js?v=2" defer></script>
-<script src="/js/admin.js?v=27" defer></script>
+<link rel="stylesheet" href="/app-fallback.css?v=1">
+<link rel="stylesheet" href="/app.css?v=24">
+<script src="/js/legacy.js?v=19" defer></script>
+<script src="/js/common.js?v=20" defer></script>
+<script src="/js/club-art.js?v=4" defer></script>
+<script src="/js/admin.js?v=29" defer></script>
+<script src="/easter-egg.js?v=1" defer></script>
 </head>
 <body>
-<div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
+<div class="legacy-note" id="legacy" hidden>请使用 IE11、Edge 或 Chrome，或将浏览器切换到极速模式。</div>
 <a class="skip" href="#main">跳到主内容</a>
 <header class="topbar">
-  <a class="brand" href="/admin/dashboard"><img src="/img/school-emblem.webp" alt="" width="34" height="34"><span><b>管理控制台</b><small>鄂尔多斯市实验中学</small></span></a>
-  <nav class="topnav" aria-label="管理操作">
-    <button id="open-settings" type="button">设置</button>
-    <button id="logout" type="button">退出</button>
-  </nav>
+  <div class="brand"><img src="/img/school-emblem.webp" alt="" width="32" height="32"><span><b>管理控制台</b><small>鄂尔多斯市实验中学</small></span></div>
+  <button class="btn btn-plain btn-small" id="logout" type="button">退出</button>
 </header>
 
-<main class="page" id="main">
-  <div class="admin-head">
-    <div>
-      <h1><button id="home-trigger" type="button">工作台</button></h1>
-    </div>
-    <nav class="admin-nav" id="seg" aria-label="一级菜单">
-      <button data-v="students" data-pane="students-import" type="button"><svg class="nav-icon" viewBox="0 0 120 80" width="82" height="54" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M49.2 8.6 L75.4 7 L87 18 L86.5 63.8 L50.2 65.3Z"/><path d="M75.4 7 L76 18.4 L87 18"/><path d="M69.1 52.2 L68.7 27"/><path d="M60.2 35.4 L68.7 26.4 L77 35"/><path d="M59.7 56.9 C64.9 58.1 72.3 58.1 77.6 56.7"/><path class="knock" d="M39.1 62.7 L35.3 70.9 C39.1 72.8 44.8 73 48.5 71.1 L51.1 64.2Z"/><path class="knock" d="M52.7 41.9 C45.6 39.6 36.6 40.8 34.7 46.5 C33 51.6 33.4 57.7 37 61.4 C41 65.4 48.1 65.6 52.5 62.9 L54.6 49.2 C59.3 48.4 63.3 46.3 62.8 42.9 C62.4 39.8 58 39.2 52.7 41.9Z"/><path d="M34.9 48.6 C38 48.6 41 49 43.3 49.7"/><path d="M34.5 54.3 C37.8 54.5 41 54.9 43.5 55.6"/><path d="M36.1 59.8 C39.1 60.2 41.8 60.6 44.1 61.2"/></svg><span>导入学生</span></button>
-      <button data-v="students" data-pane="students-accounts" type="button"><svg class="nav-icon" viewBox="0 0 120 80" width="82" height="54" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M28.4 8.2 C48.3 7.1 71.4 7 91.5 7.9 L92.5 58 C71.4 58.7 48.3 58.9 27.5 58.2Z"/><circle cx="59.9" cy="26.5" r="7.7"/><path d="M56.3 33.3 L52.9 45.8 L67.1 45.6 L63.6 33.3"/><path d="M18.1 62.5 C45.7 61.6 74 61.6 101.6 62.3 C104.8 62.6 105.2 65.7 102.8 68.5 C100.4 71.3 96.6 72.9 91.3 72.9 L28.8 73 C23.4 72.9 19.6 71.3 17.2 68.6 C14.8 65.8 15.3 62.7 18.1 62.5Z"/></svg><span>账号发放</span></button>
-      <button data-v="clubs" data-pane="clubs-cards" type="button"><svg class="nav-icon" viewBox="0 0 120 80" width="82" height="54" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M13.1 8.3 C31.7 7.3 50.9 7 70.9 7.8 L72 72 C52.2 72.9 33 73 13.7 72.2Z"/><path d="M25.3 53.2 L25.8 20.5"/><path d="M25.8 21.1 C33 19.3 39.4 24.7 47.1 21.9 L46.6 37 C39.4 39.7 33 34.5 25.7 36.3"/><path d="M25.3 61.6 L53.5 61.2"/><path class="knock" d="M99.1 11.4 L106.9 19.1 L69.7 56.1 L59.2 59.1 L62 48.5Z"/><path d="M93.3 17.1 L101.2 24.8"/><path d="M62 48.5 L69.7 56.1"/></svg><span>社团管理</span></button>
-      <button data-v="overview" data-pane="overview-summary" type="button"><svg class="nav-icon" viewBox="0 0 120 80" width="82" height="54" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 73 C43.7 72.1 76.1 72.1 108 72.9"/><path d="M22.8 71.9 L22.7 51.5 L36.2 51.3 L36.4 71.9"/><path d="M47 71.9 L46.7 37 L60.2 36.8 L60.5 71.9"/><path d="M71.1 71.9 L70.9 43.6 L84.5 43.4 L84.8 71.9"/><path d="M19.4 35.5 C32.9 30.1 49.1 18.6 59.9 17.3 C70.7 15.9 78.8 22.7 97.7 7.8"/><path d="M87.6 7.3 L98.5 7 L97.7 17.8"/></svg><span>报名数据</span></button>
+<div class="shell">
+  <aside class="sidebar">
+    <nav id="nav" aria-label="功能">
+      <button type="button" data-view="home"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg><span>工作台</span></button>
+      <button type="button" data-view="students"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="3.8"/><path d="M4.5 20.5c.6-3.9 3.7-6.5 7.5-6.5s6.9 2.6 7.5 6.5"/></svg><span>学生</span></button>
+      <button type="button" data-view="clubs"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5.5 21V3.5"/><path d="M5.5 4.5h12l-2.5 4.5 2.5 4.5h-12"/></svg><span>社团</span></button>
+      <button type="button" data-view="registration"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 3h6v2.5H9z"/><path d="M8.5 11.5l2 2 4.5-4.5"/><path d="M8.5 17h7"/></svg><span>报名</span></button>
+      <button type="button" data-view="settings"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2.2"/><circle cx="9" cy="17" r="2.2"/></svg><span>设置</span></button>
     </nav>
-  </div>
+  </aside>
 
-  <nav class="subnav" id="subnav" aria-label="二级菜单" hidden></nav>
-
-  <section data-view="home" id="view-home">
-    <div class="home-grid">
-      <article class="card home-banner">
-        <div>
-          <p class="eyebrow">报名状态</p>
-          <h2 id="home-phase">读取中</h2>
-          <p class="hint" id="home-phase-detail"></p>
-          <p class="clock-warn" id="home-clock" role="status" hidden></p>
-          <div class="actions"><button class="btn btn-secondary btn-sm" type="button" data-home-route="settings:settings-registration">开放时间与锁定</button></div>
-        </div>
-        <img src="/img/admin-desk.webp" alt="" width="960" height="540" decoding="async">
-      </article>
-      <article class="card home-flow">
-        <h2>流程</h2>
-        <ol class="flow" id="home-flow"><li class="todo"><span class="mark" aria-hidden="true">1</span><div><b>读取中</b></div></li></ol>
-      </article>
-      <article class="card home-card">
-        <h2>报名进度</h2>
-        <div id="home-project-list"><p class="hint">读取中</p></div>
-        <div class="actions"><button class="btn btn-secondary btn-sm" type="button" data-home-route="overview:overview-summary">查看全部</button></div>
-      </article>
+  <main class="content" id="main">
+    <div class="content-head">
+      <h1 id="view-title" tabindex="-1">工作台</h1>
+      <div class="segmented" id="tabs" role="tablist" aria-label="分区" hidden></div>
     </div>
-  </section>
 
-  <section data-view="students" id="view-students" hidden>
-    <article class="card" data-pane="students-import">
-      <div class="pane-head"><h2>导入学生</h2><p>为每名学生创建登录账号；初始密码在“账号发放”中下载。</p></div>
-      <ol class="steps" aria-label="导入流程"><li><b>1</b>粘贴名单</li><li><b>2</b>核对列</li><li><b>3</b>创建账号</li><li><b>4</b>下载发放</li></ol>
-      <div class="field">
-        <label for="imp-stu">学生名单</label>
-        <p class="hint">从 Excel 复制粘贴，或用逗号、Tab 分隔；首行可为表头。</p>
-        <textarea class="input" id="imp-stu" rows="8" spellcheck="false" placeholder="姓名&#9;班级&#9;学号&#10;巴特尔&#9;高一1班&#9;20260001"></textarea>
+    <section data-view="home" hidden>
+      <article class="card status-card">
+        <p class="eyebrow">报名状态</p>
+        <h2 id="home-phase">读取中</h2>
+        <p class="hint" id="home-detail" hidden></p>
+        <p class="note" id="home-clock" role="status" hidden></p>
+        <div class="actions"><button class="btn btn-small" type="button" data-go="settings/time">时间设置</button></div>
+      </article>
+      <div class="home-columns">
+        <article class="card wide"><h2>流程</h2><ol class="flow" id="home-flow"></ol></article>
+        <article class="card"><h2>报名进度</h2><div id="home-fill"><p class="hint">读取中</p></div></article>
       </div>
-      <div id="imp-stu-preview" hidden></div>
-      <p class="hint" id="imp-stu-check" aria-live="polite">粘贴后显示识别结果。</p>
-      <div class="actions"><button class="btn btn-primary" id="imp-stu-go" type="button" disabled>创建账号</button></div>
-      <div class="progress" id="imp-stu-progress" hidden><div class="meter"><i></i></div><p class="hint" id="imp-stu-progress-text"></p></div>
-      <p class="hint" id="imp-stu-result" aria-live="polite"></p>
-    </article>
+    </section>
 
-    <article class="card" data-pane="students-list" hidden>
-      <div class="pane-head"><h2>学生名单</h2><p>在“管理”中修改学生信息、调整社团或重置密码，修改记入操作记录。</p></div>
-      <div class="toolbar">
-        <label class="sr-only" for="stu-search">查找学生</label>
-        <input class="input" id="stu-search" type="search" placeholder="按姓名、班级、学号、账号或社团查找" autocomplete="off">
-      </div>
-      <p class="hint" id="stu-count" aria-live="polite"></p>
-      <div class="table-wrap"><table class="tbl" id="stu-tbl"><tbody><tr><td>读取中</td></tr></tbody></table></div>
-    </article>
+    <section data-view="students" hidden>
+      <article class="card" data-pane="list">
+        <div class="toolbar">
+          <input class="input" id="stu-search" type="search" placeholder="搜索姓名、班级、账号或社团" aria-label="搜索学生" autocomplete="off">
+          <span class="hint" id="stu-count" aria-live="polite"></span>
+        </div>
+        <div class="table-wrap"><table class="tbl" id="stu-tbl"><tbody><tr><td class="empty">读取中</td></tr></tbody></table></div>
+        <div class="pager" id="stu-pager" hidden></div>
+      </article>
 
-    <article class="card" data-pane="students-accounts" hidden>
-      <div class="pane-head"><h2>账号发放</h2><p>新建账号和重置后的密码只保存在当前页面，可下载账号密码表或打印账号条。</p></div>
-      <div id="imp-stu-out" aria-live="polite"></div>
-      <hr>
-      <h3>按班重置密码</h3>
-      <p class="hint">为所选班级的全部学生生成新密码，原密码失效，已登录的学生需重新登录。</p>
-      <div class="row2">
-        <div class="field"><label for="reset-class">班级</label><select class="input" id="reset-class"></select></div>
-        <div class="field"><label for="reset-class-reason">原因（记入操作记录）</label><input class="input" id="reset-class-reason" maxlength="200" placeholder="例如：账号条遗失"></div>
-      </div>
-      <div class="actions"><button class="btn btn-secondary" id="reset-class-go" type="button">重置该班密码</button></div>
-    </article>
+      <article class="card" data-pane="import">
+        <div class="dropzone" id="dropzone">
+          <svg viewBox="0 0 48 48" aria-hidden="true" focusable="false"><path d="M13 5h15l10 10v28H13z"/><path d="M28 5v10h10"/><path d="M25.5 36V22"/><path d="M19.5 28l6-6 6 6"/></svg>
+          <h2>上传名单</h2>
+          <p class="hint">表头含“姓名”“班级”的 Excel 或 CSV 表格，可拖到此处</p>
+          <div class="actions"><button class="btn btn-primary" id="roster-pick" type="button">选择表格</button></div>
+          <input class="sr-only" id="roster-file" type="file" accept=".xlsx,.xls,.csv,.txt,.xml,.htm,.html" tabindex="-1" aria-hidden="true">
+        </div>
+      </article>
 
-    <article class="card danger-card" data-pane="students-danger" hidden>
-      <div class="pane-head"><h2>清空学生</h2><p>删除全部学生、账号和报名记录，社团保留。删除前请下载报名表。</p></div>
-      <div class="actions"><button class="btn btn-danger" id="del-all-stu" type="button">清空全部学生</button></div>
-    </article>
-  </section>
+      <article class="card" data-pane="accounts">
+        <div class="row-head"><h2>新账号</h2><div class="actions" id="cred-actions"></div></div>
+        <div id="cred-box"></div>
+      </article>
+      <article class="card" data-pane="accounts">
+        <h2>按班重置密码</h2>
+        <div class="form-row">
+          <div class="field"><label for="reset-class">班级</label><select class="input" id="reset-class"></select></div>
+          <div class="field"><label for="reset-class-note">备注（可选）</label><input class="input" id="reset-class-note" maxlength="200"></div>
+        </div>
+        <div class="actions"><button class="btn btn-destructive" id="reset-class-go" type="button" disabled>重置</button></div>
+      </article>
+    </section>
 
-  <section data-view="clubs" id="view-clubs" hidden>
-    <article data-pane="clubs-cards">
-      <div class="pane-head"><h2>社团</h2><p>编辑社团名称、名额、简介、时间地点和报名范围。</p></div>
-      <div class="project-grid" id="club-list"><div class="sk"></div></div>
-    </article>
+    <section data-view="clubs" hidden>
+      <div data-pane="cards"><div class="club-grid admin-clubs" id="club-list"><div class="sk"></div><div class="sk"></div><div class="sk"></div></div></div>
+      <article class="card" data-pane="add">
+        <h2>添加社团</h2>
+        <form id="club-add" novalidate>
+          <div class="form-row">
+            <div class="field"><label for="club-add-name">名称</label><input class="input" id="club-add-name" maxlength="80" autocomplete="off"></div>
+            <div class="field"><label for="club-add-max">人数上限</label><input class="input" id="club-add-max" type="number" min="1" max="10000" step="1"></div>
+          </div>
+          <p class="error" id="club-add-error" role="alert"></p>
+          <div class="actions"><button class="btn btn-primary" id="club-add-go" type="submit">添加</button></div>
+        </form>
+      </article>
+    </section>
 
-    <article class="card" data-pane="clubs-import" hidden>
-      <div class="pane-head"><h2>批量添加社团</h2><p>每行一个社团：名称和人数上限，用逗号或 Tab 分隔。</p></div>
-      <div class="field">
-        <label for="imp-club">社团列表</label>
-        <textarea class="input" id="imp-club" rows="6" spellcheck="false" placeholder="3D打印,40&#10;传媒,40&#10;木工,40"></textarea>
-      </div>
-      <div class="actions"><button class="btn btn-primary" id="imp-club-go" type="button">添加社团</button></div>
-      <p class="hint" id="imp-club-out" aria-live="polite"></p>
-    </article>
-  </section>
+    <section data-view="registration" hidden>
+      <article class="card" data-pane="overview">
+        <p class="hint" id="ov-time">读取中</p>
+        <div class="metrics">
+          <div class="metric"><small>学生</small><b class="num" id="m-students">—</b></div>
+          <div class="metric"><small>已报名</small><b class="num" id="m-reg">—</b></div>
+          <div class="metric"><small>未报名</small><b class="num" id="m-unreg">—</b></div>
+          <div class="metric"><small>报名率</small><b class="num" id="m-rate">—</b></div>
+          <div class="metric"><small>社团</small><b class="num" id="m-clubs">—</b></div>
+        </div>
+        <div id="ov-fill"></div>
+      </article>
 
-  <section data-view="overview" id="view-overview" hidden>
-    <article data-pane="overview-summary">
-      <div class="pane-head"><h2>报名概览</h2><p id="ov-time"></p></div>
-      <div class="metrics">
-        <div class="metric"><small>社团</small><b class="num" id="m-clubs">—</b></div>
-        <div class="metric"><small>学生</small><b class="num" id="m-students">—</b></div>
-        <div class="metric"><small>已报名</small><b class="num" id="m-reg">—</b></div>
-        <div class="metric"><small>未报名</small><b class="num" id="m-unreg">—</b></div>
-        <div class="metric"><small>报名率</small><b class="num" id="m-rate">—</b></div>
-      </div>
-      <div class="table-wrap" id="ov-fill"><p class="empty">读取中</p></div>
-    </article>
+      <article class="card" data-pane="adjust"><div id="adjust-body"><p class="hint">读取中</p></div></article>
 
-    <article class="card" data-pane="overview-audit" hidden>
-      <div class="pane-head"><h2>操作记录</h2><p>按时间记录管理操作和学生的报名、退选。</p></div>
-      <div class="chips" id="audit-scope" role="group" aria-label="记录范围">
-        <button class="chip" type="button" data-role="admin" aria-pressed="true">管理操作</button>
-        <button class="chip" type="button" data-role="student" aria-pressed="false">学生报名</button>
-        <button class="chip" type="button" data-role="" aria-pressed="false">全部</button>
-      </div>
-      <div class="table-wrap audit-wrap"><table class="tbl" id="audit-tbl"><tbody><tr><td>读取中</td></tr></tbody></table></div>
-      <div class="actions"><button class="btn btn-secondary btn-sm" id="audit-more" type="button" hidden>加载更早的记录</button></div>
-    </article>
+      <article class="card" data-pane="export">
+        <ul class="list">
+          <li><span><b>报名表</b><small>Excel · 总表、各社团名单、未报名名单</small></span><a class="btn btn-small" href="/api/export_workbook">下载</a></li>
+          <li><span><b>报名总表</b><small>CSV</small></span><a class="btn btn-small" href="/api/export_all_data">下载</a></li>
+          <li><span><b>未报名名单</b><small>CSV</small></span><a class="btn btn-small" href="/api/export_unregistered">下载</a></li>
+          <li><span><b>学生账号</b><small>CSV · 姓名、班级、账号</small></span><a class="btn btn-small" href="/api/export_students_csv">下载</a></li>
+        </ul>
+      </article>
 
-    <article class="card" data-pane="overview-adjust" hidden>
-      <div class="pane-head"><h2>调剂</h2><p>名单锁定后，将未报名的学生随机安排到有空余名额的社团，遵守各社团的年级和班级范围。</p></div>
-      <div id="adjust-body"><p class="hint">读取中</p></div>
-    </article>
+      <article class="card" data-pane="audit">
+        <div class="segmented" id="audit-scope" role="group" aria-label="范围">
+          <button type="button" data-role="admin" aria-pressed="true">管理</button>
+          <button type="button" data-role="student" aria-pressed="false">学生</button>
+          <button type="button" data-role="" aria-pressed="false">全部</button>
+        </div>
+        <div class="table-wrap audit-wrap"><table class="tbl" id="audit-tbl"><tbody><tr><td class="empty">读取中</td></tr></tbody></table></div>
+        <div class="actions"><button class="btn btn-small" id="audit-more" type="button" hidden>更多</button></div>
+      </article>
+    </section>
 
-    <article class="card danger-card" data-pane="overview-clear" hidden>
-      <div class="pane-head"><h2>清空报名</h2><p>删除全部报名记录，学生账号和社团保留，用于演练后重新开放或下一轮选课。名单锁定后可以清空，清空前自动备份。</p></div>
-      <div id="clear-body"><p class="hint">读取中</p></div>
-    </article>
+    <section data-view="settings" hidden>
+      <article class="card" data-pane="time">
+        <h2>开放时间</h2>
+        <form id="time-form" novalidate>
+          <div class="form-row">
+            <div class="field"><label for="open-at">开放</label><input class="input" id="open-at" type="datetime-local"></div>
+            <div class="field"><label for="close-at">截止（可选）</label><input class="input" id="close-at" type="datetime-local"></div>
+          </div>
+          <p class="hint">学校时间</p>
+          <p class="error" id="time-error" role="alert"></p>
+          <div class="actions"><button class="btn btn-primary" id="save-time" type="submit">存储</button><button class="btn btn-plain" id="clear-time" type="button" hidden>清除</button></div>
+        </form>
+      </article>
+      <article class="card" data-pane="time">
+        <div class="row-head"><h2>名单锁定</h2><span class="tag" id="lock-state">读取中</span></div>
+        <p class="hint" id="lock-detail" hidden></p>
+        <div class="actions"><button class="btn" id="toggle-lock" type="button" disabled>锁定名单</button></div>
+      </article>
 
-    <article class="card" data-pane="overview-exports" hidden>
-      <div class="pane-head"><h2>导出</h2><p>报名表含总表、各社团名单和未报名名单，“方式”一列区分自选、调剂和管理员安排。</p></div>
-      <div class="table-wrap">
-        <a class="export-row" href="/api/export_workbook"><span><strong>报名表</strong><small>Excel</small></span><span>下载</span></a>
-        <a class="export-row" href="/api/export_all_data"><span><strong>报名总表</strong><small>CSV</small></span><span>下载</span></a>
-        <a class="export-row" href="/api/export_unregistered"><span><strong>未报名名单</strong><small>CSV</small></span><span>下载</span></a>
-        <a class="export-row" href="/api/export_students_csv"><span><strong>学生账号表</strong><small>CSV · 姓名、班级、学号、用户名</small></span><span>下载</span></a>
-      </div>
-    </article>
-  </section>
+      <article class="card" data-pane="backup">
+        <ul class="list">
+          <li><span><b>完整备份</b><small>数据库与社团图片</small></span><a class="btn btn-primary btn-small" href="/api/admin/backup">下载</a></li>
+          <li><span><b>从文件恢复</b><small>完整备份或快照文件</small></span><button class="btn btn-small" id="restore-pick" type="button">选择文件</button></li>
+        </ul>
+        <input class="sr-only" id="restore-file" type="file" accept=".zip,.db" tabindex="-1" aria-hidden="true">
+      </article>
+      <article class="card" data-pane="backup">
+        <div class="row-head"><h2>自动快照</h2><span class="hint" id="backup-keep"></span></div>
+        <div class="table-wrap"><table class="tbl" id="backup-tbl"><tbody><tr><td class="empty">读取中</td></tr></tbody></table></div>
+      </article>
 
-  <section data-view="settings" id="view-settings" hidden>
-    <article class="card" data-pane="settings-registration">
-      <div class="pane-head"><h2>开放时间与名单锁定</h2><p>到开放时间后开放报名；未设置开放时间时，学生页显示“开放时间待定”。到截止时间或手动锁定后，报名与退选停止。</p></div>
-      <div class="row2">
-        <div class="field"><label for="open-at">开放时间（学校时间）</label><input class="input" id="open-at" type="datetime-local"></div>
-        <div class="field"><label for="close-at">截止时间（可不填）</label><input class="input" id="close-at" type="datetime-local"></div>
-      </div>
-      <div class="actions"><button class="btn btn-primary" id="save-time" type="button">保存时间</button><button class="btn btn-quiet" id="clear-time" type="button" hidden>清除开放时间</button></div>
-      <hr>
-      <p class="hint" id="lock-state">读取中</p>
-      <div class="field"><label for="lock-reason">原因（记入操作记录）</label><input class="input" id="lock-reason" maxlength="200" placeholder="例如：报名截止"></div>
-      <div class="actions"><button class="btn btn-secondary" id="toggle-lock" type="button">锁定名单</button></div>
-    </article>
+      <article class="card" data-pane="data">
+        <ul class="list" id="data-list">
+          <li><span><b>清空报名</b><small id="data-reg">读取中</small></span><button class="btn btn-destructive btn-small" id="clear-reg" type="button" disabled>清空</button></li>
+          <li><span><b>删除全部学生</b><small id="data-stu">读取中</small></span><button class="btn btn-destructive btn-small" id="delete-students" type="button" disabled>删除</button></li>
+          <li><span><b>删除全部社团</b><small id="data-clubs">读取中</small></span><button class="btn btn-destructive btn-small" id="delete-clubs" type="button" disabled>删除</button></li>
+        </ul>
+      </article>
 
-    <article class="card" data-pane="settings-backup" hidden>
-      <div class="pane-head"><h2>备份</h2><p>完整备份为数据库的压缩包，下载后保存到另一台电脑。名单锁定时，以及调剂、清空报名、清空学生、清空社团之前，系统自动保存数据库快照。</p></div>
-      <div class="actions"><a class="btn btn-primary" href="/api/admin/backup">下载完整备份</a></div>
-      <div class="table-wrap"><table class="tbl" id="backup-tbl"><tbody><tr><td>读取中</td></tr></tbody></table></div>
-      <p class="hint" id="backup-note"></p>
-    </article>
-
-    <article class="card" data-pane="settings-security" hidden>
-      <div class="pane-head"><h2>管理员密码</h2><p>修改后需重新登录。</p></div>
-      <div class="field"><label for="ap-cur">当前密码</label><input class="input" id="ap-cur" type="password" autocomplete="current-password"></div>
-      <div class="field"><label for="ap-new">新密码（至少 8 位）</label><input class="input" id="ap-new" type="password" autocomplete="new-password"></div>
-      <div class="actions"><button class="btn btn-primary" id="save-apw" type="button">修改密码</button></div>
-    </article>
-  </section>
-</main>
+      <article class="card" data-pane="password">
+        <h2>管理员密码</h2>
+        <form id="password-form" novalidate>
+          <div class="field"><label for="ap-cur">当前密码</label><input class="input" id="ap-cur" type="password" autocomplete="current-password"></div>
+          <div class="field"><label for="ap-new">新密码</label><input class="input" id="ap-new" type="password" autocomplete="new-password" minlength="8"></div>
+          <p class="hint">至少 8 位</p>
+          <p class="error" id="password-error" role="alert"></p>
+          <div class="actions"><button class="btn btn-primary" id="save-password" type="submit">存储</button></div>
+        </form>
+      </article>
+    </section>
+  </main>
+</div>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
-<footer class="foot">Designed by Gabiri · © Weilesi</footer>
+<footer class="foot">Designed by Gabiri</footer>
 </body>
 </html>

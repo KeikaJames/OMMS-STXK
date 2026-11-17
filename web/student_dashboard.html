@@ -9,22 +9,20 @@
 <meta name="theme-color" content="#F4EFE6">
 <title>社团报名 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=23">
-<script src="/js/legacy.js?v=18" defer></script>
-<script src="/js/common.js?v=18" defer></script>
-<script src="/js/club-art.js?v=2" defer></script>
-<script src="/js/student.js?v=22" defer></script>
+<link rel="stylesheet" href="/app-fallback.css?v=1">
+<link rel="stylesheet" href="/app.css?v=24">
+<script src="/js/legacy.js?v=19" defer></script>
+<script src="/js/common.js?v=20" defer></script>
+<script src="/js/club-art.js?v=4" defer></script>
+<script src="/js/student.js?v=24" defer></script>
+<script src="/easter-egg.js?v=1" defer></script>
 </head>
 <body>
-<div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
+<div class="legacy-note" id="legacy" hidden>请使用 IE11、Edge 或 Chrome，或将浏览器切换到极速模式。</div>
 <a class="skip" href="#main">跳到主内容</a>
 <header class="topbar">
-  <a class="brand" href="/student/dashboard"><img src="/img/school-emblem.webp" alt="" width="34" height="34"><span><b>社团选课</b><small>鄂尔多斯市实验中学</small></span></a>
-  <nav class="topnav" aria-label="主导航">
-    <a href="/student/dashboard" aria-current="page">选课</a>
-    <a href="/student/profile">我的</a>
-    <button id="logout" type="button">退出</button>
-  </nav>
+  <div class="brand"><img src="/img/school-emblem.webp" alt="" width="32" height="32"><span><b>社团选课</b><small>鄂尔多斯市实验中学</small></span></div>
+  <button class="btn btn-plain btn-small" id="logout" type="button">退出</button>
 </header>
 
 <main class="page" id="main">
@@ -36,7 +34,7 @@
   <section class="status" id="status" data-phase="loading" aria-live="polite">
     <div class="status-main">
       <strong><span class="dot" aria-hidden="true"></span><span id="status-title">读取中</span></strong>
-      <span id="status-detail"></span>
+      <span id="status-detail" hidden></span>
     </div>
     <div class="status-clock"><small id="clock-label">当前时间</small><span class="clock" id="clock">--:--:--</span></div>
   </section>
@@ -47,7 +45,7 @@
       <h2 id="mine-name"></h2>
       <p id="mine-meta"></p>
     </div>
-    <div class="mine-actions" id="mine-actions"></div>
+    <div class="actions" id="mine-actions"></div>
   </section>
 
   <section aria-label="社团">
@@ -59,6 +57,6 @@
 </main>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
-<footer class="foot">Designed by Gabiri · © Weilesi</footer>
+<footer class="foot">Designed by Gabiri</footer>
 </body>
 </html>

@@ -1,39 +1,33 @@
 'use strict';
 
-(() => {
-  // 登录人数多时服务器让请求排队，浏览器按服务器给出的秒数一直重试，最多等两分钟。
-  const QUEUE_WINDOW_MS = 120000;
-  let role = 'student';
-  const form = $('#login-form');
-  const submit = $('#login-submit');
-  const error = $('#login-error');
-  const wait = $('#login-wait');
+// 登录页：身份切换、开放时间、排队重试。人多时服务器让请求排队，浏览器按约定的秒数重试，最多等两分钟。
+(function () {
+  var QUEUE_WINDOW_MS = 120000;
+  var role = 'student';
+  var form = $('#login-form');
+  var submit = $('#login-submit');
+  var error = $('#login-error');
+  var wait = $('#login-wait');
 
-  // 开放与截止时间按学校时区的原始文本显示，与设备时区无关。
-  function schoolTime(text) {
-    const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(text || '');
-    return match ? Number(match[2]) + ' 月 ' + Number(match[3]) + ' 日 ' + match[4] + ':' + match[5] : '';
-  }
-
-  async function showSchedule() {
-    const result = await App.request('/api/check_registration_time');
-    const data = result.data;
+  App.request('/api/check_registration_time').then(function (result) {
+    var data = result.data;
     if (!result.ok || !data) return;
-    const until = data.end_time ? '，截止 ' + schoolTime(data.end_time) : '';
-    let text = '报名开放时间待定';
+    var until = data.end_time ? '，截止 ' + App.schoolTime(data.end_time) : '';
+    var text = '报名开放时间待定';
     if (data.registration_locked) text = '报名已截止';
     else if (data.can_register) text = '报名中' + until;
-    else if (data.start_time) text = '报名开放 ' + schoolTime(data.start_time) + until;
-    const line = $('#login-schedule');
+    else if (data.start_time) text = '报名开放 ' + App.schoolTime(data.start_time) + until;
+    var line = $('#login-schedule');
     line.textContent = text;
     line.hidden = false;
-  }
-  showSchedule();
+  });
 
-  $$('.seg button').forEach(button => {
-    button.addEventListener('click', () => {
-      role = button.dataset.role;
-      $$('.seg button').forEach(other => other.setAttribute('aria-pressed', String(other === button)));
+  $$('.segmented button').forEach(function (item) {
+    item.addEventListener('click', function () {
+      role = item.getAttribute('data-role');
+      $$('.segmented button').forEach(function (other) {
+        other.setAttribute('aria-pressed', String(other === item));
+      });
       $('#username').focus();
     });
   });
@@ -43,42 +37,42 @@
     return result.status === 429 && !(result.data && result.data.code === 'login_throttled');
   }
 
-  async function signIn() {
-    const username = $('#username').value.trim();
-    const password = $('#password').value;
-    if (!username || !password) {
-      error.textContent = '请输入用户名和密码';
-      return;
-    }
-    error.textContent = '';
-    const started = Date.now();
-    const path = role === 'student' ? '/api/login' : '/api/admin_login';
-    App.busy(submit, '登录中');
-    let result;
-    for (;;) {
-      result = await App.request(path, { method: 'POST', body: { username, password } });
-      if (!shouldWait(result) || Date.now() - started > QUEUE_WINDOW_MS) break;
+  function attempt(path, body, started) {
+    return App.request(path, { method: 'POST', body: body }).then(function (result) {
+      if (!shouldWait(result) || Date.now() - started > QUEUE_WINDOW_MS) return result;
+      App.busy(submit, null);
       App.busy(submit, '排队中');
       wait.hidden = false;
       wait.textContent = '排队中，已等待 ' + Math.round((Date.now() - started) / 1000) + ' 秒';
-      await new Promise(resolve => setTimeout(resolve, result.retryAfter * 1000 + Math.random() * 600));
-    }
-    wait.hidden = true;
-    App.busy(submit, null);
-    if (result.ok && result.data && result.data.success) {
-      location.href = role === 'student' ? '/student/dashboard' : '/admin/dashboard';
-      return;
-    }
-    if (result.status === 0) {
-      error.textContent = '网络连接中断';
-    } else {
-      error.textContent = (result.data && result.data.message) || '登录失败，请重试';
-    }
-    $('#password').select();
+      return new Promise(function (resolve) {
+        setTimeout(resolve, result.retryAfter * 1000 + Math.random() * 600);
+      }).then(function () {
+        return attempt(path, body, started);
+      });
+    });
   }
 
-  form.addEventListener('submit', event => {
+  form.addEventListener('submit', function (event) {
     event.preventDefault();
-    if (!submit.disabled) signIn();
+    if (submit.disabled) return;
+    var username = $('#username').value.replace(/^\s+|\s+$/g, '');
+    var password = $('#password').value;
+    if (!username || !password) {
+      error.textContent = '请输入账号和密码';
+      return;
+    }
+    error.textContent = '';
+    App.busy(submit, '登录中');
+    var path = role === 'student' ? '/api/login' : '/api/admin_login';
+    attempt(path, { username: username, password: password }, Date.now()).then(function (result) {
+      wait.hidden = true;
+      App.busy(submit, null);
+      if (result.ok && result.data && result.data.success) {
+        window.location.href = role === 'student' ? '/student/dashboard' : '/admin/dashboard';
+        return;
+      }
+      error.textContent = result.status === 0 ? '网络连接中断' : (result.data && result.data.message) || '登录未完成';
+      $('#password').select();
+    });
   });
 })();
