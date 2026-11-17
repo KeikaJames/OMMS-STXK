@@ -1,4 +1,4 @@
-// 浏览器缺少本站脚本所需的能力时（IE10 及更早版本）显示提示。只用 ES3 语法。
+// 按本站脚本所需的能力检查浏览器，需要时显示换用浏览器的提示。只用 ES3 语法。
 (function () {
   var root = document.documentElement;
   var capable = !!(window.JSON && window.XMLHttpRequest && document.querySelector && root.addEventListener &&

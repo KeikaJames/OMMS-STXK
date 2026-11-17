@@ -23,7 +23,7 @@ HEADER_SCAN_ROWS = 40
 
 
 class TableError(ValueError):
-    """文件无法读取；消息直接显示给管理员。"""
+    """表格读取提示；消息直接显示给管理员。"""
 
 
 class Sheet:
@@ -88,7 +88,7 @@ def _read_part(archive, name):
     if len(data) > MAX_PART_BYTES:
         raise TableError("表格过大")
     if _DTD.search(data):
-        raise TableError("表格格式无法识别")
+        raise TableError("请上传 xlsx、xls、csv 或网页表格")
     try:
         return ElementTree.fromstring(data)
     except ElementTree.ParseError as exc:
@@ -123,11 +123,11 @@ def read_xlsx(data):
         raise TableError("表格内容已损坏") from exc
     with archive:
         if len(archive.infolist()) > MAX_ZIP_ENTRIES:
-            raise TableError("表格格式无法识别")
+            raise TableError("请上传 xlsx、xls、csv 或网页表格")
         workbook = _read_part(archive, "xl/workbook.xml")
         relations = _read_part(archive, "xl/_rels/workbook.xml.rels")
         if workbook is None or relations is None:
-            raise TableError("表格格式无法识别")
+            raise TableError("请上传 xlsx、xls、csv 或网页表格")
         targets = {}
         for item in relations:
             target = item.get("Target") or ""
@@ -215,10 +215,10 @@ _FREE_SECTOR = 0xFFFFFFFF
 def _cfb_stream(data):
     """从复合文档中取出 Workbook 流。"""
     if len(data) < 512 or data[:8] != _CFB_MAGIC:
-        raise TableError("表格格式无法识别")
+        raise TableError("请上传 xlsx、xls、csv 或网页表格")
     sector_shift, mini_shift = struct.unpack_from("<HH", data, 30)
     if sector_shift not in (9, 12) or mini_shift != 6:
-        raise TableError("表格格式无法识别")
+        raise TableError("请上传 xlsx、xls、csv 或网页表格")
     size = 1 << sector_shift
     mini_size = 1 << mini_shift
     fat_count, first_directory = struct.unpack_from("<I", data, 44)[0], struct.unpack_from("<I", data, 48)[0]
@@ -274,7 +274,7 @@ def _cfb_stream(data):
     wanted = {"workbook": "biff8", "book": "biff5"}
     target = next((entry for entry in entries if entry[1] == 2 and entry[0].lower() in wanted), None)
     if target is None:
-        raise TableError("表格格式无法识别")
+        raise TableError("请上传 xlsx、xls、csv 或网页表格")
     if wanted[target[0].lower()] != "biff8":
         raise TableError("请把表格另存为 xlsx 后上传")
     _name, _kind, start, stream_size = target
@@ -548,14 +548,14 @@ def read_markup(text):
     parser.feed(text)
     parser.close()
     if not parser.sheets:
-        raise TableError("表格格式无法识别")
+        raise TableError("请上传 xlsx、xls、csv 或网页表格")
     return parser.sheets
 
 
 def _read_spreadsheet_2003(text):
     data = text.encode("utf-8")
     if _DTD.search(data):
-        raise TableError("表格格式无法识别")
+        raise TableError("请上传 xlsx、xls、csv 或网页表格")
     try:
         root = ElementTree.fromstring(data)
     except ElementTree.ParseError as exc:
@@ -602,7 +602,7 @@ def _index_attribute(element, default):
 
 
 def read_table(filename, data):
-    """按文件内容识别格式；扩展名只在内容无法判断时参考。"""
+    """先按文件内容识别格式，再参考扩展名。"""
     if data.startswith(b"PK\x03\x04"):
         return read_xlsx(data)
     if data.startswith(_CFB_MAGIC):
@@ -611,7 +611,7 @@ def read_table(filename, data):
     if text.lstrip().startswith("<"):
         return read_markup(text)
     if (filename or "").lower().endswith((".xlsx", ".xls", ".et", ".numbers")):
-        raise TableError("表格格式无法识别")
+        raise TableError("请上传 xlsx、xls、csv 或网页表格")
     return read_csv(text)
 
 
@@ -756,9 +756,9 @@ def parse_roster(filename, data):
                 klass = previous
                 notes.append("班级沿用上一行")
             if not klass:
-                notes.append("缺少班级")
+                notes.append("待补班级")
             if not _NAME_OK.match(name) or not re.search("[{}]".format(_NAME_LETTERS), name):
-                notes.append("姓名有误")
+                notes.append("待核对姓名")
             previous = klass or previous
             result.append({"sheet": sheet.name, "line": index + 1, "name": name, "class": klass, "notes": notes})
             count += 1

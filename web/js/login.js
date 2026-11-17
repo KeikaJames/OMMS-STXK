@@ -71,7 +71,7 @@
         window.location.href = role === 'student' ? '/student/dashboard' : '/admin/dashboard';
         return;
       }
-      error.textContent = result.status === 0 ? '网络连接中断' : (result.data && result.data.message) || '登录未完成';
+      error.textContent = result.status === 0 ? '请检查网络连接' : (result.data && result.data.message) || '请重试';
       $('#password').select();
     });
   });

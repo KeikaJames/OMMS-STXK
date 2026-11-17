@@ -47,7 +47,7 @@
   function ok(result) { return Boolean(result.ok && result.data && result.data.success !== false); }
   function message(result, fallback) {
     if (result.data && result.data.message) return result.data.message;
-    return result.status === 0 ? '网络连接中断' : fallback;
+    return result.status === 0 ? '请检查网络连接' : fallback;
   }
   function begin(name) {
     versions[name] = (versions[name] || 0) + 1;
@@ -66,7 +66,7 @@
   function post(path, body, options) {
     return App.request(path, Object.assign({ method: 'POST', body: body }, options || {}));
   }
-  // 服务器忙（503）或连接中断时按 Retry-After 重试；带 request_id 的请求重复提交只执行一次。
+  // 服务器忙（503）或连接重置时按 Retry-After 重试；同一 request_id 的请求只执行一次。
   function retry(path, body) {
     var attempts = 0;
     function run() {
@@ -369,7 +369,7 @@
     });
   }
 
-  // 流程：按使用顺序列出各步骤的状态和入口，第一个未完成的步骤用主按钮。
+  // 流程：按使用顺序列出各步骤的状态和入口，第一个待办步骤用主按钮。
   function renderFlow(summary, time) {
     var students = summary.students;
     var registered = summary.registered;
@@ -386,7 +386,7 @@
       { title: '导入学生', done: students > 0, text: students ? students + ' 名学生' : '上传含姓名、班级的表格',
         routes: students ? [['名单', 'students/list'], ['导入', 'students/import']] : [['导入', 'students/import']] },
       { title: '添加社团', done: summary.clubs > 0, warn: summary.clubs > 0 && short > 0,
-        text: summary.clubs ? summary.clubs + ' 个社团 · 名额 ' + summary.capacity + (short > 0 ? ' · 缺口 ' + short : '') : '名称与人数上限',
+        text: summary.clubs ? summary.clubs + ' 个社团 · 名额 ' + summary.capacity + (short > 0 ? ' / 学生 ' + students : '') : '名称与人数上限',
         routes: [['社团', 'clubs/cards']] },
       { title: '开放时间', done: Boolean(time.start_time), text: time.start_time ? scheduleText(time) : '设置开放与截止时间',
         routes: [['时间', 'settings/time']] },
@@ -566,7 +566,7 @@
       if (!latest('students', version)) return;
       rememberClubs(results[1].data);
       if (!Array.isArray(results[0].data)) {
-        tableMessage($('#stu-tbl'), message(results[0], '读取失败'));
+        tableMessage($('#stu-tbl'), message(results[0], '请刷新页面'));
         return;
       }
       setStudents(results[0].data);
@@ -697,7 +697,7 @@
         steps.push(function () {
           return retry('/api/admin/update_student', { student_id: student.id, name: name, 'class': klass, request_id: ids.info })
             .then(function (result) {
-              if (!ok(result)) return message(result, '存储失败');
+              if (!ok(result)) return message(result, '请重试');
               ids.info = App.requestId();
               return null;
             });
@@ -710,7 +710,7 @@
           if (target) payload.club_id = target;
           if (target && override.checked) payload.override_eligibility = true;
           return retry(path, payload).then(function (result) {
-            if (!ok(result)) return message(result, '存储失败');
+            if (!ok(result)) return message(result, '请重试');
             ids.move = App.requestId();
             return null;
           });
@@ -736,7 +736,7 @@
     }
 
     function confirmReset() {
-      App.confirm({ title: '重置“' + student.name + '”的密码？', message: '原密码随即失效', confirm: '重置', destructive: true })
+      App.confirm({ title: '重置“' + student.name + '”的密码？', message: '新密码随即生效', confirm: '重置', destructive: true })
         .then(function (yes) {
           if (!yes) return;
           App.busy(reset, '重置中');
@@ -745,7 +745,7 @@
           }).then(function (result) {
             App.busy(reset, null);
             if (!ok(result)) {
-              error.textContent = message(result, '重置失败');
+              error.textContent = message(result, '请重试');
               return;
             }
             ids.reset = App.requestId();
@@ -773,7 +773,7 @@
           post('/api/delete_student', { student_id: student.id }).then(function (result) {
             App.busy(remove, null);
             if (!ok(result)) {
-              error.textContent = message(result, '删除失败');
+              error.textContent = message(result, '请重试');
               return;
             }
             sheet.close();
@@ -813,7 +813,7 @@
   function readRoster(file) {
     if (importing) return;
     if (file.size > MAX_UPLOAD) {
-      App.toast('文件超过 10 MB', 'err');
+      App.toast('请选择 10 MB 以内的文件', 'err');
       return;
     }
     var button = $('#roster-pick');
@@ -821,11 +821,11 @@
     App.upload('/api/admin/import/parse', file, { type: 'application/octet-stream' }).then(function (result) {
       App.busy(button, null);
       if (!ok(result) || !Array.isArray(result.data.rows)) {
-        App.toast(message(result, '读取失败'), 'err');
+        App.toast(message(result, '请刷新页面'), 'err');
         return;
       }
       if (!result.data.rows.length) {
-        App.toast('未识别到学生', 'err');
+        App.toast('请检查表头是否含“姓名”“班级”', 'err');
         return;
       }
       openReview(file.name || '名单', result.data);
@@ -866,15 +866,15 @@
       if (!row.include) return '';
       var name = trim(row.name);
       var klass = trim(row.klass);
-      if (!name) return '缺少姓名';
-      if (!klass) return '缺少班级';
-      if (name.length > 50 || klass.length > 50 || /[<>\u0000-\u001F]/.test(name + klass)) return '格式有误';
+      if (!name) return '待补姓名';
+      if (!klass) return '待补班级';
+      if (name.length > 50 || klass.length > 50 || /[<>\u0000-\u001F]/.test(name + klass)) return '待核对内容';
       return '';
     }
     function notesFor(row) {
       return row.notes.filter(function (note) {
-        if (note === '缺少班级') return false;
-        return !(note === '姓名有误' && row.name !== row.original);
+        if (note === '待补班级') return false;
+        return !(note === '待核对姓名' && row.name !== row.original);
       });
     }
     function flagged(row) { return Boolean(problem(row)) || notesFor(row).length > 0; }
@@ -993,7 +993,7 @@
         return post('/api/import_students', {
           students: part.map(function (row) { return { name: trim(row.name), 'class': trim(row.klass) }; })
         }, { timeout: 180000 }).then(function (result) {
-          if (!result.ok || !result.data || !Array.isArray(result.data.credentials)) return message(result, '导入中断');
+          if (!result.ok || !result.data || !Array.isArray(result.data.credentials)) return message(result, '请重试');
           created += Number(result.data.success) || 0;
           skipped += Number(result.data.failed) || 0;
           credentials = credentials.concat(result.data.credentials);
@@ -1015,7 +1015,7 @@
         }
         loadStudents();
         if (failure) {
-          controller.setMessage(failure + (created ? ' · 已导入 ' + created + ' 名' : ''));
+          controller.setMessage((created ? '已导入 ' + created + ' 名 · ' : '') + failure);
           render();
           return;
         }
@@ -1040,7 +1040,7 @@
         chain = chain.then(function () {
           return post('/api/admin/accounts_workbook', { accounts: part }, { blob: true, timeout: 120000 }).then(function (result) {
             if (!result.ok || !result.blob) {
-              App.toast(message(result, '生成失败'), 'err');
+              App.toast(message(result, '请重试'), 'err');
               return;
             }
             App.saveBlob(result.blob, result.filename || '学生账号.xlsx');
@@ -1108,7 +1108,7 @@
     var klass = $('#reset-class').value;
     if (!klass) return;
     var count = store.students.filter(function (student) { return student['class'] === klass; }).length;
-    App.confirm({ title: '重置“' + klass + '”的密码？', message: count + ' 名学生的原密码随即失效', confirm: '重置', destructive: true })
+    App.confirm({ title: '重置“' + klass + '”的密码？', message: count + ' 名学生的新密码随即生效', confirm: '重置', destructive: true })
       .then(function (yes) {
         if (!yes) return;
         App.busy(button, '重置中');
@@ -1117,7 +1117,7 @@
         }).then(function (result) {
           App.busy(button, null);
           if (!ok(result)) {
-            App.toast(message(result, '重置失败'), 'err');
+            App.toast(message(result, '请重试'), 'err');
             return;
           }
           classResetId = App.requestId();
@@ -1140,7 +1140,7 @@
       var box = $('#club-list');
       clear(box);
       if (!Array.isArray(result.data)) {
-        box.appendChild(el('p', 'empty', message(result, '读取失败')));
+        box.appendChild(el('p', 'empty', message(result, '请刷新页面')));
         return;
       }
       rememberClubs(result.data);
@@ -1186,7 +1186,7 @@
     var query = '?club_id=' + encodeURIComponent(clubId) + '&expected_revision=' + encodeURIComponent(revision) +
       '&request_id=' + encodeURIComponent(App.requestId()) + '&reason=' + encodeURIComponent('管理员更换社团图片');
     return App.upload('/api/upload_club_image' + query, file, { type: file.type || 'application/octet-stream' }).then(function (result) {
-      return ok(result) ? null : '信息已存储，' + message(result, '图片上传失败');
+      return ok(result) ? null : '信息已存储；' + message(result, '图片请重新上传');
     });
   }
 
@@ -1194,7 +1194,7 @@
     return post('/api/remove_club_image', {
       club_id: clubId, expected_revision: revision, request_id: App.requestId(), reason: '管理员恢复默认图片'
     }).then(function (result) {
-      return ok(result) ? null : '信息已存储，' + message(result, '图片恢复失败');
+      return ok(result) ? null : '信息已存储；' + message(result, '请重试');
     });
   }
 
@@ -1248,7 +1248,7 @@
       var file = takeFile(picker);
       if (!file) return;
       if (file.size > MAX_UPLOAD) {
-        error.textContent = '图片超过 10 MB';
+        error.textContent = '请选择 10 MB 以内的图片';
         return;
       }
       releasePreview();
@@ -1314,7 +1314,7 @@
         advisor_name: trim(advisor.value), meeting_time: trim(meeting.value), location: trim(place.value),
         allowed_grades: splitList(grades.value), allowed_classes: splitList(classes.value), enabled: enabled.checked
       }).then(function (result) {
-        if (!ok(result)) return message(result, '存储失败');
+        if (!ok(result)) return message(result, '请重试');
         if (result.data.club) club = result.data.club;
         if (image.file) return uploadClubImage(club.id, image.file, club.revision);
         if (image.remove) return removeClubImage(club.id, club.revision);
@@ -1345,7 +1345,7 @@
       if (!yes) return;
       post('/api/delete_club', { club_id: club.id }).then(function (result) {
         if (!ok(result)) {
-          App.toast(message(result, '删除失败'), 'err');
+          App.toast(message(result, '请重试'), 'err');
           return;
         }
         App.toast('已删除 ' + name, 'ok');
@@ -1378,7 +1378,7 @@
       App.busy(button, null);
       var added = Number(result.data && result.data.success) || 0;
       if (!added) {
-        error.textContent = result.data && result.data.failed ? '名称已存在' : message(result, '添加失败');
+        error.textContent = result.data && result.data.failed ? '名称已存在' : message(result, '请重试');
         return;
       }
       nameInput.value = '';
@@ -1397,7 +1397,7 @@
       var plan = result.data;
       clear(box);
       if (!result.ok || !plan) {
-        box.appendChild(el('p', 'empty', message(result, '读取失败')));
+        box.appendChild(el('p', 'empty', message(result, '请刷新页面')));
         return;
       }
       var metrics = el('div', 'metrics');
@@ -1425,7 +1425,7 @@
         actions.appendChild(lock);
       } else {
         if (plan.assignable < plan.unregistered) {
-          box.appendChild(el('p', 'note gap', '名额缺口 ' + (plan.unregistered - plan.assignable) + ' 个，可提高人数上限或放宽报名范围'));
+          box.appendChild(el('p', 'note gap', '再增加 ' + (plan.unregistered - plan.assignable) + ' 个名额可安排全部学生：提高人数上限或放宽报名范围'));
         }
         if (plan.assignable) {
           var requestId = App.requestId();
@@ -1437,7 +1437,7 @@
                 retry('/api/admin/adjust_registrations', { request_id: requestId }).then(function (outcome) {
                   App.busy(run, null);
                   if (!ok(outcome)) {
-                    App.toast(message(outcome, '调剂失败'), 'err');
+                    App.toast(message(outcome, '请重试'), 'err');
                     return;
                   }
                   App.toast('已调剂 ' + outcome.data.assigned + ' 名', 'ok');
@@ -1556,7 +1556,7 @@
       var table = $('#audit-tbl');
       var more = $('#audit-more');
       if (!result.data || !Array.isArray(result.data.events)) {
-        tableMessage(table, message(result, '读取失败'));
+        tableMessage(table, message(result, '请刷新页面'));
         more.hidden = true;
         return;
       }
@@ -1667,7 +1667,7 @@
     post('/api/update_registration_time', { start_time: start, end_time: close }).then(function (result) {
       App.busy(button, null);
       if (!ok(result)) {
-        error.textContent = message(result, '存储失败');
+        error.textContent = message(result, '请重试');
         return;
       }
       App.toast('已存储', 'ok');
@@ -1680,7 +1680,7 @@
       if (!yes) return;
       retry('/api/update_registration_time', { start_time: '' }).then(function (result) {
         if (!ok(result)) {
-          App.toast(message(result, '清除失败'), 'err');
+          App.toast(message(result, '请重试'), 'err');
           return;
         }
         App.toast('已清除', 'ok');
@@ -1703,7 +1703,7 @@
       }).then(function (result) {
         App.busy(button, null);
         if (!ok(result)) {
-          App.toast(message(result, '操作失败'), 'err');
+          App.toast(message(result, '请重试'), 'err');
           return;
         }
         App.toast(locked ? '已解除锁定' : '已锁定', 'ok');
@@ -1730,7 +1730,7 @@
       App.busy(button, '处理中');
       retry(path, body).then(function (result) {
         App.busy(button, null);
-        App.toast(ok(result) ? done : message(result, '操作失败'), ok(result) ? 'ok' : 'err');
+        App.toast(ok(result) ? done : message(result, '请重试'), ok(result) ? 'ok' : 'err');
         loadSettings();
       });
     });
@@ -1759,7 +1759,7 @@
       if (!latest('backups', version)) return;
       var table = $('#backup-tbl');
       if (!result.data || !Array.isArray(result.data.backups)) {
-        tableMessage(table, message(result, '读取失败'));
+        tableMessage(table, message(result, '请刷新页面'));
         return;
       }
       $('#backup-keep').textContent = '保留最近 ' + result.data.keep + ' 份';
@@ -1784,7 +1784,7 @@
   function finishRestore(result, button) {
     App.busy(button, null);
     if (!ok(result)) {
-      App.toast(message(result, '恢复失败'), 'err');
+      App.toast(message(result, '请重试'), 'err');
       return;
     }
     App.alert({
@@ -1811,7 +1811,7 @@
     var file = takeFile($('#restore-file'));
     if (!file) return;
     if (file.size > MAX_RESTORE) {
-      App.toast('文件超过 64 MB', 'err');
+      App.toast('请选择 64 MB 以内的文件', 'err');
       return;
     }
     App.confirm({
@@ -1849,7 +1849,7 @@
     post('/api/admin_change_password', { current: current, 'new': next }).then(function (result) {
       App.busy(button, null);
       if (!ok(result)) {
-        error.textContent = message(result, '修改失败');
+        error.textContent = message(result, '请重试');
         return;
       }
       App.toast('已修改，请重新登录', 'ok');

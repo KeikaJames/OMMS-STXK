@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-# 虚拟网卡与隧道（VPN、代理、虚拟机、容器）的地址学生机访问不到，不列出。
+# 学生机经物理网卡访问服务器；下列虚拟网卡与隧道（VPN、代理、虚拟机、容器）的地址略过。
 _VIRTUAL = re.compile(r"^(lo|utun|tun|tap|gif|stf|awdl|llw|anpi|ap\d|bridge|vmnet|vboxnet|docker|br-|veth|virbr|wg|zt|tailscale|ham)")
 _SEARCH = ("/sbin", "/usr/sbin", "/bin", "/usr/bin")
 _CACHE = {"at": 0.0, "value": []}

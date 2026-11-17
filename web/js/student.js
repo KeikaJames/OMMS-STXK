@@ -221,7 +221,7 @@
     });
   }
 
-  // ---- 社团卡片：按 id 复用节点，内容没变时不改 DOM ----
+  // ---- 社团卡片：按 id 复用节点，内容变化时才更新 DOM ----
   function createCard(club) {
     var card = App.el('article', 'club');
     card.setAttribute('data-id', club.id);
@@ -374,7 +374,7 @@
         if (result.status === 0 || result.status === 202 || result.status === 429 || result.status >= 500) {
           if (Date.now() - pending.started > RETRY_WINDOW_MS) {
             state.pending = null;
-            App.toast('提交未完成', 'err');
+            App.toast('请重新报名', 'err');
             return refreshAll();
           }
           pending.label = result.status === 202 ? '确认中' : '排队中';
@@ -382,7 +382,7 @@
           return wait(result.retryAfter * 1000 + Math.random() * 500).then(attempt);
         }
         state.pending = null;
-        App.toast((result.data && result.data.message) || '提交未完成', 'err');
+        App.toast((result.data && result.data.message) || '请重新报名', 'err');
         return refreshAll();
       });
     }
@@ -419,14 +419,14 @@
           return wait(result.retryAfter * 1000 + Math.random() * 500).then(attempt);
         }
         state.pending = null;
-        App.toast((result.data && result.data.message) || '退选未完成', 'err');
+        App.toast((result.data && result.data.message) || '请重试', 'err');
         return refreshAll();
       });
     }
     return attempt();
   }
 
-  // 名额快照有不到 1 秒的缓存，稍后再取一次以显示本次操作后的余量。
+  // 名额快照缓存在 1 秒以内，稍后再取一次以显示本次操作后的余量。
   function refreshAll() {
     return Promise.all([loadMe(), loadSeats()]).then(function () {
       render();
