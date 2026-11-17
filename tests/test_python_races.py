@@ -1010,6 +1010,110 @@ class PythonRaceRegressionTests(unittest.TestCase):
             )
             self.assertRaises(sqlite3.IntegrityError, conn.execute, "DELETE FROM audit_events")
 
+    def test_adjustment_after_lock_places_most_students_and_workbook_lists_everyone(self) -> None:
+        conn = sqlite3.connect(self.db_path, timeout=20.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM registrations")
+            conn.execute("DELETE FROM students")
+            conn.execute("DELETE FROM clubs")
+            conn.executemany(
+                "INSERT INTO clubs (id, name, max_students, current_students, allowed_grades) VALUES (?, ?, ?, ?, ?)",
+                [(1, "3D打印", 2, 2, "[]"), (2, "传媒", 3, 1, "[]"), (3, "木工", 4, 0, '["高二"]')],
+            )
+            conn.executemany(
+                "INSERT INTO students (id, name, class, grade, student_id, username, password) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(i, f"学生{i}", "高一1班" if i <= 6 else "高二1班", "高一" if i <= 6 else "高二",
+                  f"S{i:04d}", f"adjust{i}", "unused") for i in range(1, 10)],
+            )
+            conn.executemany(
+                "INSERT INTO registrations (student_id, club_id, registration_time, operation_id) VALUES (?, ?, ?, ?)",
+                [(1, 1, "2026-01-01 00:00:01", "1-self"), (2, 1, "2026-01-01 00:00:02", "2-self"),
+                 (3, 2, "2026-01-01 00:00:03", "admin-placed")],
+            )
+            conn.execute("UPDATE settings SET registration_locked = 0")
+            conn.commit()
+        finally:
+            conn.close()
+        redis_command(self.redis_port, "FLUSHDB")
+        deadline = time.monotonic() + 15
+        while redis_command(self.redis_port, "GET", key("init")) is None:
+            self.assertLess(time.monotonic(), deadline, "seat state was not republished")
+            time.sleep(0.1)
+        admin_token = self._admin_token()
+        try:
+            status, plan = self._request_json("GET", "/api/admin/adjustment", token=admin_token)
+            self.assertEqual(200, status, plan)
+            self.assertEqual((False, 6, 5, 6), (plan["locked"], plan["unregistered"], plan["assignable"], plan["seats"]))
+            self.assertEqual([(2, 2, 2), (3, 4, 3)], [(c["id"], c["remaining"], c["assign"]) for c in plan["clubs"]])
+
+            status, refused = self._request_json(
+                "POST", "/api/admin/adjust_registrations", token=admin_token, body={"request_id": "adjust-early-0001"})
+            self.assertEqual(409, status, refused)
+
+            status, _ = self._request_json(
+                "POST", "/api/update_registration_lock", token=admin_token,
+                body={"locked": True, "request_id": "adjust-lock-0001", "reason": "截止"})
+            self.assertEqual(200, status)
+            status, done = self._request_json(
+                "POST", "/api/admin/adjust_registrations", token=admin_token, body={"request_id": "adjust-run-0001"})
+            self.assertEqual(200, status, done)
+            self.assertEqual((5, 1, {"2": 2, "3": 3}), (done["assigned"], done["unassigned"], done["by_club"]))
+            status, replay = self._request_json(
+                "POST", "/api/admin/adjust_registrations", token=admin_token, body={"request_id": "adjust-run-0001"})
+            self.assertEqual((200, True, 5), (status, replay.get("replayed"), replay["assigned"]))
+
+            with contextlib.closing(sqlite3.connect(self.db_path)) as check:
+                rows = dict(check.execute("SELECT student_id, club_id FROM registrations").fetchall())
+                counts = dict(check.execute("SELECT id, current_students FROM clubs").fetchall())
+                adjusted = check.execute(
+                    "SELECT COUNT(*) FROM registrations WHERE operation_id LIKE 'adjust-%'").fetchone()[0]
+            self.assertEqual(8, len(rows))
+            self.assertEqual({1: 2, 2: 3, 3: 3}, counts)
+            self.assertEqual(5, adjusted)
+            self.assertEqual({7: 3, 8: 3, 9: 3}, {sid: rows[sid] for sid in (7, 8, 9)})
+            self.assertEqual(2, sum(1 for sid in (4, 5, 6) if rows.get(sid) == 2))
+            self.assertEqual(("0", "1"), (redis_command(self.redis_port, "GET", key("stock", 2)),
+                                          redis_command(self.redis_port, "GET", key("stock", 3))))
+            self.assertTrue(str(redis_command(self.redis_port, "GET", key("reg", 7))).startswith("3|adjust-"))
+
+            conn = http.client.HTTPConnection("127.0.0.1", self.http_port, timeout=20)
+            conn.request("GET", "/api/export_workbook", headers={"Cookie": f"session={admin_token}"})
+            response = conn.getresponse()
+            workbook_bytes = response.read()
+            disposition = response.getheader("Content-Disposition") or ""
+            conn.close()
+            self.assertEqual(200, response.status)
+            self.assertIn("filename*=UTF-8''", disposition)
+            try:
+                import openpyxl
+            except ImportError:
+                openpyxl = None
+            if openpyxl is not None:
+                book = openpyxl.load_workbook(io.BytesIO(workbook_bytes))
+                self.assertEqual(["总表", "3D打印", "传媒", "木工", "未报名"], book.sheetnames)
+                summary = [[cell.value for cell in row] for row in book["总表"].iter_rows(min_row=2)]
+                methods = {row[0]: row[4] for row in summary}
+                self.assertEqual(("自选", "管理员安排", "调剂"), (methods["学生1"], methods["学生3"], methods["学生7"]))
+                self.assertEqual(3, book["木工"].max_row - 1)
+                self.assertEqual(1, book["未报名"].max_row - 1)
+
+            conn = http.client.HTTPConnection("127.0.0.1", self.http_port, timeout=20)
+            conn.request("GET", "/api/export_all_data", headers={"Cookie": f"session={admin_token}"})
+            response = conn.getresponse()
+            header_line = response.read().decode("utf-8-sig").splitlines()[0]
+            disposition = response.getheader("Content-Disposition") or ""
+            conn.close()
+            self.assertEqual("姓名,班级,学号,社团,方式,报名时间", header_line)
+            self.assertIn("%E6%8A%A5%E5%90%8D%E6%80%BB%E8%A1%A8", disposition)
+        finally:
+            self._request_json("POST", "/api/update_registration_lock", token=admin_token,
+                               body={"locked": False, "request_id": "adjust-unlock-0001", "reason": "测试结束"})
+            with contextlib.closing(sqlite3.connect(self.db_path)) as reset:
+                reset.execute("UPDATE settings SET registration_locked = 0")
+                reset.commit()
+            redis_command(self.redis_port, "DEL", key("locked"))
+
     def test_admin_assign_remove_transfer_and_operations_snapshot(self) -> None:
         self._seed_scenario(users=2, capacity=2, redis_stock=2)
         with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
@@ -1025,7 +1129,7 @@ class PythonRaceRegressionTests(unittest.TestCase):
         self.assertEqual("1", redis_command(self.redis_port, "GET", key("stock", 1)))
         transfer_status, transferred = self._request_json(
             "POST", "/api/admin/transfer_registration", token=admin_token,
-            body={"student_id": 1, "club_id": 2, "request_id": "transfer-0001", "reason": "调剂到第二社团"},
+            body={"student_id": 1, "club_id": 2, "request_id": "transfer-0001", "reason": "调整到第二社团"},
         )
         self.assertEqual(200, transfer_status, transferred)
         self.assertEqual("2", redis_command(self.redis_port, "GET", key("stock", 1)))

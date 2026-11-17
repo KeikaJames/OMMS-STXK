@@ -9,13 +9,13 @@
 <meta name="theme-color" content="#F4EFE6">
 <title>我的 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=18">
+<link rel="stylesheet" href="/app.css?v=21">
 <script src="/js/legacy.js?v=18" defer></script>
 <script src="/js/common.js?v=18" defer></script>
-<script src="/js/profile.js?v=15" defer></script>
+<script src="/js/profile.js?v=16" defer></script>
 </head>
 <body>
-<div class="legacy-note" id="legacy" hidden>这个浏览器版本太旧，打不开选课页面。请换用新版 Edge、Chrome 或 Firefox；360、QQ、搜狗浏览器请点地址栏右侧的图标切换到“极速模式”。</div>
+<div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
 <a class="skip" href="#main">跳到主内容</a>
 <header class="topbar">
   <a class="brand" href="/student/dashboard"><img src="/img/school-emblem.webp" alt="" width="34" height="34"><span><b>社团选课</b><small>鄂尔多斯市实验中学</small></span></a>
@@ -27,7 +27,7 @@
 </header>
 
 <main class="page page-narrow" id="main">
-  <img class="profile-art" src="/img/profile-study.webp" alt="" width="720" height="406" decoding="async">
+  <div class="page-head"><h1>我的</h1></div>
   <div class="stack">
     <section class="card">
       <div class="pane-head"><h2>基本信息</h2></div>
@@ -41,7 +41,7 @@
 
     <section class="card">
       <div class="pane-head"><h2>我的社团</h2></div>
-      <p class="hint" id="reg-empty">还没有报名。开放后在<a href="/student/dashboard">选课页</a>选择一个社团。</p>
+      <p class="hint" id="reg-empty">暂无报名记录。<a href="/student/dashboard">前往报名</a></p>
       <div id="reg-detail" hidden>
         <h3 id="reg-name"></h3>
         <p class="hint" id="reg-time"></p>
@@ -49,13 +49,13 @@
     </section>
 
     <section class="card">
-      <div class="pane-head"><h2>修改密码</h2><p>修改后需要用新密码重新登录。</p></div>
+      <div class="pane-head"><h2>修改密码</h2><p>修改后需重新登录。</p></div>
       <form id="password-form" novalidate>
         <div class="field"><label for="cp">当前密码</label><input class="input" id="cp" type="password" autocomplete="current-password"></div>
         <div class="field"><label for="np">新密码（至少 6 位）</label><input class="input" id="np" type="password" autocomplete="new-password"></div>
-        <div class="field"><label for="np2">再输入一次新密码</label><input class="input" id="np2" type="password" autocomplete="new-password"></div>
+        <div class="field"><label for="np2">确认新密码</label><input class="input" id="np2" type="password" autocomplete="new-password"></div>
         <p class="error" id="password-error" role="alert"></p>
-        <button class="btn btn-primary" id="save" type="submit">保存新密码</button>
+        <button class="btn btn-primary" id="save" type="submit">保存</button>
       </form>
     </section>
   </div>

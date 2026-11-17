@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import collections
 import http.server
+import random
 import socketserver
 import json
 import sqlite3
@@ -21,7 +23,9 @@ import re
 import hashlib
 import importlib.util
 import warnings
+import zipfile
 from datetime import datetime, timedelta, timezone
+from xml.sax.saxutils import escape as xml_escape
 
 # ---- 可选重依赖(有 fallback 不致命) -------------------------------------
 try:
@@ -1184,6 +1188,208 @@ def operations_snapshot():
     return payload
 
 
+# ==========================================================================
+# 调剂：锁定名单后，把未报名的学生随机安排到还有名额的社团
+# ==========================================================================
+def registration_method(operation_id):
+    text = operation_id or ""
+    if text.startswith("adjust-"):
+        return "调剂"
+    if text.startswith("admin-"):
+        return "管理员安排"
+    return "自选"
+
+
+def registration_locked(conn):
+    row = conn.execute("SELECT COALESCE(registration_locked, 0) FROM settings ORDER BY id DESC LIMIT 1").fetchone()
+    return bool(row and row[0])
+
+
+def _max_flow(groups, seats):
+    """groups：{可报社团集合: 人数}；seats：{社团: 空余名额}。返回 {社团集合: {社团: 人数}}，安排人数最多。"""
+    capacity = collections.defaultdict(dict)
+
+    def edge(u, v, amount):
+        capacity[u][v] = capacity[u].get(v, 0) + amount
+        capacity[v].setdefault(u, 0)
+
+    keys = list(groups)
+    for index, options in enumerate(keys):
+        edge("source", ("group", index), groups[options])
+        for club in sorted(options):
+            edge(("group", index), ("club", club), groups[options])
+    for club, free in seats.items():
+        edge(("club", club), "sink", free)
+    flow = collections.defaultdict(lambda: collections.defaultdict(int))
+    while True:
+        parent = {"source": None}
+        pending = collections.deque(["source"])
+        while pending and "sink" not in parent:
+            node = pending.popleft()
+            for nxt, cap in capacity[node].items():
+                if nxt not in parent and cap - flow[node][nxt] > 0:
+                    parent[nxt] = node
+                    pending.append(nxt)
+        if "sink" not in parent:
+            break
+        path, node = [], "sink"
+        while parent[node] is not None:
+            path.append((parent[node], node))
+            node = parent[node]
+        amount = min(capacity[u][v] - flow[u][v] for u, v in path)
+        for u, v in path:
+            flow[u][v] += amount
+            flow[v][u] -= amount
+    return {options: {club: flow[("group", index)][("club", club)] for club in options
+                      if flow[("group", index)][("club", club)] > 0}
+            for index, options in enumerate(keys)}
+
+
+def plan_adjustment(conn, rng=None):
+    """返回 (安排 [(学生, 社团)], 无法安排的学生, {社团: 空余名额})。
+
+    只用开放中的社团，遵守年级和班级限制；能安排的人数最多，同组学生之间随机。
+    """
+    students = conn.execute(
+        "SELECT s.id, s.grade, s.class FROM students s "
+        "LEFT JOIN registrations r ON r.student_id = s.id WHERE r.id IS NULL ORDER BY s.id"
+    ).fetchall()
+    clubs = conn.execute(
+        "SELECT c.id, c.max_students - (SELECT COUNT(*) FROM registrations r WHERE r.club_id = c.id), "
+        "c.enabled, c.allowed_grades, c.allowed_classes FROM clubs c ORDER BY c.id"
+    ).fetchall()
+    seats = {club: free for club, free, enabled, _grades, _classes in clubs if enabled and free > 0}
+    groups = collections.OrderedDict()
+    for student, grade, klass in students:
+        options = frozenset(club for club, _free, _enabled, grades, classes in clubs
+                            if club in seats and student_matches_restrictions(grade, klass, grades, classes)[0])
+        groups.setdefault(options, []).append(student)
+    allocation = _max_flow({options: len(members) for options, members in groups.items() if options}, seats)
+    rng = rng or random.SystemRandom()
+    pairs, unplaced = [], []
+    for options, members in groups.items():
+        members = list(members)
+        rng.shuffle(members)
+        for club, count in sorted(allocation.get(options, {}).items()):
+            pairs.extend((student, club) for student in members[:count])
+            members = members[count:]
+        unplaced.extend(members)
+    return pairs, unplaced, seats
+
+
+# ==========================================================================
+# 导出：Excel（标准库生成）与 CSV
+# ==========================================================================
+_SHEET_NAME_BAD = re.compile(r"[\\/?*\[\]:]")
+
+
+def _column_letter(index):
+    letters = ""
+    index += 1
+    while index:
+        index, rest = divmod(index - 1, 26)
+        letters = chr(65 + rest) + letters
+    return letters
+
+
+def xlsx_bytes(sheets):
+    """sheets：[(表名, 表头, 行, 列宽)]。单元格一律写成文本，学号前导零原样保留。"""
+    names, used = [], set()
+    for title, *_rest in sheets:
+        base = _SHEET_NAME_BAD.sub(" ", str(title)).strip()[:28] or "Sheet"
+        name, n = base, 2
+        while name in used:
+            name, n = "{} ({})".format(base, n), n + 1
+        used.add(name)
+        names.append(name)
+
+    def cell(ref, value, style):
+        text = xml_escape("" if value is None else str(value))
+        return '<c r="{}" t="inlineStr"{}><is><t xml:space="preserve">{}</t></is></c>'.format(
+            ref, ' s="1"' if style else "", text)
+
+    def sheet_xml(header, rows, widths):
+        cols = "".join('<col min="{0}" max="{0}" width="{1}" customWidth="1"/>'.format(i + 1, w)
+                       for i, w in enumerate(widths))
+        lines = ['<row r="1">' + "".join(cell(_column_letter(i) + "1", v, True) for i, v in enumerate(header)) + "</row>"]
+        for r, row in enumerate(rows, start=2):
+            lines.append('<row r="{}">'.format(r) + "".join(
+                cell(_column_letter(i) + str(r), v, False) for i, v in enumerate(row)) + "</row>")
+        return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+                'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+                '<cols>{}</cols><sheetData>{}</sheetData></worksheet>').format(cols, "".join(lines))
+
+    overrides = "".join(
+        '<Override PartName="/xl/worksheets/sheet{}.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'.format(i + 1)
+        for i in range(len(sheets)))
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + overrides + "</Types>")
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+        'officeDocument" Target="xl/workbook.xml"/></Relationships>')
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+        + "".join('<sheet name="{}" sheetId="{}" r:id="rId{}"/>'.format(xml_escape(name, {'"': "&quot;"}), i + 1, i + 1)
+                  for i, name in enumerate(names))
+        + "</sheets></workbook>")
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join('<Relationship Id="rId{0}" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                  'relationships/worksheet" Target="worksheets/sheet{0}.xml"/>'.format(i + 1)
+                  for i in range(len(sheets)))
+        + '<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+          'styles" Target="styles.xml"/></Relationships>'.format(len(sheets) + 1))
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="2"><font><sz val="11"/><name val="宋体"/></font>'
+        '<font><b/><sz val="11"/><name val="宋体"/></font></fonts>'
+        '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        '</styleSheet>')
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/styles.xml", styles)
+        for i, (_title, header, rows, widths) in enumerate(sheets):
+            archive.writestr("xl/worksheets/sheet{}.xml".format(i + 1), sheet_xml(header, rows, widths))
+    return out.getvalue()
+
+
+def attachment_header(filename, fallback):
+    """中文文件名按 RFC 5987 给出，旧浏览器使用 ASCII 备用名。"""
+    return ("Content-Disposition",
+            "attachment; filename=\"{}\"; filename*=UTF-8''{}".format(fallback, urllib.parse.quote(filename)))
+
+
+def export_stamp():
+    return datetime.now(APP_TZ).strftime("%Y%m%d_%H%M")
+
+
 def restriction_code(grade, klass, allowed_grades, allowed_classes):
     """资格不符时返回提示码，符合返回 None。"""
     grades = strict_text_list(allowed_grades)
@@ -1700,7 +1906,7 @@ def init_db():
             )
             log.warning("=" * 60)
             log.warning("首次启动：管理员账号 admin，初始密码 %s", init_admin_pw)
-            log.warning("这个密码只输出这一次，登录后请在“设置”里修改。")
+            log.warning("该密码仅输出一次，请登录后在“设置”中修改。")
             log.warning("=" * 60)
         else:
             # 管理员口令一次性迁移成 argon2
@@ -1850,6 +2056,8 @@ GET_ROUTES = {
     "/api/admin/audit_events": ("_h_audit_events", ROLE_ADMIN),
     "/api/admin/operations_snapshot": ("_h_operations_snapshot", ROLE_ADMIN),
     "/api/admin/summary": ("_h_admin_summary", ROLE_ADMIN),
+    "/api/admin/adjustment": ("_h_adjustment_plan", ROLE_ADMIN),
+    "/api/export_workbook": ("_h_export_workbook", ROLE_ADMIN),
     "/api/admin/preflight_plan": ("_h_preflight_plan", ROLE_ADMIN),
 }
 POST_ROUTES = {
@@ -1873,6 +2081,7 @@ POST_ROUTES = {
     "/api/admin/assign_registration": ("_h_admin_assign_registration", ROLE_ADMIN),
     "/api/admin/remove_registration": ("_h_admin_remove_registration", ROLE_ADMIN),
     "/api/admin/transfer_registration": ("_h_admin_transfer_registration", ROLE_ADMIN),
+    "/api/admin/adjust_registrations": ("_h_adjust_registrations", ROLE_ADMIN),
     "/api/remove_club_image": ("_h_remove_club_image", ROLE_ADMIN),
 }
 RAW_POST_ROUTES = {
@@ -1964,7 +2173,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return
         self._send(200, body, extra=headers)
 
-    def _csv(self, rows, header, filename):
+    def _csv(self, rows, header, filename, fallback):
         out = io.StringIO()
         writer = csv.writer(out)
         writer.writerow([_csv_safe(c) for c in header])
@@ -1972,7 +2181,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             writer.writerow([_csv_safe(c) for c in row])
         body = out.getvalue().encode("utf-8-sig")  # BOM 便于 Excel 识别中文
         self._send(200, body, ctype="text/csv; charset=utf-8",
-                   extra=[("Content-Disposition", 'attachment; filename="{}"'.format(filename))])
+                   extra=[attachment_header(filename, fallback), ("Cache-Control", "no-store")])
 
     def log_message(self, fmt, *args):
         log.debug("%s - %s", self.address_string(), fmt % args)
@@ -2769,7 +2978,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         except RuntimeError:
             return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
         if not mutation_lock:
-            return self._json(503, {"success": False, "message": "账号状态正在更新，请稍后重试"})
+            return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
         try:
             # The mutation lock is visible to the session-create Lua before
             # this generation changes, and stays until SQLite has committed.
@@ -2820,7 +3029,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         except RuntimeError:
             return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
         if not mutation_lock:
-            return self._json(503, {"success": False, "message": "账号状态正在更新，请稍后重试"})
+            return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
         try:
             RG.session_revoke_identity("admin", uname)
             with DB_POOL.connection() as conn:
@@ -2867,7 +3076,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                                         "message": "request_id 已用于其他学生的密码重置"})
             return self._json(200, {"success": True, "replayed": True, "event_id": replay[0],
                                     "request_id": request_id,
-                                    "message": "该重置请求已执行；临时密码不会再次显示"})
+                                    "message": "该重置请求已执行，临时密码仅在首次返回时显示"})
         if not student:
             return self._json(404, {"success": False, "message": "学生不存在"})
         temporary_password = gen_password(length=12)
@@ -2879,7 +3088,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         except RuntimeError:
             return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
         if not mutation_lock:
-            return self._json(503, {"success": False, "message": "账号状态正在更新，请稍后重试"})
+            return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
         event_id = "password-reset-" + secrets.token_urlsafe(18)
         try:
             RG.session_revoke_identity("student", str(student_id))
@@ -2995,7 +3204,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             held = acquire_seat_locks([club_id])
             if not held:
                 return self._json(503, {"success": False,
-                                        "message": "这个社团正在处理报名，请稍后再改容量"},
+                                        "message": "该社团正在处理报名，请稍后修改容量"},
                                   extra=[("Retry-After", "2")])
         event_id = None
         try:
@@ -3061,7 +3270,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 if not publish_seat_locks(held):
                     return self._json(503, {"success": False, "event_id": event_id,
                                             "request_id": request_id, "retriable": True,
-                                            "message": "社团信息已保存，名额同步中；请用同一请求 ID 重试"},
+                                            "message": "社团信息已保存，名额同步中；请用同一请求编号重试"},
                                       extra=[("Retry-After", "2")])
                 seat_sync = "published"
                 after["seat_sync_pending"] = False
@@ -3304,11 +3513,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         if all(repair_club(club_id) for club_id in club_ids if club_id):
             return self._json(200, {"success": True, "replayed": True, "event_id": replay[0],
                                     "request_id": request_id, "seat_sync": "repaired"})
-        return self._json(503, {"success": False, "message": "调剂已保存，名额同步中，请稍后重试"},
+        return self._json(503, {"success": False, "message": "调整已保存，名额同步中，请稍后重试"},
                           extra=[("Retry-After", "2")])
 
     def _admin_seat_busy(self):
-        return self._json(503, {"success": False, "message": "相关学生或社团正在处理报名，请稍后再调剂"},
+        return self._json(503, {"success": False, "message": "相关学生或社团正在处理报名，请稍后重试"},
                           extra=[("Retry-After", "2")])
 
     def _admin_published(self, held, payload, student_mirror=None):
@@ -3316,7 +3525,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             payload["seat_sync"] = "published"
             return self._json(200, payload)
         payload.update({"success": False, "retriable": True,
-                        "message": "调剂已保存，名额同步中；请用同一请求 ID 重试"})
+                        "message": "调整已保存，名额同步中；请用同一请求编号重试"})
         return self._json(503, payload, extra=[("Retry-After", "2")])
 
     @staticmethod
@@ -3329,7 +3538,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_admin_assign_registration(self, sess, data):
         parsed = self._admin_registration_input(data)
         if not parsed:
-            return self._json(400, {"success": False, "message": "调剂参数格式错误"})
+            return self._json(400, {"success": False, "message": "调整参数格式错误"})
         student_id, club_id, request_id, reason, override_eligibility = parsed
         actor = sess.get("username", "admin")
         replay = self._admin_replay(actor, "registration.admin_assigned", request_id)
@@ -3337,7 +3546,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             try:
                 recorded = json.loads(replay[3]) if replay[3] else {}
                 if str(replay[1]) != str(student_id) or int(recorded.get("club_id")) != club_id:
-                    return self._json(409, {"success": False, "message": "request_id 已用于其他调剂操作"})
+                    return self._json(409, {"success": False, "message": "request_id 已用于其他调整操作"})
             except (TypeError, ValueError):
                 return self._json(409, {"success": False, "message": "request_id 对应的审计记录异常"})
             return self._admin_replay_reply(replay, request_id, (club_id,))
@@ -3394,20 +3603,20 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 "registration_id": registration_id, "club_id": club_id,
             }, student_mirror=reservation_mirror(club_id, operation_id))
         except sqlite3.IntegrityError:
-            return self._json(409, {"success": False, "message": "调剂请求冲突"})
+            return self._json(409, {"success": False, "message": "调整请求冲突"})
         finally:
             release_seat_locks(held)
 
     def _h_admin_remove_registration(self, sess, data):
         parsed = self._admin_registration_input(data, needs_club=False)
         if not parsed:
-            return self._json(400, {"success": False, "message": "调剂参数格式错误"})
+            return self._json(400, {"success": False, "message": "调整参数格式错误"})
         student_id, _club_id, request_id, reason, _override = parsed
         actor = sess.get("username", "admin")
         replay = self._admin_replay(actor, "registration.admin_removed", request_id)
         if replay:
             if str(replay[1]) != str(student_id):
-                return self._json(409, {"success": False, "message": "request_id 已用于其他调剂操作"})
+                return self._json(409, {"success": False, "message": "request_id 已用于其他调整操作"})
             try:
                 source_club_id = int((json.loads(replay[2]) if replay[2] else {}).get("club_id"))
             except (TypeError, ValueError):
@@ -3452,7 +3661,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_admin_transfer_registration(self, sess, data):
         parsed = self._admin_registration_input(data)
         if not parsed:
-            return self._json(400, {"success": False, "message": "调剂参数格式错误"})
+            return self._json(400, {"success": False, "message": "调整参数格式错误"})
         student_id, target_club_id, request_id, reason, override_eligibility = parsed
         actor = sess.get("username", "admin")
         replay = self._admin_replay(actor, "registration.admin_transferred", request_id)
@@ -3461,7 +3670,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 before = json.loads(replay[2]) if replay[2] else {}
                 after = json.loads(replay[3]) if replay[3] else {}
                 if str(replay[1]) != str(student_id) or int(after.get("club_id")) != target_club_id:
-                    return self._json(409, {"success": False, "message": "request_id 已用于其他调剂操作"})
+                    return self._json(409, {"success": False, "message": "request_id 已用于其他调整操作"})
                 clubs = (int(before.get("club_id")), int(after.get("club_id")))
             except (TypeError, ValueError):
                 return self._json(409, {"success": False, "message": "request_id 对应的审计记录异常"})
@@ -3534,7 +3743,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 "to_club_id": target_club_id,
             }, student_mirror=reservation_mirror(target_club_id, new_operation_id))
         except sqlite3.IntegrityError:
-            return self._json(409, {"success": False, "message": "调剂请求冲突"})
+            return self._json(409, {"success": False, "message": "调整请求冲突"})
         finally:
             release_seat_locks(held)
 
@@ -3615,33 +3824,39 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
 
     def _h_export_students_csv(self, sess):
         with DB_POOL.connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT name, class, student_id, username FROM students ORDER BY class, name")
-            rows = cur.fetchall()
-        self._csv(rows, ["姓名", "班级", "学号", "用户名"],
-                  "students_{}.csv".format(datetime.now(APP_TZ).strftime("%Y%m%d_%H%M%S")))
+            rows = conn.execute("SELECT name, class, student_id, username FROM students ORDER BY class, name").fetchall()
+        stamp = export_stamp()
+        self._csv(rows, ["姓名", "班级", "学号", "用户名"], "学生账号_{}.csv".format(stamp), "students_{}.csv".format(stamp))
+
+    @staticmethod
+    def _registration_rows(conn):
+        """每名学生一行：姓名、班级、学号、社团编号、社团、方式、报名时间。"""
+        rows = conn.execute(
+            "SELECT s.name, s.class, s.student_id, c.id, c.name, r.operation_id, r.registration_time "
+            "FROM students s LEFT JOIN registrations r ON s.id = r.student_id "
+            "LEFT JOIN clubs c ON r.club_id = c.id ORDER BY s.class, s.student_id, s.name"
+        ).fetchall()
+        return [(name, klass, number, club_id, club, registration_method(operation) if club_id else "", when or "")
+                for name, klass, number, club_id, club, operation, when in rows]
 
     def _h_export_all_data(self, sess):
         with DB_POOL.connection() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT s.name, s.class, s.student_id, COALESCE(c.name,'未报名') FROM students s "
-                "LEFT JOIN registrations r ON s.id = r.student_id "
-                "LEFT JOIN clubs c ON r.club_id = c.id ORDER BY s.class, s.name")
-            rows = cur.fetchall()
-        self._csv(rows, ["姓名", "班级", "学号", "报名社团"],
-                  "registrations_{}.csv".format(datetime.now(APP_TZ).strftime("%Y%m%d_%H%M%S")))
+            rows = self._registration_rows(conn)
+        stamp = export_stamp()
+        self._csv([(name, klass, number, club or "未报名", method, when)
+                   for name, klass, number, _club_id, club, method, when in rows],
+                  ["姓名", "班级", "学号", "社团", "方式", "报名时间"],
+                  "报名总表_{}.csv".format(stamp), "registrations_{}.csv".format(stamp))
 
     def _h_export_unregistered(self, sess):
         with DB_POOL.connection() as conn:
-            cur = conn.cursor()
-            cur.execute(
+            rows = conn.execute(
                 "SELECT s.name, s.class, s.student_id FROM students s "
                 "LEFT JOIN registrations r ON s.id = r.student_id WHERE r.id IS NULL "
-                "ORDER BY s.class, s.name")
-            rows = cur.fetchall()
-        self._csv(rows, ["姓名", "班级", "学号"],
-                  "unregistered_{}.csv".format(datetime.now(APP_TZ).strftime("%Y%m%d_%H%M%S")))
+                "ORDER BY s.class, s.student_id, s.name").fetchall()
+        stamp = export_stamp()
+        self._csv(rows, ["姓名", "班级", "学号"], "未报名名单_{}.csv".format(stamp),
+                  "unregistered_{}.csv".format(stamp))
 
     def _h_export_club_data(self, sess):
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -3650,23 +3865,117 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(400, {"success": False, "message": "无效的 club_id"})
         club_id = int(club_id)
         with DB_POOL.connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM clubs WHERE id = ?", (club_id,))
-            club = cur.fetchone()
+            club = conn.execute("SELECT name FROM clubs WHERE id = ?", (club_id,)).fetchone()
             if not club:
                 return self._json(404, {"success": False, "message": "社团不存在"})
-            cur.execute(
-                "SELECT s.name, s.class, s.student_id FROM students s "
+            rows = conn.execute(
+                "SELECT s.name, s.class, s.student_id, r.operation_id, r.registration_time FROM students s "
                 "JOIN registrations r ON s.id = r.student_id WHERE r.club_id = ? "
-                "ORDER BY s.class, s.name", (club_id,))
-            rows = cur.fetchall()
-        self._csv(rows, ["姓名", "班级", "学号"],
-                  "club_{}_{}.csv".format(club_id, datetime.now(APP_TZ).strftime("%Y%m%d_%H%M%S")))
+                "ORDER BY s.class, s.student_id, s.name", (club_id,)).fetchall()
+        stamp = export_stamp()
+        self._csv([(name, klass, number, registration_method(operation), when)
+                   for name, klass, number, operation, when in rows],
+                  ["姓名", "班级", "学号", "方式", "报名时间"],
+                  "{}_名单_{}.csv".format(_SHEET_NAME_BAD.sub(" ", club[0]).strip() or club_id, stamp),
+                  "club_{}_{}.csv".format(club_id, stamp))
+
+    def _h_export_workbook(self, sess):
+        """报名表：总表、每个社团一张表、未报名名单（有未报名学生时）。"""
+        with DB_POOL.connection() as conn:
+            rows = self._registration_rows(conn)
+            clubs = conn.execute("SELECT id, name FROM clubs ORDER BY id").fetchall()
+        summary = [(name, klass, number, club or "未报名", method, when)
+                   for name, klass, number, _club_id, club, method, when in rows]
+        sheets = [("总表", ["姓名", "班级", "学号", "社团", "方式", "报名时间"], summary, [10, 12, 14, 16, 10, 20])]
+        for club_id, club_name in clubs:
+            members = [(name, klass, number, method, when)
+                       for name, klass, number, member_club, _club, method, when in rows if member_club == club_id]
+            sheets.append((club_name, ["姓名", "班级", "学号", "方式", "报名时间"], members, [10, 12, 14, 10, 20]))
+        missing = [(name, klass, number) for name, klass, number, club_id, *_rest in rows if not club_id]
+        if missing:
+            sheets.append(("未报名", ["姓名", "班级", "学号"], missing, [10, 12, 14]))
+        stamp = export_stamp()
+        self._send(200, xlsx_bytes(sheets),
+                   ctype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                   extra=[attachment_header("社团报名表_{}.xlsx".format(stamp), "registrations_{}.xlsx".format(stamp)),
+                          ("Cache-Control", "no-store")])
+
+    # ---- 调剂 ----
+    def _h_adjustment_plan(self, sess):
+        with DB_POOL.connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                pairs, unplaced, seats = plan_adjustment(conn, rng=random.Random(0))
+                names = dict(conn.execute("SELECT id, name FROM clubs").fetchall())
+                locked = registration_locked(conn)
+            finally:
+                conn.rollback()
+        planned = collections.Counter(club for _student, club in pairs)
+        self._json(200, {
+            "locked": locked, "unregistered": len(pairs) + len(unplaced),
+            "assignable": len(pairs), "seats": sum(seats.values()),
+            "clubs": [{"id": club, "name": names.get(club), "remaining": seats[club], "assign": planned.get(club, 0)}
+                      for club in sorted(seats)],
+        }, extra=[("Cache-Control", "no-store")])
+
+    def _h_adjust_registrations(self, sess, data):
+        request_id = admin_request_id(data)
+        if request_id is None:
+            return self._json(400, {"success": False, "message": "请求编号无效"})
+        actor = sess.get("username", "admin")
+        replay = self._admin_replay(actor, "registrations.adjusted", request_id)
+        if replay:
+            after = json.loads(replay[3] or "{}")
+            after.pop("students", None)
+            return self._json(200, dict(after, success=True, replayed=True))
+        maintenance = RG.maintenance_begin()
+        if not maintenance:
+            return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        try:
+            with DB_POOL.connection() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if not registration_locked(conn):
+                        conn.rollback()
+                        return self._json(409, {"success": False, "message": "请先锁定名单"})
+                    pairs, unplaced, _seats = plan_adjustment(conn)
+                    batch = secrets.token_urlsafe(9)
+                    stamp = now_text()
+                    cur = conn.cursor()
+                    cur.executemany(
+                        "INSERT INTO registrations (student_id, club_id, registration_time, operation_id) "
+                        "VALUES (?,?,?,?)",
+                        [(student, club, stamp, "adjust-{}-{}".format(batch, student)) for student, club in pairs])
+                    planned = collections.Counter(club for _student, club in pairs)
+                    cur.executemany("UPDATE clubs SET current_students = current_students + ? WHERE id = ?",
+                                    [(count, club) for club, count in planned.items()])
+                    summary = {"assigned": len(pairs), "unassigned": len(unplaced),
+                               "by_club": {str(club): count for club, count in sorted(planned.items())}}
+                    append_audit_event(
+                        cur, event_id="adjust-" + batch, actor_role="admin", actor_id=actor,
+                        action="registrations.adjusted", target_type="registrations", request_id=request_id,
+                        before={"unregistered": len(pairs) + len(unplaced)},
+                        after=dict(summary, students=[[student, club] for student, club in pairs]),
+                        metadata={"batch": batch},
+                    )
+                    conn.commit()
+                except sqlite3.Error as e:
+                    conn.rollback()
+                    log.error("调剂失败: %s", e)
+                    return self._json(500, {"success": False, "message": "调剂失败"})
+            if not rebuild_all(maintenance):
+                RECONCILE_REQUESTED.set()
+                return self._json(503, dict(summary, success=False, message="调剂已保存，名额稍后发布"),
+                                  extra=[("Retry-After", "2")])
+            self._json(200, dict(summary, success=True))
+        finally:
+            RG.maintenance_end(maintenance)
 
     def _h_import_students(self, sess, data):
         students = data.get("students", [])
         if not isinstance(students, list) or not students:
-            return self._json(400, {"success": False, "message": "没有学生数据"})
+            return self._json(400, {"success": False, "message": "学生名单为空"})
         if len(students) > MAX_IMPORT_STUDENTS:
             return self._json(400, {"success": False,
                                     "message": "单次最多导入 {} 人".format(MAX_IMPORT_STUDENTS),
@@ -3724,7 +4033,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_import_clubs(self, sess, data):
         clubs = data.get("clubs", [])
         if not isinstance(clubs, list) or not clubs:
-            return self._json(400, {"success": False, "message": "没有社团数据"})
+            return self._json(400, {"success": False, "message": "社团名单为空"})
         actor = sess.get("username", "admin")
         results = {"success": 0, "failed": 0}
         new_ids = []
@@ -3809,7 +4118,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         except RuntimeError as e:
             log.error("报名时间已保存，同步开放时间失败: %s", e)
             RECONCILE_REQUESTED.set()
-            return self._json(503, {"success": False, "message": "时间已保存，正在同步，请稍后刷新确认"},
+            return self._json(503, {"success": False, "message": "时间已保存，正在同步"},
                               extra=[("Retry-After", "2")])
         self._json(200, {"success": True})
 
@@ -3870,7 +4179,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             RG.locked_set(locked)
         except RuntimeError:
             return self._json(503, {"success": False, "request_id": request_id, "retriable": True,
-                                    "message": "锁定状态已保存，正在同步；请用同一请求 ID 重试"},
+                                    "message": "锁定状态已保存，正在同步；请用同一请求编号重试"},
                               extra=[("Retry-After", "2")])
         if changed is None:
             return self._json(200, {"success": True, "replayed": True, "request_id": request_id,
@@ -3896,7 +4205,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             try:
                 session_lock = RG.session_begin_mutation("student", str(sid))
                 if not session_lock:
-                    return self._json(503, {"success": False, "message": "账号状态正在更新，请稍后再试"})
+                    return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
                 RG.session_revoke_identity("student", str(sid))
             except RuntimeError:
                 return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
@@ -3942,14 +4251,14 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_delete_all_students(self, sess, data):
         maintenance = RG.maintenance_begin()
         if not maintenance:
-            return self._json(503, {"success": False, "message": "有报名请求正在处理，请稍后再试"},
+            return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
                               extra=[("Retry-After", "2")])
         session_lock = None
         try:
             try:
                 session_lock = RG.session_begin_mutation("student")
                 if not session_lock:
-                    return self._json(503, {"success": False, "message": "账号状态正在更新，请稍后再试"})
+                    return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
                 RG.session_revoke_role("student")
             except RuntimeError:
                 return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
@@ -3989,7 +4298,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(400, {"success": False, "message": "缺少或非法的社团ID"})
         held = acquire_seat_locks([club_id])
         if not held:
-            return self._json(503, {"success": False, "message": "这个社团正在处理报名，请稍后再试"},
+            return self._json(503, {"success": False, "message": "该社团正在处理报名，请稍后重试"},
                               extra=[("Retry-After", "2")])
         try:
             with DB_POOL.connection() as conn:
@@ -4031,7 +4340,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_delete_all_clubs(self, sess, data):
         maintenance = RG.maintenance_begin()
         if not maintenance:
-            return self._json(503, {"success": False, "message": "有报名请求正在处理，请稍后再试"},
+            return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
                               extra=[("Retry-After", "2")])
         try:
             with DB_POOL.connection() as conn:

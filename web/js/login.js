@@ -39,7 +39,7 @@
       if (!shouldWait(result) || Date.now() - started > QUEUE_WINDOW_MS) break;
       App.busy(submit, '排队中');
       wait.hidden = false;
-      wait.textContent = '登录的人比较多，正在排队，请不要关闭页面（已等 ' + Math.round((Date.now() - started) / 1000) + ' 秒）';
+      wait.textContent = '排队中，已等待 ' + Math.round((Date.now() - started) / 1000) + ' 秒';
       await new Promise(resolve => setTimeout(resolve, result.retryAfter * 1000 + Math.random() * 600));
     }
     wait.hidden = true;
@@ -49,9 +49,9 @@
       return;
     }
     if (result.status === 0) {
-      error.textContent = '网络连接中断，请检查网络后重试';
+      error.textContent = '网络连接中断';
     } else {
-      error.textContent = (result.data && result.data.message) || '登录未完成，请稍后再试';
+      error.textContent = (result.data && result.data.message) || '登录失败，请重试';
     }
     $('#password').select();
   }

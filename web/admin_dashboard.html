@@ -9,13 +9,14 @@
 <meta name="theme-color" content="#F4EFE6">
 <title>管理控制台 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app.css?v=18">
+<link rel="stylesheet" href="/app.css?v=21">
 <script src="/js/legacy.js?v=18" defer></script>
 <script src="/js/common.js?v=18" defer></script>
-<script src="/js/admin.js?v=19" defer></script>
+<script src="/js/club-art.js?v=1" defer></script>
+<script src="/js/admin.js?v=21" defer></script>
 </head>
 <body>
-<div class="legacy-note" id="legacy" hidden>这个浏览器版本太旧，打不开选课页面。请换用新版 Edge、Chrome 或 Firefox；360、QQ、搜狗浏览器请点地址栏右侧的图标切换到“极速模式”。</div>
+<div class="legacy-note" id="legacy" hidden>当前浏览器版本过低。请使用新版 Edge、Chrome 或 Firefox；使用 360、QQ、搜狗浏览器时请切换到极速模式。</div>
 <a class="skip" href="#main">跳到主内容</a>
 <header class="topbar">
   <a class="brand" href="/admin/dashboard"><img src="/img/school-emblem.webp" alt="" width="34" height="34"><span><b>管理控制台</b><small>鄂尔多斯市实验中学</small></span></a>
@@ -29,7 +30,6 @@
   <div class="admin-head">
     <div>
       <h1><button id="home-trigger" type="button">工作台</button></h1>
-      <p>本学期社团选课管理</p>
     </div>
     <nav class="admin-nav" id="seg" aria-label="一级菜单">
       <button data-v="students" data-pane="students-import" type="button"><svg class="nav-icon" viewBox="0 0 120 80" width="82" height="54" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M49.2 8.6 L75.4 7 L87 18 L86.5 63.8 L50.2 65.3Z"/><path d="M75.4 7 L76 18.4 L87 18"/><path d="M69.1 52.2 L68.7 27"/><path d="M60.2 35.4 L68.7 26.4 L77 35"/><path d="M59.7 56.9 C64.9 58.1 72.3 58.1 77.6 56.7"/><path class="knock" d="M39.1 62.7 L35.3 70.9 C39.1 72.8 44.8 73 48.5 71.1 L51.1 64.2Z"/><path class="knock" d="M52.7 41.9 C45.6 39.6 36.6 40.8 34.7 46.5 C33 51.6 33.4 57.7 37 61.4 C41 65.4 48.1 65.6 52.5 62.9 L54.6 49.2 C59.3 48.4 63.3 46.3 62.8 42.9 C62.4 39.8 58 39.2 52.7 41.9Z"/><path d="M34.9 48.6 C38 48.6 41 49 43.3 49.7"/><path d="M34.5 54.3 C37.8 54.5 41 54.9 43.5 55.6"/><path d="M36.1 59.8 C39.1 60.2 41.8 60.6 44.1 61.2"/></svg><span>导入学生</span></button>
@@ -45,8 +45,8 @@
     <div class="home-grid">
       <article class="card home-banner">
         <div>
-          <p class="eyebrow">本学期</p>
-          <h2 id="home-phase">正在读取报名状态</h2>
+          <p class="eyebrow">报名状态</p>
+          <h2 id="home-phase">读取中</h2>
           <p class="hint" id="home-phase-detail"></p>
           <p class="clock-warn" id="home-clock" role="status" hidden></p>
           <div class="actions"><button class="btn btn-secondary btn-sm" type="button" data-home-route="settings:settings-registration">开放时间与锁定</button></div>
@@ -55,18 +55,18 @@
       </article>
       <article class="card home-card">
         <h2>导入学生</h2>
-        <p class="hint">从 Excel 粘贴姓名、班级和学号，系统为每人生成账号。</p>
+        <p class="hint">从 Excel 粘贴姓名、班级、学号，生成登录账号。</p>
         <button class="btn btn-primary btn-sm" type="button" data-home-route="students:students-import">开始导入</button>
       </article>
       <article class="card home-card">
         <h2>学生账号</h2>
         <p class="big num" id="home-account-total">—</p>
-        <p class="hint" id="home-account-count">导入学生后，这里显示账号数量。</p>
+        <p class="hint" id="home-account-count">暂无学生账号</p>
         <button class="btn btn-secondary btn-sm" type="button" data-home-route="students:students-accounts">账号发放</button>
       </article>
       <article class="card home-card">
         <h2>报名进度</h2>
-        <div id="home-project-list"><p class="hint">正在读取</p></div>
+        <div id="home-project-list"><p class="hint">读取中</p></div>
         <div class="actions"><button class="btn btn-secondary btn-sm" type="button" data-home-route="overview:overview-summary">查看全部</button></div>
       </article>
     </div>
@@ -74,52 +74,52 @@
 
   <section data-view="students" id="view-students" hidden>
     <article class="card" data-pane="students-import">
-      <div class="pane-head"><h2>导入学生</h2><p>系统为每位新学生创建账号，初始密码在下一步统一下载发放。</p></div>
+      <div class="pane-head"><h2>导入学生</h2><p>为每名学生创建登录账号；初始密码在“账号发放”中下载。</p></div>
       <ol class="steps" aria-label="导入流程"><li><b>1</b>粘贴名单</li><li><b>2</b>核对列</li><li><b>3</b>创建账号</li><li><b>4</b>下载发放</li></ol>
       <div class="field">
         <label for="imp-stu">学生名单</label>
-        <p class="hint">可以直接从 Excel 粘贴，也支持逗号或 Tab 分隔；第一行可以是表头。</p>
+        <p class="hint">从 Excel 复制粘贴，或用逗号、Tab 分隔；首行可为表头。</p>
         <textarea class="input" id="imp-stu" rows="8" spellcheck="false" placeholder="姓名&#9;班级&#9;学号&#10;巴特尔&#9;高一1班&#9;20260001"></textarea>
       </div>
       <div id="imp-stu-preview" hidden></div>
-      <p class="hint" id="imp-stu-check" aria-live="polite">粘贴名单后，这里会显示识别结果。</p>
+      <p class="hint" id="imp-stu-check" aria-live="polite">粘贴后显示识别结果。</p>
       <div class="actions"><button class="btn btn-primary" id="imp-stu-go" type="button" disabled>创建账号</button></div>
       <div class="progress" id="imp-stu-progress" hidden><div class="meter"><i></i></div><p class="hint" id="imp-stu-progress-text"></p></div>
       <p class="hint" id="imp-stu-result" aria-live="polite"></p>
     </article>
 
     <article class="card" data-pane="students-list" hidden>
-      <div class="pane-head"><h2>学生名单</h2><p>点“管理”可以为学生调整社团、重置密码，每次修改都写入操作记录。</p></div>
+      <div class="pane-head"><h2>学生名单</h2><p>在“管理”中调整社团或重置密码，修改记入操作记录。</p></div>
       <div class="toolbar">
         <label class="sr-only" for="stu-search">查找学生</label>
         <input class="input" id="stu-search" type="search" placeholder="按姓名、班级、学号、账号或社团查找" autocomplete="off">
       </div>
       <p class="hint" id="stu-count" aria-live="polite"></p>
-      <div class="table-wrap"><table class="tbl" id="stu-tbl"><tbody><tr><td>正在读取</td></tr></tbody></table></div>
+      <div class="table-wrap"><table class="tbl" id="stu-tbl"><tbody><tr><td>读取中</td></tr></tbody></table></div>
     </article>
 
     <article class="card" data-pane="students-accounts" hidden>
-      <div class="pane-head"><h2>账号发放</h2><p>本次创建的初始密码保存在当前页面，下载后按学校流程发放给学生。</p></div>
+      <div class="pane-head"><h2>账号发放</h2><p>初始密码只保存在当前页面，请下载后发放。</p></div>
       <div id="imp-stu-out" aria-live="polite"></div>
     </article>
 
     <article class="card danger-card" data-pane="students-danger" hidden>
-      <div class="pane-head"><h2>清空学生</h2><p>删除全部学生、登录账号和报名记录，社团保留。操作前请先在“报名数据”里导出需要保存的表格。</p></div>
+      <div class="pane-head"><h2>清空学生</h2><p>删除全部学生、账号和报名记录，社团保留。删除前请下载报名表。</p></div>
       <div class="actions"><button class="btn btn-danger" id="del-all-stu" type="button">清空全部学生</button></div>
     </article>
   </section>
 
   <section data-view="clubs" id="view-clubs" hidden>
     <article data-pane="clubs-cards">
-      <div class="pane-head"><h2>社团</h2><p>学生在选课页看到的名称、简介、老师、时间地点和名额都在这里编辑。</p></div>
+      <div class="pane-head"><h2>社团</h2><p>编辑社团名称、名额、简介、时间地点和照片。</p></div>
       <div class="project-grid" id="club-list"><div class="sk"></div></div>
     </article>
 
     <article class="card" data-pane="clubs-import" hidden>
-      <div class="pane-head"><h2>批量添加社团</h2><p>每行一个社团：名称和人数上限，用逗号或 Tab 分隔。添加后可以在社团卡片里补充简介等信息。</p></div>
+      <div class="pane-head"><h2>批量添加社团</h2><p>每行一个社团：名称和人数上限，用逗号或 Tab 分隔。</p></div>
       <div class="field">
         <label for="imp-club">社团列表</label>
-        <textarea class="input" id="imp-club" rows="6" spellcheck="false" placeholder="天文观测社（305）,30&#10;书法社,20"></textarea>
+        <textarea class="input" id="imp-club" rows="6" spellcheck="false" placeholder="3D打印,40&#10;传媒,40&#10;木工,40"></textarea>
       </div>
       <div class="actions"><button class="btn btn-primary" id="imp-club-go" type="button">添加社团</button></div>
       <p class="hint" id="imp-club-out" aria-live="polite"></p>
@@ -136,43 +136,49 @@
         <div class="metric"><small>未报名</small><b class="num" id="m-unreg">—</b></div>
         <div class="metric"><small>报名率</small><b class="num" id="m-rate">—</b></div>
       </div>
-      <div class="table-wrap" id="ov-fill"><p class="empty">正在读取</p></div>
+      <div class="table-wrap" id="ov-fill"><p class="empty">读取中</p></div>
     </article>
 
     <article class="card" data-pane="overview-audit" hidden>
-      <div class="pane-head"><h2>操作记录</h2><p>管理员的每次修改和学生的每次报名、退选，按时间记录在这里。</p></div>
+      <div class="pane-head"><h2>操作记录</h2><p>按时间记录管理操作和学生的报名、退选。</p></div>
       <div class="chips" id="audit-scope" role="group" aria-label="记录范围">
         <button class="chip" type="button" data-role="admin" aria-pressed="true">管理操作</button>
         <button class="chip" type="button" data-role="student" aria-pressed="false">学生报名</button>
         <button class="chip" type="button" data-role="" aria-pressed="false">全部</button>
       </div>
-      <div class="table-wrap audit-wrap"><table class="tbl" id="audit-tbl"><tbody><tr><td>正在读取</td></tr></tbody></table></div>
+      <div class="table-wrap audit-wrap"><table class="tbl" id="audit-tbl"><tbody><tr><td>读取中</td></tr></tbody></table></div>
       <div class="actions"><button class="btn btn-secondary btn-sm" id="audit-more" type="button" hidden>加载更早的记录</button></div>
     </article>
 
+    <article class="card" data-pane="overview-adjust" hidden>
+      <div class="pane-head"><h2>调剂</h2><p>名单锁定后，将未报名的学生随机安排到有空余名额的社团，遵守各社团的年级和班级范围。</p></div>
+      <div id="adjust-body"><p class="hint">读取中</p></div>
+    </article>
+
     <article class="card" data-pane="overview-exports" hidden>
-      <div class="pane-head"><h2>导出</h2><p>表格为 CSV，Excel 可直接打开。</p></div>
+      <div class="pane-head"><h2>导出</h2><p>报名表含总表、各社团名单和未报名名单，“方式”一列区分自选、调剂和管理员安排。</p></div>
       <div class="table-wrap">
-        <a class="export-row" href="/api/export_all_data"><span><strong>报名总表</strong><small>学生、班级、学号和报名社团</small></span><span>下载</span></a>
-        <a class="export-row" href="/api/export_unregistered"><span><strong>未报名名单</strong><small>还没有选择社团的学生</small></span><span>下载</span></a>
-        <a class="export-row" href="/api/export_students_csv"><span><strong>学生账号表</strong><small>登录账号，不含密码</small></span><span>下载</span></a>
+        <a class="export-row" href="/api/export_workbook"><span><strong>报名表</strong><small>Excel</small></span><span>下载</span></a>
+        <a class="export-row" href="/api/export_all_data"><span><strong>报名总表</strong><small>CSV</small></span><span>下载</span></a>
+        <a class="export-row" href="/api/export_unregistered"><span><strong>未报名名单</strong><small>CSV</small></span><span>下载</span></a>
+        <a class="export-row" href="/api/export_students_csv"><span><strong>学生账号表</strong><small>CSV · 姓名、班级、学号、用户名</small></span><span>下载</span></a>
       </div>
     </article>
   </section>
 
   <section data-view="settings" id="view-settings" hidden>
     <article class="card" data-pane="settings-registration">
-      <div class="pane-head"><h2>开放时间与名单锁定</h2><p>到达开放时间后学生端自动开放；锁定后报名和退选都停止，名单保持不变。</p></div>
+      <div class="pane-head"><h2>开放时间与名单锁定</h2><p>到开放时间后开放报名；锁定后报名与退选停止。</p></div>
       <div class="field"><label for="open-at">开放时间（学校时间）</label><input class="input" id="open-at" type="datetime-local"></div>
       <div class="actions"><button class="btn btn-primary" id="save-time" type="button">保存开放时间</button></div>
       <hr>
-      <p class="hint" id="lock-state">正在读取锁定状态</p>
-      <div class="field"><label for="lock-reason">锁定或解锁原因（写入操作记录）</label><input class="input" id="lock-reason" maxlength="200" placeholder="例如：报名结束，名单交给各社团老师"></div>
+      <p class="hint" id="lock-state">读取中</p>
+      <div class="field"><label for="lock-reason">原因（记入操作记录）</label><input class="input" id="lock-reason" maxlength="200" placeholder="例如：报名截止"></div>
       <div class="actions"><button class="btn btn-secondary" id="toggle-lock" type="button">锁定名单</button></div>
     </article>
 
     <article class="card" data-pane="settings-security" hidden>
-      <div class="pane-head"><h2>管理员密码</h2><p>修改后用新密码重新登录。</p></div>
+      <div class="pane-head"><h2>管理员密码</h2><p>修改后需重新登录。</p></div>
       <div class="field"><label for="ap-cur">当前密码</label><input class="input" id="ap-cur" type="password" autocomplete="current-password"></div>
       <div class="field"><label for="ap-new">新密码（至少 8 位）</label><input class="input" id="ap-new" type="password" autocomplete="new-password"></div>
       <div class="actions"><button class="btn btn-primary" id="save-apw" type="button">修改密码</button></div>
