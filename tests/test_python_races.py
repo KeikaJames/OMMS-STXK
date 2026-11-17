@@ -1167,29 +1167,40 @@ class PythonRaceRegressionTests(unittest.TestCase):
             from PIL import Image
         except ImportError:
             self.skipTest("Pillow unavailable")
-        image = Image.new("RGB", (8, 8), "navy")
-        out = io.BytesIO()
-        image.save(out, format="PNG")
-        raw = out.getvalue()
-        request = (
-            f"POST /api/upload_club_image?club_id=1&expected_revision=0&request_id=image-upload-0001&reason=upload "
-            f"HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\n"
-            "Content-Type: image/png\r\n"
-            f"Content-Length: {len(raw)}\r\nCookie: session={admin_token}\r\nConnection: close\r\n\r\n"
-        ).encode("ascii") + raw
-        status, headers, body = self._one_raw_request(request)
-        self.assertEqual(200, status)
-        self.assertEqual("application/json; charset=utf-8", headers.get("content-type"))
-        uploaded = json.loads(body)
+        def upload(picture, revision: int, request_id: str) -> dict:
+            out = io.BytesIO()
+            picture.save(out, format="PNG")
+            raw = out.getvalue()
+            request = (
+                f"POST /api/upload_club_image?club_id=1&expected_revision={revision}&request_id={request_id}"
+                f"&reason=upload HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\n"
+                "Content-Type: image/png\r\n"
+                f"Content-Length: {len(raw)}\r\nCookie: session={admin_token}\r\nConnection: close\r\n\r\n"
+            ).encode("ascii") + raw
+            status, headers, body = self._one_raw_request(request)
+            self.assertEqual(200, status, body)
+            self.assertEqual("application/json; charset=utf-8", headers.get("content-type"))
+            return json.loads(body)
+
+        def fetch(path: str) -> tuple[int, dict[str, str], bytes]:
+            return self._one_raw_request(
+                f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\nConnection: close\r\n\r\n".encode("ascii"))
+
+        transparent = upload(Image.new("RGBA", (8, 8), (0, 0, 128, 200)), 0, "image-upload-0001")
+        self.assertRegex(transparent["club"]["image_path"], r"^/club-images/1-[0-9a-f]{32}\.png$")
+        image_status, image_headers, _image_body = fetch(transparent["club"]["image_path"])
+        self.assertEqual((200, "image/png"), (image_status, image_headers.get("content-type")))
+
+        uploaded = upload(Image.new("RGB", (2400, 1600), "navy"), transparent["club"]["revision"], "image-upload-0002")
         image_path = uploaded["club"]["image_path"]
-        self.assertRegex(image_path, r"^/club-images/1-[0-9a-f]{32}\.png$")
+        self.assertRegex(image_path, r"^/club-images/1-[0-9a-f]{32}\.jpg$")
+        image_status, image_headers, image_body = fetch(image_path)
+        self.assertEqual((200, "image/jpeg"), (image_status, image_headers.get("content-type")))
+        self.assertEqual((960, 640), Image.open(io.BytesIO(image_body)).size)
+        self.assertEqual(404, fetch(transparent["club"]["image_path"])[0])
         image_get = (
             f"GET {image_path} HTTP/1.1\r\nHost: 127.0.0.1:{self.http_port}\r\nConnection: close\r\n\r\n"
         ).encode("ascii")
-        image_status, image_headers, image_body = self._one_raw_request(image_get)
-        self.assertEqual(200, image_status)
-        self.assertEqual("image/png", image_headers.get("content-type"))
-        self.assertGreater(len(image_body), 0)
         clubs_status, clubs = self._request_json("GET", "/api/get_clubs")
         self.assertEqual(200, clubs_status)
         self.assertEqual(image_path, clubs[0]["image_path"])

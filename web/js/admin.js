@@ -993,7 +993,7 @@
     row3.append(field('年级限制', grades), field('班级限制', classes));
     const buttons = el('div', 'actions');
     buttons.append(save, cancel);
-    form.append(row1, field('简介', description), row2, field('地点', location), row3, enabledLabel, field('社团照片（可选，2 MB 以内）', image), error, buttons);
+    form.append(row1, field('简介', description), row2, field('地点', location), row3, enabledLabel, field('社团照片（可选，10 MB 以内）', image), error, buttons);
     const requestIds = { update: App.requestId(), upload: App.requestId() };
     form.addEventListener('input', () => { requestIds.update = App.requestId(); });
     cancel.addEventListener('click', () => { editingClub = null; loadClubs(); });

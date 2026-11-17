@@ -5,6 +5,8 @@
 #   bash run.sh reset-admin          重置管理员密码，新密码只输出一次
 #   bash run.sh restore 备份文件      停止服务，从完整备份（.zip）或数据库快照（.db）恢复后重新启动
 #   OMMS_PYTHON_ONLY=1 bash run.sh   不编译 Rust，由 Python 服务全部接口
+#   TLS_CERT=证书 TLS_KEY=私钥 bash run.sh      在 TLS_PORT（默认 8443）上提供 HTTPS，8080 跳转到 HTTPS
+#   REAL_IP_FROM=127.0.0.1 bash run.sh         经内网穿透或反向代理访问时，按 REAL_IP_HEADER 取学生的真实地址
 # 没有 cargo、Rust 版本过旧或首次编译失败时，自动改用只运行 Python 的模式。
 set -o pipefail
 
@@ -45,6 +47,29 @@ rcli() { redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" "$@"; }
 redis_up() { rcli ping >/dev/null 2>&1; }
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 http_ok() { curl -fsS -o /dev/null --max-time 2 "$1" 2>/dev/null; }
+
+# 每个学生连接在 nginx 上占 1 至 2 个文件句柄；macOS 终端默认上限只有 256。
+raise_open_files() {
+    local hard want=65536
+    hard=$(ulimit -Hn)
+    if [ "$hard" != unlimited ] && [ "$hard" -lt "$want" ]; then
+        want=$hard
+    fi
+    ulimit -n "$want" 2>/dev/null || ulimit -n 10240 2>/dev/null || true
+}
+
+# 开放瞬间的连接先进入内核队列，队列上限低于 1024 时提示调高（需要管理员权限，重启后恢复默认）。
+check_backlog() {
+    local current="" command=""
+    case "$(uname -s)" in
+        Darwin) current=$(sysctl -n kern.ipc.somaxconn 2>/dev/null); command="sudo sysctl -w kern.ipc.somaxconn=2048" ;;
+        Linux) current=$(cat /proc/sys/net/core/somaxconn 2>/dev/null); command="sudo sysctl -w net.core.somaxconn=2048" ;;
+    esac
+    case "$current" in ''|*[!0-9]*) return 0 ;; esac
+    if [ "$current" -lt 1024 ]; then
+        say "[系统] 连接队列上限为 $current，开放报名前执行：$command"
+    fi
+}
 
 wait_until() {
     # wait_until 秒数 命令...：在限定时间内等待命令成功
@@ -112,6 +137,14 @@ if [ "${1:-}" = "restore" ]; then
 fi
 
 # ---- 预检：在旧服务仍在线时完成，失败不影响旧服务 ----
+raise_open_files
+if [ -n "${TLS_CERT:-}${TLS_KEY:-}" ]; then
+    if [ ! -r "${TLS_CERT:-}" ] || [ ! -r "${TLS_KEY:-}" ]; then
+        say "[nginx] TLS_CERT 与 TLS_KEY 需指向可读的证书与私钥文件"
+        exit 1
+    fi
+    export COOKIE_SECURE=1
+fi
 if ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 7))' 2>/dev/null; then
     say "[python] 需要 Python 3.7 或更高版本（当前：$("$PYTHON" -V 2>&1)），可用 PYTHON=python3.8 指定"
     exit 1
@@ -174,6 +207,41 @@ if [ "$PYTHON_ONLY" = "1" ]; then
         -e '/^ *keepalive 64;$/d' "$NGINX_CONF.new"
 fi
 rm -f "$NGINX_CONF.new.bak"
+if ! "$PYTHON" - "$NGINX_CONF.new" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as source:
+    text = source.read()
+sources = [item.strip() for item in os.environ.get("REAL_IP_FROM", "").split(",") if item.strip()]
+if sources:
+    lines = "".join("    set_real_ip_from {};\n".format(item) for item in sources)
+    lines += "    real_ip_header {};\n    real_ip_recursive on;\n".format(os.environ.get("REAL_IP_HEADER") or "X-Forwarded-For")
+    anchor = "    server_tokens off;\n"
+    if anchor not in text:
+        sys.exit("server_tokens 行缺失")
+    text = text.replace(anchor, anchor + lines, 1)
+cert, key = os.environ.get("TLS_CERT"), os.environ.get("TLS_KEY")
+if cert and key:
+    port = os.environ.get("TLS_PORT") or "8443"
+    anchor = "    server {\n        listen 8080 backlog=2048;\n"
+    if anchor not in text:
+        sys.exit("listen 8080 行缺失")
+    text = text.replace(anchor, (
+        "    server {\n        listen 8080;\n        server_name _;\n"
+        "        return 301 https://$host:" + port + "$request_uri;\n    }\n\n"
+        "    server {\n        listen " + port + " ssl backlog=2048;\n"
+        "        ssl_certificate     " + cert + ";\n        ssl_certificate_key " + key + ";\n"
+        "        ssl_protocols TLSv1.2 TLSv1.3;\n"
+        "        add_header Strict-Transport-Security \"max-age=31536000\" always;\n"), 1)
+with open(path, "w", encoding="utf-8") as target:
+    target.write(text)
+PY
+then
+    say "[nginx] 生成 HTTPS 或来源地址配置失败，旧服务保持不变"
+    exit 1
+fi
 if ! nginx -t -p "$RUN_DIR" -c "$NGINX_CONF.new" >/dev/null 2>&1; then
     nginx -t -p "$RUN_DIR" -c "$NGINX_CONF.new"
     say "[nginx] 新配置校验失败，旧服务保持不变"
@@ -200,6 +268,10 @@ if ! wait_until 30 http_ok "http://127.0.0.1:2001/healthz"; then
     exit 1
 fi
 say "[python] http://127.0.0.1:2001 就绪"
+if command -v caffeinate >/dev/null 2>&1; then
+    # macOS：服务运行期间阻止系统闲置睡眠，接通电源时同时阻止系统睡眠；Python 服务退出后自动解除。
+    nohup caffeinate -i -s -w "$(cat "$RUN_DIR/python.pid")" >/dev/null 2>&1 &
+fi
 
 if [ "$PYTHON_ONLY" != "1" ]; then
     BIND=127.0.0.1:2002 nohup "$RUST_BIN" > "$RUN_DIR/rust.log" 2>&1 &
@@ -213,7 +285,12 @@ if [ "$PYTHON_ONLY" != "1" ]; then
 fi
 
 if nginx -p "$RUN_DIR" -c "$NGINX_CONF"; then
-    say "[nginx] http://127.0.0.1:8080 就绪"
+    if [ -n "${TLS_CERT:-}" ]; then
+        say "[nginx] https://127.0.0.1:${TLS_PORT:-8443} 就绪，http://127.0.0.1:8080 跳转到 HTTPS"
+    else
+        say "[nginx] http://127.0.0.1:8080 就绪"
+    fi
+    check_backlog
 else
     say "[nginx] 启动失败，可直接访问 http://127.0.0.1:2001"
     exit 1

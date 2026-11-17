@@ -166,7 +166,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
         # production-oriented value remains 250r/s with a 1000-request burst.
         config = (
             template.replace("__APP_ROOT__", str(REPO_ROOT))
-            .replace("listen 8080;", f"listen 127.0.0.1:{cls.edge_port};")
+            .replace("listen 8080 backlog=2048;", f"listen 127.0.0.1:{cls.edge_port};")
             .replace(
                 "server 127.0.0.1:2002 max_fails=2 fail_timeout=5s;",
                 f"server 127.0.0.1:{cls.rust_port} max_fails=2 fail_timeout=5s;",
@@ -413,7 +413,7 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
             from PIL import Image
         except ImportError:
             self.skipTest("Pillow unavailable")
-        image = Image.new("RGB", (8, 8), "navy")
+        image = Image.new("RGBA", (8, 8), (0, 0, 128, 200))
         out = io.BytesIO()
         image.save(out, format="PNG")
         raw = out.getvalue()
