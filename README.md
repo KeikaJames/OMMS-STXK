@@ -9,7 +9,6 @@
 ![Rust](https://img.shields.io/badge/Rust-1.88%2B-CE422B?logo=rust&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-3.2%2B-DC382D?logo=redis&logoColor=white)
 
-<sub>为 <b>鄂尔多斯市实验中学</b> 而做</sub>
 
 <img src="docs/login.jpg" alt="登录页" width="760">
 
