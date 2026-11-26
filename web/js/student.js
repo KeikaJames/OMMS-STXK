@@ -90,8 +90,8 @@
     for (var i = 0; i < state.catalog.length; i += 1) if (state.catalog[i].id === id) return state.catalog[i];
     return null;
   }
-  function metaLine(club, info) {
-    return [info.room, club.location, club.meeting_time, teacher(club.advisor_name)].filter(Boolean).join(' · ');
+  function metaParts(club, info) {
+    return [info.room, club.location, club.meeting_time, teacher(club.advisor_name)].filter(Boolean);
   }
 
   // ---- 数据 ----
@@ -211,7 +211,7 @@
   function closeLabel(startText, endText) {
     var end = App.schoolTime(endText);
     if (!end) return '';
-    return (startText && String(startText).slice(0, 10) === String(endText).slice(0, 10) ? end.split(' ').pop() : end) + ' 截止';
+    return (startText && String(startText).slice(0, 10) === String(endText).slice(0, 10) ? end.split(/\s/).pop() : end) + ' 截止';
   }
 
   function renderStatus() {
@@ -224,10 +224,10 @@
     var until = batch ? closeLabel(startText, endText) : (App.schoolTime(endText) ? App.schoolTime(endText) + ' 截止' : '');
     var texts = {
       unset: ['开放时间待定', ''],
-      countdown: ['距开放', [name, openText ? openText + ' 开放' : '', until].filter(Boolean).join(' · ')],
-      open: ['报名中', [name, until].filter(Boolean).join(' · ')],
-      chosen: ['已报名', [name, until].filter(Boolean).join(' · ')],
-      locked: ['报名已截止', [name, registeredId() ? '' : '社团由老师统一安排'].filter(Boolean).join(' · ')]
+      countdown: ['距开放', [name, openText ? openText + ' 开放' : '', until].filter(Boolean).join('\u00a0· ')],
+      open: ['报名中', [name, until].filter(Boolean).join('\u00a0· ')],
+      chosen: ['已报名', [name, until].filter(Boolean).join('\u00a0· ')],
+      locked: ['报名已截止', [name, registeredId() ? '' : '社团由老师统一安排'].filter(Boolean).join('\u00a0· ')]
     };
     var text = texts[current];
     var detail = $('#status-detail');
@@ -262,11 +262,10 @@
     }
     var club = clubById(id);
     var info = splitRoom(club ? club.name : state.me.registered_club);
-    var meta = club ? metaLine(club, info) : '';
+    var meta = club ? metaParts(club, info) : [];
     box.hidden = false;
     $('#mine-name').textContent = info.name;
-    $('#mine-meta').textContent = meta;
-    $('#mine-meta').hidden = !meta;
+    App.dotted($('#mine-meta'), meta).hidden = !meta.length;
     var cancelling = state.pending && state.pending.kind === 'cancel';
     var key = phase() === 'locked' ? 'locked' : cancelling ? 'busy:' + state.pending.label : 'idle:' + info.name;
     if (actions.getAttribute('data-key') === key) return;
@@ -349,9 +348,8 @@
     App.toggleClass(card, 'is-mine', mine);
     App.toggleClass(card, 'is-off', Boolean(next.off));
     $('.club-name', card).textContent = info.name;
-    var meta = $('.club-meta', card);
-    meta.textContent = metaLine(club, info);
-    meta.hidden = !meta.textContent;
+    var meta = metaParts(club, info);
+    App.dotted($('.club-meta', card), meta).hidden = !meta.length;
     var desc = $('.club-desc', card);
     desc.textContent = club.description || '';
     desc.hidden = !club.description;

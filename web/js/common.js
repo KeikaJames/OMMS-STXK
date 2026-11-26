@@ -142,6 +142,17 @@
     while (node && node.firstChild) node.removeChild(node.firstChild);
     return node;
   }
+  // 几段信息用“ · ”连成一行：每段整体换行，分隔点跟在上一段末尾。parts 为文字或 .dot-item 节点。
+  function dotted(node, parts) {
+    clear(node);
+    parts.forEach(function (part, index) {
+      var item = part && part.nodeType ? part : el('span', 'dot-item', part);
+      if (index) node.appendChild(document.createTextNode(' '));
+      if (index < parts.length - 1) item.appendChild(document.createTextNode('\u00a0·'));
+      node.appendChild(item);
+    });
+    return node;
+  }
   function button(label, className, onClick) {
     var node = el('button', className, label);
     node.type = 'button';
@@ -294,10 +305,10 @@
 
   function pad(value) { return value < 10 ? '0' + value : String(value); }
 
-  // 开放与截止时间按学校时区的原始文本显示，与设备时区无关。
+  // 开放与截止时间按学校时区的原始文本显示，与设备时区无关。各部分用不换行空格连接，日期和钟点保持在同一行。
   function schoolTime(text) {
     var match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(text || '');
-    return match ? Number(match[2]) + ' 月 ' + Number(match[3]) + ' 日 ' + match[4] + ':' + match[5] : '';
+    return match ? [Number(match[2]), '月', Number(match[3]), '日', match[4] + ':' + match[5]].join('\u00a0') : '';
   }
 
   // ---- 对话框与表格页 ----
@@ -427,6 +438,7 @@
     el: el,
     add: add,
     clear: clear,
+    dotted: dotted,
     button: button,
     toggleClass: toggleClass,
     hidden: hidden,

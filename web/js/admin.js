@@ -121,7 +121,7 @@
   function stampText(value) {
     if (typeof value !== 'number') return value ? App.schoolTime(String(value)) : '';
     var date = new Date(value);
-    return (date.getMonth() + 1) + ' 月 ' + date.getDate() + ' 日 ' + App.pad(date.getHours()) + ':' + App.pad(date.getMinutes());
+    return [date.getMonth() + 1, '月', date.getDate(), '日', App.pad(date.getHours()) + ':' + App.pad(date.getMinutes())].join('\u00a0');
   }
   function fileSize(bytes) {
     return bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB';
@@ -144,7 +144,7 @@
     var start = App.schoolTime(batch.start_time);
     var end = App.schoolTime(batch.end_time);
     var sameDay = String(batch.start_time).slice(0, 10) === String(batch.end_time).slice(0, 10);
-    return start + '–' + (sameDay ? end.split(' ').pop() : end);
+    return start + '–' + (sameDay ? end.split(/\s/).pop() : end);
   }
   function batchStateText(batch) {
     return { open: '报名中', closed: '已截止', waiting: '待开放' }[batch.state] || '';
@@ -446,7 +446,7 @@
     var parts = [];
     if (time.start_time) parts.push(App.schoolTime(time.start_time) + ' 开放');
     if (time.end_time) parts.push(App.schoolTime(time.end_time) + ' 截止');
-    return parts.join(' · ');
+    return parts.join('\u00a0· ');
   }
 
   function renderPhase(time) {
@@ -1337,8 +1337,8 @@
     art.appendChild(ClubArt.node(club));
     var body = el('div', 'club-body');
     body.appendChild(el('h3', 'club-name', info.name));
-    var meta = [info.room, club.location, club.meeting_time, teacher(club.advisor_name)].filter(Boolean).join(' · ');
-    if (meta) body.appendChild(el('p', 'club-meta', meta));
+    var meta = [info.room, club.location, club.meeting_time, teacher(club.advisor_name)].filter(Boolean);
+    if (meta.length) body.appendChild(App.dotted(el('p', 'club-meta'), meta));
     if (club.description) body.appendChild(el('p', 'club-desc', club.description));
     var tags = el('div', 'club-tags');
     if (!club.enabled) tags.appendChild(el('span', 'tag tag-warn', '暂停报名'));
@@ -1349,12 +1349,10 @@
     if (batchMode()) {
       // 分批报名：名额按批计算，列出各批已报名人数。
       add(body, add(el('div', 'seats'), el('span', '', '每批名额'), el('b', 'num', String(club.max_students))));
-      var counts = el('p', 'club-batches');
-      batchList().forEach(function (batch, index) {
-        if (index) counts.appendChild(document.createTextNode(' · '));
-        add(counts, document.createTextNode(batch.name + ' '), el('b', 'num', String(Number((batch.clubs || {})[club.id]) || 0)));
+      var counts = batchList().map(function (batch) {
+        return add(el('span', 'dot-item'), document.createTextNode(batch.name + ' '), el('b', 'num', String(Number((batch.clubs || {})[club.id]) || 0)));
       });
-      if (counts.childNodes.length) body.appendChild(counts);
+      if (counts.length) body.appendChild(App.dotted(el('p', 'club-batches'), counts));
     } else {
       add(body,
         add(el('div', 'seats'), el('span', '', '已报名'), el('b', 'num', String(club.current_students)), el('span', '', '/ ' + club.max_students)),
@@ -1493,7 +1491,8 @@
         { label: '存储', kind: 'primary', onClick: save }
       ]
     });
-    setTimeout(function () { name.focus(); }, 0);
+    // 插图在名称上方，聚焦名称时不滚动，打开后先看到卡片图。
+    setTimeout(function () { name.focus({ preventScroll: true }); }, 0);
 
     function refreshRevision() {
       return App.request('/api/get_clubs').then(function (result) {
@@ -1765,7 +1764,7 @@
         (meta.count ? ' · ' + meta.count + ' 个' : ''));
     }
     if (event.reason) parts.push(event.reason);
-    return parts.filter(Boolean).join(' · ');
+    return parts.filter(Boolean).join('\u00a0· ');
   }
 
   function loadAudit(reset) {
