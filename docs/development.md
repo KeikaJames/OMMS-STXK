@@ -42,7 +42,7 @@ DB_PATH=/tmp/omms/club_system.db REDIS_URL=redis://127.0.0.1:6390/0 python3 main
 
 输出三行：`ADMIN_USER=`、`ADMIN_PASSWORD=`、`LOGIN_URL=`。登录链接 2 分钟内有效、只能使用一次，只在本机打开。
 
-常用环境变量：`HOST`（监听地址，局域网访问时设为 `0.0.0.0`）、`PORT`（默认 2001）、`WEB_DIR`、`LOG_LEVEL`。完整列表见 README 的“配置”一节。
+常用环境变量：`HOST`（监听地址，局域网访问时设为 `0.0.0.0`）、`PORT`（默认 2001）、`WEB_DIR`、`LOG_LEVEL`。服务部署参数见[部署指南](deployment.md)。
 
 ### 2.2 完整运行
 
