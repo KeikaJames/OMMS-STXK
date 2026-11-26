@@ -4,6 +4,11 @@
 
 系统服务于鄂尔多斯市实验中学的社团选课：管理员导入学生和社团、设定开放时间；到点后学生在网页上抢报，每人一个社团；截止后锁定名单，把未报名的学生调剂到有空位的社团，最后导出名单并备份。
 
+报名方式有两种，按学校的实际安排选：
+
+- **同时报名**：全体学生在同一时段报名，共用各社团的名额。
+- **分批报名**：学生分几节课到机房报名时使用。按班级分批，各批在自己的时段报名，社团名额每批单独计算；同一批报名的学生通常也一起上课。见 4.6。
+
 ---
 
 ## 1. 工作方式与边界
@@ -32,6 +37,8 @@
 |---|---|
 | 报名进行中或一小时内开放时重启、停止服务 | `start_service`、`stop_service`、`update_settings(restart)` |
 | 报名进行中锁定名单、改动开放时间 | `set_lock`、`set_schedule`、`clear_schedule` |
+| 报名进行中或一小时内开放时改动报名方式或批次 | `set_batches` |
+| 当前批次现在开放或现在截止 | `batch_now` |
 | 导入名单 | `import_roster` |
 | 重置学生密码 | `reset_passwords` |
 | 删除学生、删除社团 | `delete_student`、`delete_club` |
@@ -117,11 +124,15 @@
 
 2. **添加社团**
    - `add_club(name, capacity, description, advisor, meeting_time, location, grades, classes)`。
-   - 各社团人数上限之和大于或等于学生人数时，调剂后每名学生都有社团；`get_overview` 的“流程”并列显示名额与学生人数。
-   - 社团卡片默认显示插图（3D 打印、传媒、木工有专门插图）。换图片：`update_club(club, image: "/完整路径/图片.jpg")`；恢复插图：`image: "default"`。
+   - 同时报名：`capacity` 是人数上限。各社团人数上限之和大于或等于学生人数时，调剂后每名学生都有社团；`get_overview` 的“流程”并列显示名额与学生人数。
+   - 分批报名：`capacity` 是每批名额，通常就是这个社团一节课能容纳的人数（教室座位、设备数量）。每批名额之和大于或等于人数最多的一批时，调剂后每名学生都有社团。
+   - 社团卡片显示管理员选定的插图。新社团按名称先选好一幅（例如“激光雕切”为激光雕刻、“3D设计”为 3D 建模），之后改名不影响已选的插图。`list_clubs` 的“图片”一列写明当前用哪幅。
+   - 换插图：`update_club(club, art: "laser")`，可选 club（通用）、laser（激光雕刻）、design（平面设计）、model3d（3D 建模）、print（3D 打印）、media（影视传媒）、wood（木工）、code（编程）、robot（机器人）、paint（美术）、music（音乐）、science（科学实验）、sports（体育）、book（阅读写作）。
+   - 换成照片：`update_club(club, image: "/完整路径/图片.jpg")`，照片优先于插图显示；改回插图：`image: "default"`。
 
 3. **设置开放与截止时间**
-   - `set_schedule(open_at, close_at)`，学校时间，例如 `"2026-11-20 08:00"`。
+   - 先确认报名方式：问管理员学生是一起报名，还是分几节课到机房报名。分几节课时用分批报名（4.6），时间在各批里设置。
+   - 同时报名：`set_schedule(open_at, close_at)`，学校时间，例如 `"2026-11-20 08:00"`。
    - 到开放时间自动开放，到截止时间自动锁定名单；截止时间可以不设，届时手动锁定。
    - 管理员说相对时间（“明天早上八点”）时，先用 `get_overview` 的“服务器当前时间”换算成具体日期，再向管理员复述一遍确认。
 
@@ -153,14 +164,40 @@
 ### 4.4 截止之后
 
 1. 到截止时间自动锁定；也可以随时 `set_lock(true, confirm)`。
-2. 调剂：`adjustment()` 查看未报名人数、各社团空余和将安排人数 → 向管理员说明 → `adjustment(run: true, confirm: true)`。调剂遵守年级和班级范围，随机安排，安排人数取最大值；空余名额小于未报名人数时，先提高人数上限或放宽范围。
-3. 导出：`export_data(kind: "workbook")`，Excel 里有总表、各社团名单和未报名名单，“方式”一列区分自选、调剂和管理员安排。
+2. 调剂：`adjustment()` 查看未报名人数、各社团空余和将安排人数 → 向管理员说明 → `adjustment(run: true, confirm: true)`。调剂遵守年级和班级范围，随机安排，安排人数取最大值；空余名额小于未报名人数时，先提高人数上限或放宽范围。分批报名时每批只用本批的空余名额，预览按批列出。
+3. 导出：`export_data(kind: "workbook")`，Excel 里有总表、各社团名单和未报名名单，“方式”一列区分自选、调剂和管理员安排。分批报名时每张表的第一列是批次，按批次排序，方便按节次打印。
 4. 备份：`backup_now()`，建议管理员把这个 zip 另存到其他电脑或 U 盘。
 
 ### 4.5 下一轮或新学期
 
 - 学生不变：`set_lock(true)` → `clear_data(registrations)` → 调整社团 → `set_schedule` → `set_lock(false)`。
 - 学生更换：`clear_data(students)` 后重新导入；社团更换：`clear_data(clubs)` 后重新添加。每次清空前系统自动保存快照。
+
+### 4.6 分批报名（学生分几节课到机房报名）
+
+机房一次坐不下全部学生、各班轮流来报名时使用。每一批在自己的时段报名，只和同一批的学生竞争名额。
+
+1. **确认安排**：向管理员问清每节课来哪几个班、几点开始、几点结束，以及每个社团一节课收多少人。
+2. **导入全部学生**：和同时报名一样，一次导入全部班级。
+3. **社团名额按批设置**：`update_club(club, capacity: 每批名额)`。例如每个社团一节课收 30 人，就设 30；4 批时这个社团合计收 120 人。
+4. **设置批次**：`set_batches(batch_mode: true, batches: [...])`，给出全部批次：
+
+   ```json
+   {"batch_mode": true, "batches": [
+     {"open_at": "2026-11-27 10:00", "close_at": "2026-11-27 10:40", "classes": ["高一1班", "高一2班"]},
+     {"open_at": "2026-11-27 10:50", "close_at": "2026-11-27 11:30", "classes": ["高一3班", "高一4班"]}
+   ]}
+   ```
+
+   - 批次按开放时间自动编号，第 1 批最早；后一批在前一批截止时或之后开放。
+   - 每个班级只放在一批里。`get_overview` 的“待分批的班级”列出还没加入批次的班级，把它们加入某一批。
+   - 改动某一批时也给出全部批次；`batches` 缺省时只改报名方式。
+   - 管理员说“每节课来两个班、10 点开始、每节 40 分钟、课间 10 分钟”时，按班级顺序每两个班一批，依次排出各批时段，复述后保存。控制台的“快速分批”做的是同一件事。
+5. **报名期间**：学生提前到齐时 `batch_now(batch, action: "open")` 让这一批现在开放；提前下课时 `batch_now(batch, action: "close")` 现在截止。当前批次截止后系统自动切换到下一批；学生页显示本班所在批次的倒计时和截止时间。`get_overview` 的“报名状态”写明当前批次，例如“第 2 批报名中”，“批次”列出各批的人数和状态。
+6. **最后一批截止后**：名单自动锁定并保存快照，按 4.4 调剂、导出、备份。
+7. **改回同时报名**：`set_batches(batch_mode: false)`，再用 `set_schedule` 设置开放时间。已保存的批次保留，之后改回分批报名时继续使用。
+
+切换报名方式或改批次时，系统核对每个名额池里的报名人数：某社团在某一批的报名人数超过每批名额时，返回提示，先按提示提高名额再保存。已经用同时报名报过名、准备改成分批报名时，常见做法是：`set_lock(true)` → `clear_data(registrations)` → `set_batches` → 设置每批名额 → `set_lock(false)`。
 
 ---
 
@@ -176,15 +213,17 @@
 | `get_settings` / `update_settings` | 查看、修改运行参数 | `values`、`restart`、`confirm` |
 | `admin_credentials` | 管理员账号、密码、控制台地址 | — |
 | `change_admin_password` | 修改管理员密码（缺省随机 12 位） | `new_password` |
-| `get_overview` | 报名概览与流程状态 | — |
-| `set_schedule` / `clear_schedule` | 开放与截止时间 | `open_at`、`close_at`、`confirm` |
+| `get_overview` | 报名概览、报名方式与各批次、流程状态 | — |
+| `set_schedule` / `clear_schedule` | 同时报名的开放与截止时间 | `open_at`、`close_at`、`confirm` |
+| `set_batches` | 报名方式与批次（各批的时段和班级） | `batch_mode`、`batches`、`confirm` |
+| `batch_now` | 当前批次现在开放或现在截止 | `batch`、`action`、`confirm` |
 | `set_lock` | 锁定或解除锁定名单 | `locked`、`reason`、`confirm` |
 | `preview_roster` / `import_roster` | 预览、导入名单 | `file_path`、`fixes`、`skip`、`include_imported`、`output_dir`、`reveal`、`confirm` |
 | `list_students` | 查找学生 | `query`、`class`、`club`、`status`、`limit`、`offset` |
 | `update_student` | 改姓名班级、代为报名、调整或移出社团 | `student`、`name`、`class`、`club`、`ignore_limits`、`reason` |
 | `reset_passwords` | 重置单个学生或整班密码 | `student` 或 `class`、`save_excel`、`confirm` |
 | `delete_student` | 删除学生 | `student`、`confirm` |
-| `list_clubs` / `add_club` / `update_club` / `delete_club` | 社团管理与图片 | `club`、`name`、`capacity`、`description`、`advisor`、`meeting_time`、`location`、`grades`、`classes`、`enabled`、`image` |
+| `list_clubs` / `add_club` / `update_club` / `delete_club` | 社团管理、卡片插图与照片 | `club`、`name`、`capacity`、`description`、`advisor`、`meeting_time`、`location`、`grades`、`classes`、`enabled`、`art`、`image` |
 | `adjustment` | 调剂预览与执行 | `run`、`confirm` |
 | `export_data` | 导出报名表、CSV、社团名单 | `kind`、`club`、`output_dir`、`reveal` |
 | `audit_log` | 操作记录 | `role`: admin、student、all；`limit` |
@@ -211,6 +250,10 @@
 | 打开管理后台 | `open_console` |
 | 学生用什么地址 / 机房里怎么让学生打开 | `service_status` 的“访问地址”；控制台工作台“学生访问”卡片的“放大显示”可用于屏幕广播；做法见 4.3 |
 | 明天 8 点开放、17 点截止 | 换算日期并复述 → `set_schedule` |
+| 分几节课报名 / 每节课来两个班 | 问清各批的班级和时段、每个社团一节课收多少人 → `update_club(capacity)` → `set_batches(batch_mode: true, batches)`；做法见 4.6 |
+| 第二批的学生到齐了，现在开始 / 这节课提前结束 | `batch_now(batch: 2, action: "open", confirm)` / `batch_now(batch, action: "close", confirm)` |
+| 第二批推迟十分钟 | `get_overview` 取出全部批次 → 改第二批及之后各批的时间 → `set_batches`（给出全部批次） |
+| 不分批了，大家一起报 | `set_batches(batch_mode: false)` → `set_schedule` |
 | 推迟或提前开放 | `set_schedule(open_at)`；报名已在进行时需管理员确认 |
 | 现在就开放 | `set_schedule(open_at: 当前服务器时间)`；名单锁定时再 `set_lock(false)` |
 | 提前结束报名 | `set_lock(true, confirm)` |
@@ -221,11 +264,11 @@
 | 帮某学生报名 | `update_student(student, club)`；社团已满时先问是否提高人数上限（`update_club(capacity)`） |
 | 把某学生移出社团 | `update_student(student, club: "")` |
 | 改学生姓名或班级 | `update_student(student, name, class)` |
-| 木工名额改成 50 | `update_club(club: "木工", capacity: 50)`；人数上限至少为已报名人数 |
+| 木工名额改成 50 | `update_club(club: "木工", capacity: 50)`；人数上限至少为已报名人数（分批报名时为每批名额，至少为各批中报名最多的人数） |
 | 加一个社团 / 删社团 | `add_club` / `delete_club(confirm)` |
 | 只让高一报 / 只让某几个班报 | `update_club(grades: ["高一"])` / `update_club(classes: [...])` |
 | 暂停某社团报名 | `update_club(enabled: false)` |
-| 换社团图片 / 恢复默认 | `update_club(image: 路径)` / `update_club(image: "default")` |
+| 换社团插图 / 用照片 / 改回插图 | `update_club(art: "laser")` / `update_club(image: 路径)` / `update_club(image: "default")` |
 | 现在报了多少人 | `get_overview` |
 | 导出名单 / 导出某社团名单 | `export_data(kind: "workbook")` / `export_data(kind: "club", club)` |
 | 查看未报名的学生 | `list_students(status: "unregistered")` 或 `export_data(kind: "unregistered")` |
@@ -294,7 +337,8 @@
 - **页面提示换浏览器**：360、QQ、搜狗浏览器切换到极速模式，或改用 Edge、Chrome。
 - **登录时显示“排队中”**：登录高峰的正常排队，浏览器自动重试，最长 2 分钟。
 - **登录提示“请核对账号和密码”**：密码区分大小写；同一设备连续输入 10 次后暂停一分钟；需要时 `reset_passwords(student)` 生成新密码。
-- **学生页显示“开放时间待定”**：用 `set_schedule` 设置开放时间。显示“报名已截止”：名单已锁定或已到截止时间。
+- **学生页显示“开放时间待定”**：同时报名时用 `set_schedule` 设置开放时间；分批报名时这名学生的班级待分批，用 `set_batches` 把班级加入某一批。显示“报名已截止”：名单已锁定，或已到截止时间（分批报名时为本批的截止时间）。
+- **分批报名时学生说“报名待开放”**：这名学生的批次还没到，学生页有本批的开放时间和倒计时。
 - **报名时显示“名额更新中”**：系统正在核对该社团的名额，几秒内自动恢复，浏览器会自动重试。持续一分钟以上时查看 `service_logs(source: "python")`。
 
 **时间**
@@ -327,7 +371,7 @@
 | Cursor、VS Code | 打开 `agent` 文件夹，`.cursor/mcp.json`、`.vscode/mcp.json` 已写好 |
 | 其他客户端 | `python3 agent/omms_mcp.py register show` 输出各种配置写法 |
 
-连接后，客户端的工具列表里出现 `omms` 的 30 个工具；本指南也作为资源 `omms://guide` 提供。
+连接后，客户端的工具列表里出现 `omms` 的 32 个工具；本指南也作为资源 `omms://guide` 提供。
 
 ---
 
@@ -346,5 +390,6 @@
 - 报名按先到先得，名额在服务器上一步扣减，报名人数始终在人数上限以内。
 - 社团可以限定年级（如只收高一）、班级，或暂停报名；学生端会显示限制。
 - 调剂只在锁定后进行，只安排未报名的学生，遵守社团的年级、班级范围。
+- 分批报名时，学生在本班所在批次的时段内报名和退选，只和同一批的学生竞争名额；社团的人数上限是每批名额；调剂时每批只用本批的空余名额。
 - 管理员代为报名、调整、移出都会记入操作记录，并在报名表的“方式”一列标为管理员安排。
 - 学生的密码由管理员重置（`reset_passwords`）。

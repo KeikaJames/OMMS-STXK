@@ -222,7 +222,7 @@ select.input { padding-right: 32px; }
 .segmented button[aria-selected="true"], .segmented button[aria-pressed="true"] { background: var(--surface-2); color: var(--ink); box-shadow: 0 1px 3px rgba(31, 29, 26, .18); }
 
 /* ---- 提示 ---- */
-.toasts { position: fixed; left: 50%; bottom: 24px; z-index: 80; width: 360px; max-width: 92%; margin-left: -180px; pointer-events: none; }
+.toasts { position: fixed; left: 0; right: 0; bottom: 24px; z-index: 80; width: 360px; max-width: 92%; margin: 0 auto; pointer-events: none; }
 .toast { margin-top: 8px; padding: 12px 16px; border-radius: 12px; background: var(--ink); color: var(--paper); font-size: 14px; box-shadow: var(--shadow-lift); text-align: center; }
 .toast.err { background: var(--danger); color: #FFFFFF; }
 
@@ -376,6 +376,29 @@ body.has-dialog { overflow: hidden; }
 .admin-clubs .club-body .actions { margin-top: 12px; }
 .image-row { display: flex; flex-wrap: wrap; align-items: center; }
 .image-row .club-art { flex: 0 0 160px; width: 160px; height: 100px; padding-top: 0; margin-right: 16px; border-radius: 10px; }
+.art-grid { display: flex; flex-wrap: wrap; margin: 0 -4px; }
+.art-option { display: flex; flex-direction: column; align-items: center; width: 92px; margin: 0 4px 8px; padding: 4px 4px 2px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); color: var(--ink-2); font-size: 12px; line-height: 1.6; }
+.art-option:hover { border-color: var(--line-strong); }
+.art-option .club-art { width: 100%; border-radius: 7px; }
+.art-option > span:last-child { margin-top: 2px; white-space: nowrap; }
+.art-option[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); color: var(--accent); font-weight: 600; }
+.club-batches { margin-top: 12px; color: var(--muted); font-size: 13px; }
+.dot-item { display: inline-block; }
+.club-batches b { color: var(--ink); font-weight: 600; }
+.mode-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; }
+.mode-head h2 { margin: 0 12px 8px 0; }
+.mode-head .segmented { margin-bottom: 8px; }
+.mode-hint { margin-bottom: 16px; }
+.batch-list li > span small + small { margin-top: 0; }
+.batch-list .tag { margin-left: 6px; }
+.class-grid { display: flex; flex-wrap: wrap; margin: 0 -4px 6px; }
+.class-grid .check { flex: 0 0 auto; margin: 0 4px 8px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.class-grid .check small { margin-left: 6px; color: var(--muted); font-size: 12px; }
+.class-grid .check .tag { margin: 0 0 0 6px; }
+.class-grid .check.is-on { border-color: var(--accent); background: var(--accent-tint); }
+.batch-tally { margin-bottom: 14px; }
+.batch-table td.wrap { min-width: 200px; }
+.tbl td.nowrap { white-space: nowrap; }
 .backup-row td:first-child { white-space: nowrap; }
 .audit-wrap { max-height: 560px; overflow: auto; }
 .content-head h1:focus { outline: none; }
@@ -413,15 +436,17 @@ body.has-dialog { overflow: hidden; }
 .present-label { color: var(--muted); font-size: 28px; }
 .present-url { margin-top: 12px; font-size: 64px; font-size: 6vw; font-weight: 700; line-height: 1.15; word-break: break-all; }
 .present-more { margin-top: 24px; color: var(--ink-2); font-size: 24px; }
+.present-batch { margin-top: 28px; color: var(--accent); font-size: 32px; font-size: 3vw; font-weight: 600; }
 .present-hint { position: absolute; right: 0; bottom: 24px; left: 0; color: var(--muted); font-size: 14px; }
 .gap { margin: 12px 0; }
 #audit-scope { margin-bottom: 12px; }
 
 @media (max-width: 900px) {
   .shell { display: block; }
-  .sidebar { position: static; padding: 8px 12px 0; border-bottom: 1px solid var(--line); }
-  .sidebar nav { display: flex; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  .sidebar nav button { flex: 0 0 auto; width: auto; margin: 0 4px 8px 0; }
+  /* 窄屏时五个入口等分一行，全部可见。 */
+  .sidebar { position: static; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  .sidebar nav { display: flex; }
+  .sidebar nav button { flex: 1 1 0%; justify-content: center; width: auto; min-width: 0; margin: 0 2px; padding: 0 8px; }
   .content { padding: 16px 16px 40px; }
   .club-grid > * { width: 47%; width: calc(50% - 16px); }
 }
@@ -433,8 +458,11 @@ body.has-dialog { overflow: hidden; }
   .page-head h1 { font-size: 24px; }
   .status-clock { margin: 8px 0 0; text-align: left; }
   .club-grid > * { width: 100%; width: calc(100% - 16px); }
+  .sidebar { padding: 6px 12px; }
+  .sidebar nav button { flex-direction: column; min-height: 50px; margin: 0 1px; padding: 4px 0 3px; font-size: 12px; line-height: 1.25; text-align: center; white-space: nowrap; }
+  .sidebar svg { display: block; width: 22px; height: 22px; margin: 0 auto 3px; }
   .club { flex-direction: row; }
-  .club-art { flex: 0 0 96px; width: 96px; height: 96px; padding-top: 0; margin: 12px 0 12px 12px; border-radius: 12px; }
+  .club > .club-art { flex: 0 0 96px; width: 96px; height: 96px; padding-top: 0; margin: 12px 0 12px 12px; border-radius: 12px; }
   .club-body { padding: 12px; }
   .club-desc { max-height: 3.2em; }
   .sk { min-height: 120px; }
@@ -445,17 +473,23 @@ body.has-dialog { overflow: hidden; }
   .sheet-foot { padding: 12px; }
   .image-row .club-art { margin-bottom: 12px; }
   .toolbar .input { max-width: none; margin-right: 0; }
-  .access-url .mono { font-size: 18px; font-size: 4.8vw; }
+  .access-url .mono { font-size: 16px; font-size: 4.2vw; }
   .present-label { font-size: 20px; }
   .present-more { font-size: 18px; }
+  .present-batch { font-size: 20px; }
   .list li { flex-wrap: wrap; }
   .list li > span { flex-basis: 100%; margin: 0 0 8px; }
 }
 
-/* 支持网格的浏览器用网格排列社团卡片；放在断点之后，覆盖上面按宽度计算的回退布局。 */
+/* 支持网格的浏览器用网格排列社团卡片和插图；放在断点之后，覆盖上面按宽度计算的回退布局。 */
 @supports (display: grid) {
   .club-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; margin: 8px 0 0; }
   .club-grid > * { width: auto; margin: 0; }
+  .art-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 8px; margin: 0; }
+  .art-option { width: auto; margin: 0; }
+}
+@media (max-width: 560px) {
+  .art-grid { grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); }
 }
 
 @media (prefers-reduced-motion: reduce) {

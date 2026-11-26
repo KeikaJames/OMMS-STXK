@@ -10,7 +10,7 @@
 | `sheets.py` | 名单表格读取（xlsx、xls、csv、网页表格、XML 表格 2003）与 Excel 写出，只用标准库 |
 | `netinfo.py` | 本机各网卡的局域网地址，控制台和 AI 代理接口共用 |
 | `club-hot/` | Rust 热服务（axum）：登录、报名、退选、名额、目录 |
-| `shared/` | 两个服务共用的 Lua 脚本（`shared/lua`）和提示文案（`shared/messages.json`） |
+| `shared/` | 两个服务共用的 Lua 脚本（`shared/lua`）、名额池的表、视图与容量触发器（`shared/sql/pools.sql`）和提示文案（`shared/messages.json`） |
 | `web/` | 页面、样式、ES5 脚本和插画；`app-fallback.css` 由工具生成 |
 | `agent/` | AI 代理接口：MCP 服务 `omms_mcp.py`、运行指南 `AGENTS.md`、各客户端配置 |
 | `tools/` | `css_fallbacks.py`（颜色回退样式）、`check_es5.js`（ES5 语法检查） |
@@ -132,6 +132,10 @@ SELECT id, name, max_students, current_students, enabled, revision FROM clubs;
 SELECT COUNT(*) FROM students;
 SELECT COUNT(*) FROM registrations;
 SELECT registration_start_time, registration_end_time, registration_locked FROM settings;
+SELECT batch_mode, current_batch FROM settings;
+SELECT b.id, b.start_time, b.end_time, group_concat(c.class_name, '、') FROM batches b
+  LEFT JOIN batch_classes c ON c.batch_id = b.id GROUP BY b.id;
+SELECT club_id, max_students, used FROM club_pool;
 SELECT occurred_at, actor_role, actor_id, action, reason FROM audit_events ORDER BY occurred_at DESC LIMIT 20;
 ```
 
@@ -239,6 +243,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 - 状态名称保持统一：开放时间待定、待开放、报名中、名单已锁定、已报名、未报名、已满、暂停报名、名额更新中。
 - 核对页标注：待补班级、待补姓名、待核对姓名、待核对内容、班级沿用上一行、班级取自工作表名、同班同名、已导入。
 - “调剂”专指锁定后的统一安排；管理员为单个学生的操作叫“调整”。
+- 报名方式写作“同时报名”“分批报名”。批次按开放时间编号，写作“第 1 批”；还没加入批次的班级叫“待分批”；分批报名时社团的人数上限叫“每批名额”。
+- 说明一个选项时写它适合的情况，例如“学生分几节课报名时，选‘分批报名’”。
 - 文档和 PR 说明写功能现在怎样工作，以及如何验证。
 
 ## 7. 函数索引
@@ -273,6 +279,19 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 | `ClubSystemHandler._restore_from(sess, source, label, images)` | 恢复的公共步骤：维护标记、恢复前快照、整库替换、重建表结构、保留管理员账号、吊销学生会话、重新发布名额 |
 | `ClubSystemHandler._h_backup(sess)` / `_h_backups(sess)` | 下载完整备份或指定快照；列出快照 |
 | `ClubSystemHandler._h_addresses(sess)` | `GET /api/admin/addresses`：本机各网卡的局域网地址 |
+| `CLUB_ART` / `suggest_art(name)` | 社团卡片插图的键名；新社团（和升级前的旧社团）按名称先选一幅，之后由管理员在编辑页更换 |
+| `run_sql_script(cur, script)` / `POOLS_SQL` | 逐条执行 `shared/sql/pools.sql`，留在调用方的事务里 |
+| `batch_state(conn)` / `load_batches(conn)` / `batch_name(id)` | 报名方式与记录的当前批次；按编号读出各批的时段与班级；“第 N 批” |
+| `desired_batch(batches, now_ms)` / `batch_window(batches, id)` / `batch_payload(batch, now_ms)` | 按时间确定当前批次（第一个尚未截止的批次，全部截止为 `BATCH_DONE`）；该批时段；对外格式与状态 |
+| `parse_batches(items)` | 校验管理员提交的批次：时段完整且先后排开、每批有班级、班级只在一批，按开放时间编号 |
+| `pool_used(cur, club_id, student_id)` / `club_peak_used(cur, club_id)` / `pool_overflows(cur)` | 学生所在名额池的报名人数；各名额池报名人数的最大值；超出人数上限的名额池 |
+| `batch_overview(conn, now_ms)` | 控制台的分批情况：各批时段、班级、人数、报名数、各社团报名数，待分批的班级 |
+| `sync_current_batch(cur)` | 写入当前批次及其时段，返回 Redis 的批次状态；`rebuild_all` 在整体发布前调用 |
+| `sync_batches()` / `batches_lock_due(conn)` / `lock_after_batches(last_end)` | 后台每秒检查：当前批次截止后切换并重新发布；最后一批截止后锁定一次；返回距离本批截止的秒数 |
+| `ClubSystemHandler._h_batches(sess)` / `build_batches()` / `BATCHES_CACHE` | `GET /api/batches` 各批时段与班级，缓存 1 秒、带 ETag |
+| `ClubSystemHandler._h_update_batches(sess, data)` / `_h_batch_now(sess, data)` / `_store_batches(...)` | `POST /api/admin/batches` 设置报名方式与批次；`POST /api/admin/batch_now` 当前批次现在开放或截止；两者共用的保存流程（维护标记、名额池核对、操作记录、整体发布） |
+| `latest_actions(conn, actions)` | 各操作最近一次的时间，逐个走 `(action, occurred_at)` 索引 |
+| `ClubSystemHandler._registration_rows(conn)` / `_with_batch(batched, header, rows, widths)` | 导出用的逐人行；分批报名时第一列为批次 |
 
 ### 7.2 sheets.py
 
@@ -362,7 +381,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 | 函数 | 功能 |
 |---|---|
 | `short_name(name)` / `natural_key(text)` / `clean_text(value, field)` / `text_list(value)` | 社团短名、自然排序、文字字段校验、列表参数拆分 |
-| `phase_text(info)` | 报名状态文字 |
+| `CLUB_ART` / `art_key(value)` | 卡片插图的键名与中文名；`update_club(art)` 接受键名或中文名 |
+| `phase_text(info)` / `batch_view(summary)` / `batched_now()` | 报名状态文字（分批报名时带当前批次）；报名方式与各批次；是否分批报名 |
 | `all_clubs()` / `all_students()` / `club_row(club)` / `student_row(student, clubs)` | 读取并整理社团、学生 |
 | `find_club(ref)` / `find_student(ref)` | 按名称、编号或账号、“姓名 班级”定位，重名时列出候选 |
 | `save_file(data, filename, output_dir)` / `read_input(path_text, limit)` | 写出文件（0600，重名加序号）；读取输入文件并检查大小 |
@@ -377,7 +397,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 | `start_in_progress()` / `registration_running()` / `opening_soon(info)` | 启动是否进行中；报名状态；是否报名中或一小时内开放（决定是否需要确认） |
 | `validate_setting(key, value)` / `tool_get_settings` / `tool_update_settings` | 参数校验、查看、写入 |
 | `tool_admin_credentials` / `tool_change_admin_password` | 管理员账号密码、修改密码 |
-| `tool_get_overview` / `tool_set_schedule` / `tool_clear_schedule` / `tool_set_lock` | 概览、开放与截止时间、锁定 |
+| `tool_get_overview` / `tool_set_schedule` / `tool_clear_schedule` / `tool_set_lock` / `tool_set_batches` / `tool_batch_now` | 概览、开放与截止时间、锁定、报名方式与批次、当前批次现在开放或截止 |
 | `parse_roster(path_text)` / `row_view(row)` / `class_counts(rows)` | 上传解析、行摘要、各班人数 |
 | `tool_preview_roster` / `tool_import_roster` | 名单预览；按位置改正、跳过，按姓名和班级对照现有学生，分批导入并生成账号表 |
 | `tool_list_students` / `tool_update_student` / `tool_reset_passwords` / `tool_delete_student` | 学生查找、修改与调整社团、重置密码、删除 |
@@ -421,7 +441,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 |---|---|
 | `readRoute()` / `go(view, pane)` / `show(next, focus)` / `renderTabs()` / `load()` | 侧栏与分段控件的路由：读地址栏、跳转、显示、刷新所需数据 |
 | `watching()` / `refreshOverview()` / `loadOverview()` | 工作台与报名概览每 6 秒刷新 |
-| `renderPhase(time)` / `scheduleText(time)` / `renderFill(id, clubs)` / `renderFlow(summary, time)` / `renderClockSkew(...)` | 报名状态、开放与截止时间、各社团进度、流程步骤、服务器与本机的时钟差 |
+| `renderPhase(time)` / `scheduleText(time)` / `renderFill(id, rows, caption)` / `fillRows(clubs)` / `fillCaption()` / `renderFlow(summary, time)` / `renderBatchTable(summary)` / `renderClockSkew(...)` | 报名状态、开放与截止时间、各社团进度（分批报名时为当前批次，全部截止后为各批合计）、流程步骤、各批次表、服务器与本机的时钟差 |
+| `batchMode()` / `batchList()` / `currentBatch()` / `capacityLabel()` / `batchWindow(batch)` / `batchStateText(batch)` / `peakUsed(club)` / `applyModeLabels()` / `loadSummary()` | 报名方式与批次的读取和文字：“人数上限”或“每批名额”、批次时段与状态、各批报名人数的最大值 |
+| `batchNow()` / `runBatchNow(now, button)` | 当前批次的即时操作：待开放时“现在开放”，报名中时“现在截止”；工作台与批次列表共用 |
+| `openQuickSplit()` / `numberInput(value, min, max)` | 快速分批：按班级顺序每几个班一批，依次排出各批时段，预览后整体保存 |
+| `batchOf(klass)` / `totalUsed(club)` | 学生名单的批次列与按批次搜索；社团全部报名人数（删除确认框用） |
+| `renderMode()` / `renderBatchList()` / `saveBatches(batched, batches)` / `openBatchEditor(batch)` / `addMinutes(text, minutes)` / `datetimeInput(text)` | 设置 → 时间：报名方式切换、批次列表与待分批提示、批次编辑页（时段默认接在上一批之后、一节课 40 分钟；勾选班级并显示人数） |
 | `loadAccess()` / `hostIsAddress(host)` / `siteBase(host)` / `copyText(text)` / `presentAccess()` / `fullscreenElement()` | 学生访问地址卡片：读取地址、拼出网址、拷贝、整屏放大显示 |
 | `loadStudents()` / `matchingStudents()` / `renderStudents()` / `onSearch()` | 学生名单：读取、搜索、每页 200 行 |
 | `openStudent(student)` 及其中的 `save`、`confirmReset`、`confirmRemove` | 学生编辑页：姓名班级、社团调整、重置密码、删除 |
@@ -446,6 +471,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 | 函数 | 功能 |
 |---|---|
 | `phase()` / `registeredId()` / `remaining(club)` / `eligibility(club)` | 当前阶段（待定、倒计时、报名中、已报名、已截止）、已报社团、剩余名额、年级班级范围 |
+| `myBatch()` / `windowOpenAt()` / `windowCloseAt()` / `liveSeats()` / `loadBatches()` / `closeLabel(start, end)` | 分批报名：本班所在批次、本人适用的开放与截止时间、本批是否为当前批次（是时显示实时余量）、读取批次、截止时间文字 |
 | `loadMe()` / `syncTime()` / `loadCatalog()` / `loadSeats()` | 个人信息；与服务器对时；社团目录；名额快照 |
 | `pollDelay()` / `schedulePoll()` / `scheduleOpen()` | 轮询间隔（报名中 2 秒，临近开放 4 秒，其余 10–15 秒）；到开放时间刷新 |
 | `renderStatus()` / `tick()` / `formatDuration(ms)` / `formatClock(ms)` | 状态条、每秒更新倒计时或当前时间 |
@@ -459,7 +485,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 | 文件与函数 | 功能 |
 |---|---|
 | `login.js`：`shouldWait(result)`、`attempt(path, body, started)` | 登录排队：按 `Retry-After` 重试，最长 2 分钟；身份切换与开放时间显示 |
-| `club-art.js`：`kind(name)`、`photo(club)`、`picture(source, label)`、`illustration(club)`，导出 `ClubArt.node`、`ClubArt.key` | 按社团名称选插图（3D 打印、传媒、木工、通用）；上传的图片以背景图显示 |
+| `club-art.js`：`svg(body)`、`kind(club)`、`photo(club)`、`picture(source, label)`、`illustration(key)`，导出 `ClubArt.node`、`ClubArt.illustration`、`ClubArt.options`、`ClubArt.label`、`ClubArt.key` | 卡片图：14 幅单线插图（viewBox 240×150，线条跟随文字颜色，主体放在 x 50–190 之间，手机上裁成方形时完整），按社团选定的 `art` 显示；上传的照片优先，以背景图显示 |
 | `legacy.js` | 检查 JSON、XHR、`querySelector`、`classList`、`dataset`、`Uint8Array`，需要时显示换用浏览器的提示 |
 | `easter-egg.js` | 在浏览器开发者控制台打印横幅 |
 

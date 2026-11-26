@@ -12,9 +12,9 @@
 | Rust 热服务 `club-hot`（:2002） | 学生登录、报名、退选、目录、名额快照 | `club-hot/src` |
 | Python 服务（:2001） | 管理端全部接口；热接口的备用实现；后台修复 | `main.py` |
 | Redis | 名额、报名镜像、在途租约、会话、登录计数 | `shared/lua` |
-| SQLite（WAL） | 学生、社团、报名、设置、审计记录 | 建表语句在 `main.py` 与 `club-hot/src/db.rs` |
+| SQLite（WAL） | 学生、社团、报名、设置、批次、审计记录 | 建表语句在 `main.py` 与 `club-hot/src/db.rs`；名额池的表、视图与容量触发器在 `shared/sql/pools.sql` |
 
-两个服务读取同一组 Lua 脚本和 `shared/messages.json`，共用 Redis 键、会话格式和返回码。nginx 的 `club_hot` 上游把 Rust 设为主节点、Python 设为 `backup`，Rust 停止时热接口由 Python 接管。
+两个服务读取同一组 Lua 脚本、`shared/sql/pools.sql` 和 `shared/messages.json`，共用 Redis 键、名额池定义、会话格式和返回码。nginx 的 `club_hot` 上游把 Rust 设为主节点、Python 设为 `backup`，Rust 停止时热接口由 Python 接管。
 
 ## 一次报名
 
@@ -46,8 +46,8 @@
 | -1 | 已有报名或其他操作 | `registered_other` / `registered_already` |
 | -2 | 名额未初始化 | 503 `syncing`，触发重建 |
 | -3 | 维护中或社团修复中 | 503 `syncing` |
-| -4 | 未到开放时间或未设置开放时间 | `not_open` |
-| -6 | 名单已锁定或已到截止时间 | `locked` |
+| -4 | 未到开放时间或未设置开放时间；分批报名时所在批次未到或班级待分批 | `not_open` |
+| -6 | 名单已锁定或已到截止时间；分批报名时所在批次已截止 | `locked` |
 
 ## 退选
 
@@ -66,6 +66,32 @@
 ## 截止时间
 
 管理员设置截止时间后，`close_at` 与开放时间一起发布到 Redis。`acquire.lua` 和 `cancel_begin.lua` 在同一个脚本里读取 Redis 时钟，到截止时间即返回 `-6`，报名与退选在这一刻停止。Python 后台线程每秒检查一次：到截止时间后把名单写为锁定、清除截止时间、记一条操作人为“系统”的操作记录，并保存快照。解除锁定时，已经过去的截止时间一并清除。
+
+## 分批报名
+
+学生分几节课到机房报名时，管理员把报名方式设为分批报名：按班级分批，每批一个时段，社团的 `max_students` 是每批名额，每批只和同一批的学生竞争。
+
+**名额池**：同时报名时每个社团一个名额池；分批报名时每个社团每批一个名额池。`shared/sql/pools.sql` 定义了它们，两个服务启动时都执行这个文件：
+
+| 对象 | 作用 |
+|---|---|
+| 表 `batches(id, start_time, end_time)` | 批次与时段；编号按开放时间先后，第 1 批最早，时段不重叠 |
+| 表 `batch_classes(class_name, batch_id)` | 班级所在的批次，每个班级一行 |
+| 视图 `student_batch(student_id, pool)` | 学生所在的名额池：同时报名为 0；分批报名为批次编号，班级待分批为 0 |
+| 视图 `club_pool(club_id, max_students, used)` | 当前名额池的占用，Redis 库存 = `max_students - used` |
+| 触发器 `registrations_capacity_guard`（插入与改社团）、`clubs_capacity_registration_guard` | 同一名额池里的报名人数不超过 `max_students`；人数上限不低于任一名额池的报名人数 |
+
+**当前批次**：第一个尚未截止的批次；全部截止后为 1000000（`BATCH_DONE`）。Python 后台线程按服务器时钟维护它：写入 `settings.current_batch`，把当前批次的时段写入 `settings` 的开放与截止时间，再整体发布名额。这样两个服务读取开放时间、截止时间和库存的地方无需区分报名方式。后台线程在当前批次截止时准时醒来，前后两批的时段可以首尾相接。
+
+**抢位与退选**：Redis 键 `batch`（当前批次）与 `batchmap`（班级到批次）随整体发布写入。`acquire.lua` 与 `cancel_begin.lua` 收到学生的班级，在同一个脚本里核对：班级待分批或批次未到返回 `-4`，批次已截止返回 `-6`；同时报名时 `batch` 不存在，跳过核对。Rust 用会话里的班级，Python 用数据库里的班级（改班级时该生的会话失效）。
+
+**截止与锁定**：某一批截止只结束这一批，`registration_locked` 不变；后台线程随即切换到下一批。最后一批截止后写入锁定、记一条操作人为“系统”的操作记录并保存快照，同一份分批设置只自动锁定一次，管理员解除锁定后保持解除；各批时段已过，报名仍然停止。
+
+**现在开放与现在截止**：`POST /api/admin/batch_now`（`batch_id`、`action`）按服务器时间改当前批次的开放或截止时间：开放要求前一批已截止，截止要求这一批报名中；随后与批次设置走同一个保存流程。
+
+**设置**：`POST /api/admin/batches`（`batch_mode`、`batches`）在全局维护标记下保存，按开放时间排序编号并校验时段与班级；保存前用 `pool_overflows` 核对每个名额池的报名人数都在人数上限以内，保存后整体发布。改为同时报名时清除开放与截止时间，由管理员重新设置。`GET /api/batches` 公开各批的时段与班级，学生页据此找到本班的批次；它和名额快照一样缓存 1 秒、带 ETag，nginx 也缓存 1 秒，批次切换时全体学生同时读取也只回源一次；名额快照的 `batch` 字段是当前批次，学生页只在本批是当前批次时显示实时余量。
+
+**调剂与导出**：调剂按名额池分别求最大流，每批只用本批的空余名额，班级待分批的学生保持未报名。导出的每张表在分批报名时以“批次”为第一列，按批次排序。
 
 ## 清空报名
 
@@ -112,6 +138,7 @@
 | `maint` / `init` | 标记 | 全局维护 / 名额已初始化 |
 | `open_at` / `locked` | 时间戳 / 标记 | 开放时间（设置后写入）/ 名单锁定 |
 | `close_at` | 时间戳 | 截止时间（设置后写入） |
+| `batch` / `batchmap` | 整数 / 哈希 | 分批报名时的当前批次 / 班级到批次编号；同时报名时不存在 |
 | `repair` | 集合 | 待修复社团 |
 | `rb:{lease}` / `cx:{event}` | 标记 | 回滚与退选的幂等记录 |
 | `sess:{token}` | 会话 JSON | 登录会话，有效期 `SESSION_TTL` |
@@ -157,7 +184,7 @@
 
 名额快照包含每个社团的剩余名额、开放时间、锁定状态和目录版本。社团介绍等内容由 `/api/catalog` 提供，前端在目录版本变化时重新获取。学生页每次轮询后只更新内容有变化的卡片。
 
-管理端工作台每 6 秒读取 `/api/admin/summary`（学生数和报名数）与社团列表。
+管理端工作台每 6 秒读取 `/api/admin/summary`（学生数和报名数）与社团列表。其中最近一次导出、备份和数据变化的时间按操作逐个取最大值，走 `audit_events(action, occurred_at)` 索引，操作记录再多也是常数时间。
 
 ## 边缘限流
 
@@ -181,7 +208,7 @@
 - `deploy/redis.conf` 关闭持久化、限制 256 MB 内存并使用 `noeviction`，名额以 SQLite 为准，重启后自动重建。
 - `run.sh` 每次启动保留上一次的服务日志（`python.log.1`、`rust.log.1`），访问日志超过 64 MB 时换新文件。
 - 前端为原生 HTML、CSS 和 ES5 脚本，`tools/check_es5.js` 按 ES5 语法解析全部脚本；`common.js` 补齐 Promise、`Object.assign`、`find`、`closest` 等接口，请求用 XHR，下载在 IE 上用 `msSaveOrOpenBlob`。`tools/css_fallbacks.py` 为每条使用 CSS 变量的声明生成固定颜色的回退样式（`app-fallback.css`，先于 `app.css` 加载）；布局以 flexbox 为主，网格放在 `@supports` 内。
-- 登录页插画为 WebP，社团默认插图和管理端图标为内嵌 SVG。页面使用纯色顶栏和小范围阴影，适合集成显卡。
+- 登录页插画为 WebP，社团插图和管理端图标为内嵌 SVG（社团卡片使用插图时不下载图片）。页面使用纯色顶栏和小范围阴影，适合集成显卡。
 - 带版本号的脚本与样式由 nginx 缓存 7 天，页面每次重新校验。
 - 社团图片上传后按 EXIF 方向摆正，缩到长边 960 像素，带透明通道的存 PNG，其余存 JPEG（质量 82），每张约 70–160 KB；文件名随每次上传变化，响应带一年的 `immutable` 缓存。
 - 管理端工作台比较服务器与管理员电脑的时钟，相差超过一分钟时提示校准。

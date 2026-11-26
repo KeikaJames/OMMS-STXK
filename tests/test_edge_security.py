@@ -614,6 +614,56 @@ class EdgeSecurityRegressionTests(unittest.TestCase):
                 conn.execute("UPDATE settings SET registration_start_time='2000-01-01 00:00:00'")
                 conn.commit()
 
+    def test_python_and_rust_admit_only_the_current_batch(self) -> None:
+        self._reset_state()
+        hour = timedelta(hours=1)
+        school = datetime.now(timezone(timedelta(hours=8)))
+        text = lambda moment: moment.strftime("%Y-%m-%d %H:%M:%S")  # noqa: E731
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE students SET class='高一1班' WHERE id=1")
+            conn.execute("UPDATE students SET class='高一2班' WHERE id=2")
+            conn.execute("DELETE FROM batches")
+            conn.execute("DELETE FROM batch_classes")
+            conn.executemany("INSERT INTO batches (id, start_time, end_time) VALUES (?,?,?)",
+                             [(1, text(school - hour), text(school + hour)),
+                              (2, text(school + hour), text(school + 2 * hour))])
+            conn.executemany("INSERT INTO batch_classes (class_name, batch_id) VALUES (?,?)",
+                             [("高一1班", 1), ("高一2班", 2)])
+            conn.execute("UPDATE settings SET batch_mode=1, current_batch=1")
+            conn.commit()
+        self.redis.set(key("batch"), "1")
+        self.redis.hset(key("batchmap"), mapping={"高一1班": "1", "高一2班": "2"})
+        try:
+            first = self._login(self.python_port, "edge1", "student-password")
+            second = self._login(self.python_port, "edge2", "student-password")
+            for port in (self.python_port, self.rust_port):
+                status, _headers, body = self._request_raw(
+                    port, "POST", "/api/register_club", body={"club_id": 1}, cookie=f"session={second}")
+                self.assertEqual((200, "not_open"), (status, json.loads(body).get("code")), port)
+                status, _headers, body = self._request_raw(port, "GET", "/api/check_registration_time")
+                state = json.loads(body)
+                self.assertEqual((True, 1), (state["batch_mode"], state["batch"]), port)
+            status, _headers, body = self._request_raw(self.rust_port, "GET", "/api/seats")
+            self.assertEqual(1, json.loads(body)["batch"])
+            status, _headers, body = self._request_raw(
+                self.rust_port, "POST", "/api/register_club", body={"club_id": 1}, cookie=f"session={first}")
+            self.assertEqual((200, "registered"), (status, json.loads(body).get("code")))
+            self.assertEqual("2", self.redis.get(key("stock", 1)))
+            # 第 1 批之后：该批学生的退选在两个服务上都停止。
+            self.redis.set(key("batch"), "2")
+            for port in (self.python_port, self.rust_port):
+                status, _headers, body = self._request_raw(
+                    port, "POST", "/api/cancel_registration", body={}, cookie=f"session={first}")
+                self.assertEqual((200, "locked"), (status, json.loads(body).get("code")), port)
+            self.assertEqual("2", self.redis.get(key("stock", 1)))
+        finally:
+            with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
+                conn.execute("UPDATE settings SET batch_mode=0, current_batch=NULL")
+                conn.execute("DELETE FROM batches")
+                conn.execute("DELETE FROM batch_classes")
+                conn.commit()
+            self.redis.delete(key("batch"), key("batchmap"))
+
     def test_python_and_rust_stop_registration_at_the_close_time(self) -> None:
         self._reset_state()
         past = (datetime.now(timezone(timedelta(hours=8))) - timedelta(seconds=5)).strftime("%Y-%m-%d %H:%M:%S")

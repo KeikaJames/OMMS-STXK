@@ -9,12 +9,12 @@
 <meta name="theme-color" content="#F4EFE6">
 <title>管理控制台 · 社团选课</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/app-fallback.css?v=3">
-<link rel="stylesheet" href="/app.css?v=26">
+<link rel="stylesheet" href="/app-fallback.css?v=5">
+<link rel="stylesheet" href="/app.css?v=31">
 <script src="/js/legacy.js?v=20" defer></script>
-<script src="/js/common.js?v=20" defer></script>
-<script src="/js/club-art.js?v=5" defer></script>
-<script src="/js/admin.js?v=31" defer></script>
+<script src="/js/common.js?v=21" defer></script>
+<script src="/js/club-art.js?v=7" defer></script>
+<script src="/js/admin.js?v=36" defer></script>
 <script src="/easter-egg.js?v=1" defer></script>
 </head>
 <body>
@@ -48,7 +48,7 @@
         <h2 id="home-phase">读取中</h2>
         <p class="hint" id="home-detail" hidden></p>
         <p class="note" id="home-clock" role="status" hidden></p>
-        <div class="actions"><button class="btn btn-small" type="button" data-go="settings/time">时间设置</button></div>
+        <div class="actions"><button class="btn btn-primary btn-small" id="home-batch-now" type="button" hidden></button><button class="btn btn-small" type="button" data-go="settings/time">时间设置</button></div>
       </article>
       <article class="card access-card" id="access-card" hidden>
         <div class="row-head">
@@ -105,7 +105,7 @@
         <form id="club-add" novalidate>
           <div class="form-row">
             <div class="field"><label for="club-add-name">名称</label><input class="input" id="club-add-name" maxlength="80" autocomplete="off"></div>
-            <div class="field"><label for="club-add-max">人数上限</label><input class="input" id="club-add-max" type="number" min="1" max="10000" step="1"></div>
+            <div class="field"><label for="club-add-max" id="club-add-max-label">人数上限</label><input class="input" id="club-add-max" type="number" min="1" max="10000" step="1"></div>
           </div>
           <p class="error" id="club-add-error" role="alert"></p>
           <div class="actions"><button class="btn btn-primary" id="club-add-go" type="submit">添加</button></div>
@@ -117,13 +117,14 @@
       <article class="card" data-pane="overview">
         <p class="hint" id="ov-time">读取中</p>
         <div class="metrics">
-          <div class="metric"><small>学生</small><b class="num" id="m-students">—</b></div>
+          <div class="metric"><small id="m-students-label">学生</small><b class="num" id="m-students">—</b></div>
           <div class="metric"><small>已报名</small><b class="num" id="m-reg">—</b></div>
           <div class="metric"><small>未报名</small><b class="num" id="m-unreg">—</b></div>
           <div class="metric"><small>报名率</small><b class="num" id="m-rate">—</b></div>
           <div class="metric"><small>社团</small><b class="num" id="m-clubs">—</b></div>
         </div>
         <div id="ov-fill"></div>
+        <div id="ov-batches"></div>
       </article>
 
       <article class="card" data-pane="adjust"><div id="adjust-body"><p class="hint">读取中</p></div></article>
@@ -150,7 +151,14 @@
 
     <section data-view="settings" hidden>
       <article class="card" data-pane="time">
-        <h2>开放时间</h2>
+        <div class="mode-head">
+          <h2>开放时间</h2>
+          <div class="segmented" id="mode-switch" role="group" aria-label="报名方式">
+            <button type="button" data-mode="single" aria-pressed="true">同时报名</button>
+            <button type="button" data-mode="batch" aria-pressed="false">分批报名</button>
+          </div>
+        </div>
+        <p class="hint mode-hint" id="mode-hint">全体学生同一时段报名，共用名额。学生分几节课报名时，选“分批报名”。</p>
         <form id="time-form" novalidate>
           <div class="form-row">
             <div class="field"><label for="open-at">开放</label><input class="input" id="open-at" type="datetime-local"></div>
@@ -160,6 +168,11 @@
           <p class="error" id="time-error" role="alert"></p>
           <div class="actions"><button class="btn btn-primary" id="save-time" type="submit">存储</button><button class="btn btn-plain" id="clear-time" type="button" hidden>清除</button></div>
         </form>
+        <div id="batch-pane" hidden>
+          <ul class="list batch-list" id="batch-list"></ul>
+          <p class="note gap" id="batch-unassigned" hidden></p>
+          <div class="actions"><button class="btn btn-primary" id="batch-add" type="button">添加批次</button><button class="btn" id="batch-quick" type="button">快速分批</button></div>
+        </div>
       </article>
       <article class="card" data-pane="time">
         <div class="row-head"><h2>名单锁定</h2><span class="tag" id="lock-state">读取中</span></div>

@@ -395,6 +395,24 @@ class MaintenanceTests(unittest.TestCase):
         self.assertTrue(result.get("replayed"), result)
         self.assertEqual(1, len(app.sql("SELECT 1 FROM audit_events WHERE action='student.updated'")))
 
+    def test_deleting_a_club_takes_its_registrations_after_a_snapshot(self) -> None:
+        app = self.instance
+        app.sql("INSERT INTO clubs (id, name, max_students, current_students) VALUES (2, '木工', 5, 0)")
+        app.republish()
+        for student in (1, 2):
+            status, body = app.register(student)
+            self.assertTrue(body.get("success"), body)
+        status, body = app.post(self.admin, "/api/delete_club", {"club_id": 1})
+        self.assertEqual((200, True), (status, body.get("success")), body)
+        self.assertEqual([(0,)], app.sql("SELECT COUNT(*) FROM registrations"))
+        self.assertEqual([(2,)], app.sql("SELECT json_extract(before_json, '$.registrations') FROM audit_events "
+                                         "WHERE action='club.deleted'"))
+        self.assertTrue(any(name.endswith("-before-delete-club.db") for name in os.listdir(app.backups)))
+        self.assertIsNone(app.client.get(key("reg", 1)))
+        token = write_session(app.client, 1)
+        status, body = request_json(app.http_port, "POST", "/api/register_club", token=token, body={"club_id": 2})
+        self.assertTrue(body.get("success"), body)
+
     def test_class_password_reset_returns_new_passwords_once(self) -> None:
         app = self.instance
         token = write_session(app.client, 2)
