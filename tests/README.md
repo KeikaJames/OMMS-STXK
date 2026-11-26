@@ -100,7 +100,7 @@ Apple Silicon 笔记本，回环网络，每组 1000 名学生同时报名：
 | 100 个名额，900 人得到满员 | 5828 次/秒 | 109 ms |
 | 1000 个名额，全部写库 | 3369 次/秒 | 198 ms |
 
-`stress_site.py`，同一台笔记本的 4 个能效核、后台优先级（单核速度约为全速的六分之一），1000 名学生：
+`stress_site.py`，同一台笔记本的 4 个能效核、后台优先级（单核速度约为平时的六分之一），1000 名学生：
 
 | 场景 | 只运行 Python | 加上 Rust 热服务 |
 |---|---|---|
@@ -108,32 +108,3 @@ Apple Silicon 笔记本，回环网络，每组 1000 名学生同时报名：
 | `hot`：100 个名额，全部拿到结果 | 2.6 秒 | 0.2 秒 |
 | `spread`：895 人报上，105 人满员 | 3.3 秒 | 0.7 秒 |
 | `poll`：30 秒 12572 次刷新 | nginx 1.8 秒 CPU，后端 0.05 秒 | nginx 1.9 秒 CPU，后端 0.03 秒 |
-
-## 高峰与资源画像
-
-Apple M4 Max（16 核）全速运行的 3000 人场景。可用以下命令重跑；先完成前文的 release 构建：
-
-```bash
-python3 tests/stress_site.py login --backend rust --users 3000
-python3 tests/stress_site.py login --backend python --users 3000
-python3 tests/stress_site.py hot --backend rust --users 3000 --hot-seats 120
-python3 tests/stress_site.py spread --backend rust --users 3000 --clubs 4
-```
-
-| 场景 | 结果 | 用时 |
-|---|---|---|
-| 同时登录，Rust 热服务 | 3000 人全部登录 | 5.4 秒 |
-| 同时登录，只运行 Python | 3000 人全部登录 | 10.1 秒 |
-| 争抢同一社团的 120 个名额 | 120 人报名成功，2880 人收到满员结果 | 1.8 秒 |
-| 各自随机报三个社团之一 | 2904 人报名成功，96 人遇到社团已满 | 1.8 秒 |
-
-低资源场景的请求耗时见前面的整站压测表。这里列出同一组 1000 人压测的服务进程内存：
-
-| 进程 | 空闲内存 | 1000 人登录后 |
-|---|---|---|
-| Python 服务 | 62 MB | 151 MB |
-| Rust 热服务 | 6 MB | 126 MB |
-| nginx（2 个工作进程） | 20 MB | 32 MB |
-| Redis | 7 MB | 10 MB |
-
-登录后增加的内存用于口令哈希工作区，每个校验线程约 19 MB。实际部署请在目标服务器按前文命令测量。
