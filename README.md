@@ -22,7 +22,7 @@
 - 倒计时按服务器时钟计算，到开放时间后报名按钮可用。
 - 全部社团在一屏内列出：插图或上传的照片、名称、时间地点、剩余名额和报名按钮。手机上为左图右文。
 - 分批报名时，学生页显示本班所在批次的倒计时与截止时间，名额是本批的余量。
-- 报名与退选在排队或确认期间按同一请求自动重试，结果以服务器为准；退选前弹出确认框。
+- 报名与退选使用同一 `request_id` 自动重试；退选前弹出确认框。
 
 **管理控制台**
 
@@ -49,8 +49,7 @@
 - 抢位在 Redis 里一步完成；SQLite 容量触发器为每个社团设定最终上限。
 - 名额修复以社团为单位进行，其他社团照常报名；Redis 重启后由 SQLite 自动重建。
 - 名额快照带 ETag，由 nginx 每秒生成一次，全校轮询集中在一份缓存上。
-- 登录高峰时口令校验按到达顺序排队，浏览器按服务器约定的时间自动重试，直到登录成功。
-- 一条命令启动整套服务；有 Rust 编译环境时同时运行 Rust 热服务，其余情况只运行 Python 服务。
+- 登录高峰时口令校验按到达顺序排队；浏览器按服务器给出的间隔重试并显示结果。
 - 写操作接口要求 `X-Requested-With: XMLHttpRequest` 请求头。
 
 <div align="center">
@@ -87,7 +86,7 @@ bash run.sh
 
 运行文件都放在 `run/` 目录下。再次执行即为平滑重启；双击 `停止.command` 或执行 `bash run.sh stop` 停止。
 
-`run.sh` 在 cargo 可用、Rust 为 1.88 及以上且编译成功时运行 Rust 热服务，其余情况只运行 Python 服务。也可以手动指定只运行 Python：
+Cargo 1.88 及以上且编译成功时，报名接口由 Rust 热服务处理；其他情况下由 Python 服务处理：
 
 ```bash
 OMMS_PYTHON_ONLY=1 bash run.sh
@@ -116,7 +115,7 @@ python3 -m pip install redis argon2-cffi pypinyin Pillow
 ```
 
 - **文件句柄**：终端默认每个进程 256 个，`run.sh` 启动前调到 65536，nginx 每个工作进程 16384。
-- **睡眠**：`run.sh` 用 `caffeinate` 在服务运行期间阻止系统闲置睡眠，接通电源时同时阻止系统睡眠。MacBook 运行期间保持开盖并接通电源。
+- **睡眠**：服务运行期间，`run.sh` 用 `caffeinate` 保持 Mac 唤醒。MacBook 接通电源并保持开盖。
 - **防火墙**：首次运行时系统询问是否允许 nginx 接受传入连接，选择允许。
 - **实测**：Apple M4 Max（16 核）全速运行，3000 名学生同时操作：
 
@@ -151,8 +150,8 @@ python3 -m pip install redis argon2-cffi pypinyin Pillow
 
 登录后增加的内存是口令哈希的工作区：每个校验线程 19 MB，线程数为 `AUTH_CONCURRENCY`。
 
-- **登录**：口令校验是最耗 CPU 的环节，这类机器上每次约 50–70 毫秒。请学生提前几分钟登录；人多时浏览器自动排队，最长等 2 分钟。
-- **时钟**：报名按服务器时钟开放。服务器与管理员电脑相差超过一分钟时，工作台会提示校准（Linux：`timedatectl set-ntp true`）。
+- **登录**：每次口令校验约 50–70 毫秒。登录高峰时浏览器自动排队，最长等待 2 分钟。
+- **时钟**：报名按服务器时钟开放。工作台显示服务器与管理员电脑的时间差；Linux 可用 `timedatectl set-ntp true` 校准。
 - **内存 2 GB 以下**：把 `AUTH_CONCURRENCY` 设为 2，口令校验最多占用 38 MB。
 - **Rust**：同样条件下从零编译约 3 分钟，单个编译进程峰值约 650 MB，`run.sh` 按内存决定并行数。也可以在同架构的另一台 Linux 机器上编译，把 `club-hot/target/release/club-hot` 拷过来。
 - **nginx**：1.12 及以上；`run.sh` 在 1.17.6 以前的版本上自动调整访问日志格式。
@@ -167,15 +166,14 @@ python3 tests/stress_site.py hot --backend python --users 1000
 
 ## 由 AI 代理运行
 
-`agent/` 目录提供 MCP 服务 `omms_mcp.py`（只用 Python 标准库），让 Claude、Codex、Cursor 等 AI 客户端代管理员完成全部操作：启动与停止服务、查看状态和日志、调整运行参数、查看与修改管理员密码、设置开放与截止时间、锁定、导入名单并生成账号表、修改学生和社团、设置报名方式与批次、让当前批次现在开放或截止、调剂、导出、备份与恢复。共 32 个工具，删除、清空、恢复、重置密码、调剂等操作在管理员确认后执行。
+`agent/` 提供以 Python 标准库实现的 MCP 服务 `omms_mcp.py`，Claude、Codex、Cursor 等客户端可用它管理服务、参数、管理员账户、名单、社团、报名批次、调剂、导出和备份恢复。删除、清空、恢复、重置密码和调剂等操作需管理员确认；完整工具清单见 [代理运行指南](agent/AGENTS.md)。
 
-- 运行指南：[agent/AGENTS.md](agent/AGENTS.md)，同时作为 MCP 资源 `omms://guide` 提供。
 - Claude Code、Cursor、VS Code：在 `agent` 文件夹中打开，配置已写好。
 - Claude 桌面版：`python3 agent/omms_mcp.py register claude-desktop`，重新打开 Claude。
 - Codex：`python3 agent/omms_mcp.py register codex`。
 - 命令行：`python3 agent/omms_mcp.py call 工具名 '{"参数": "值"}'`。
 
-运行参数写在 `deploy/omms.env`（每行 `键=值`），`run.sh` 启动时读取，代理用 `update_settings` 修改。
+运行参数保存在 `deploy/omms.env`；代理可通过 `update_settings` 修改。
 
 ## 使用流程
 
@@ -183,7 +181,7 @@ python3 tests/stress_site.py hot --backend python --users 1000
 
 1. **导入学生**：在“学生 → 导入”上传名单表格，在核对页改正标注的行后导入，账号表随即下载。
 2. **添加社团**：在“社团 → 添加”填写名称和人数上限，再在社团卡片的“编辑”中补充简介、时间地点、年级范围和图片。各社团人数上限之和不少于学生人数时，调剂后每名学生都有社团。
-3. **设置开放与截止时间**：在“设置 → 时间”按学校时间填写，学生端显示倒计时。新安装时不设开放时间，学生页显示“开放时间待定”。截止时间可以不填。学生分几节课到机房报名时，在同一页选“分批报名”，按班级添加批次并设置各批时段，社团的人数上限即每批名额。
+3. **设置开放与截止时间**：在“设置 → 时间”按学校时间填写，学生端显示倒计时。首次设置开放时间前，学生页显示“开放时间待定”。截止时间为可选项。学生分几节课到机房报名时，在同一页选“分批报名”，按班级添加批次并设置各批时段，社团的人数上限即每批名额。
 4. **报名期间**：在“报名 → 概览”查看各社团进度。
 5. **锁定**：到截止时间自动锁定；也可以随时在“设置 → 时间”中锁定名单。锁定后报名与退选停止，系统同时保存一份数据库快照。
 6. **调剂**：在“报名 → 调剂”查看未报名人数和各社团空余名额，确认后一次安排。
@@ -236,7 +234,7 @@ python3 tests/stress_site.py hot --backend python --users 1000
 | `REGISTER_WAIT_MS` | `8000` | Rust 报名请求等待结果的时长，超出后返回 `pending` |
 | `MAX_CONCURRENCY` | `1024` | Rust 同时处理的请求上限 |
 
-`run.sh` 另外读取下列变量。它们也可以写在 `deploy/omms.env` 里，启动命令中给出的同名变量优先；该文件中 `run.sh` 只读取本表、`APP_UTC_OFFSET`、`BACKUP_KEEP`、`MAX_IMPORT_STUDENTS`、`SESSION_TTL`、`LOGIN_MAX_FAILS`、`AUTH_CONCURRENCY`、`MAX_HTTP_WORKERS`、`SEATS_CACHE_MS`、`LOG_LEVEL` 和 `PYTHON`。
+`run.sh` 从 `deploy/omms.env` 读取本表以及 `APP_UTC_OFFSET`、`BACKUP_KEEP`、`MAX_IMPORT_STUDENTS`、`SESSION_TTL`、`LOGIN_MAX_FAILS`、`AUTH_CONCURRENCY`、`MAX_HTTP_WORKERS`、`SEATS_CACHE_MS`、`LOG_LEVEL` 和 `PYTHON`。启动命令中的同名变量优先；systemd 单元读取整份环境文件。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -286,10 +284,9 @@ python3 tests/stress_registration.py --seats 100 --users 1000 --concurrency 1000
 ## 上线清单
 
 - 从校外访问时设置 `TLS_CERT`、`TLS_KEY` 启用 HTTPS；经内网穿透访问时设置 `REAL_IP_FROM`。
-- 服务器是 Mac 时保持接通电源；MacBook 保持开盖。
 - Redis 使用 `deploy/redis.conf`，或者为本系统单独分配一个库和键前缀。
 - 按学校时区设置 `APP_UTC_OFFSET`，并校准服务器时钟。
-- 提醒学生提前几分钟登录，让口令校验的计算分散在开放之前。
+- 安排学生提前几分钟登录，分散开放前的口令校验负载。
 - 锁定和调剂之后下载完整备份，保存到另一台电脑。
 
 ## 项目结构
