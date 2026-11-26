@@ -167,6 +167,23 @@ def _load_lua(name):
         return fh.read()
 
 
+# 名额池的表、视图与触发器；Rust 热服务执行同一个文件。
+with open(os.path.join(SHARED_DIR, "sql", "pools.sql"), encoding="utf-8") as _pools_file:
+    POOLS_SQL = _pools_file.read()
+
+
+def run_sql_script(cur, script):
+    """逐条执行 SQL 脚本，留在调用方的事务里（executescript 会先提交）。"""
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            cur.execute(pending)
+            pending = ""
+    if any(line.strip() and not line.strip().startswith("--") for line in pending.splitlines()):
+        raise ValueError("SQL 脚本末尾的语句不完整")
+
+
 # ---- Redis 键(与 Rust 热服务共用) ----------------------------------------
 def rk(*parts):
     return REDIS_PREFIX + ":".join(str(part) for part in parts)
@@ -178,6 +195,9 @@ K_LOCKED = rk("locked")        # "1" 表示名单已锁定
 K_INIT = rk("init")            # 整体发布完成的标记
 K_MAINT = rk("maint")          # 全局维护锁(清空类操作与冷启动)
 K_REPAIR = rk("repair")        # 待修复的社团 id 集合
+K_BATCH = rk("batch")          # 分批报名时的当前批次编号；同时报名时不存在
+K_BATCHMAP = rk("batchmap")    # 分批报名时班级到批次编号的哈希
+BATCH_DONE = 1_000_000         # 全部批次已截止时的当前批次编号，大于任何批次
 
 
 def k_stock(club_id):
@@ -354,11 +374,11 @@ class RedisGate:
             raise RuntimeError("redis unavailable") from e
 
     # ---- 抢位、确认、撤销 ----
-    def acquire(self, student_id, club_id, lease, member, idem_prefix):
-        """返回 acquire.lua 的结果码；本次请求的重放(2)按抢到(1)处理。"""
+    def acquire(self, student_id, club_id, lease, member, idem_prefix, klass=""):
+        """返回 acquire.lua 的结果码；本次请求的重放(2)按抢到(1)处理。klass 用于分批报名的批次检查。"""
         keys = [k_stock(club_id), k_reg(student_id), k_op(student_id), K_OPEN_AT, K_MAINT,
-                K_LOCKED, k_fence(club_id), k_inflight(club_id), K_CLOSE_AT]
-        args = [lease, SEAT_OP_TTL, member, idem_prefix]
+                K_LOCKED, k_fence(club_id), k_inflight(club_id), K_CLOSE_AT, K_BATCH, K_BATCHMAP]
+        args = [lease, SEAT_OP_TTL, member, idem_prefix, klass or ""]
         code = int(self._run("acquire", keys, args))
         return 1 if code == 2 else code
 
@@ -378,11 +398,12 @@ class RedisGate:
             raise RuntimeError("stock missing")
         return code
 
-    def cancel_begin(self, student_id, club_id, lease, member):
+    def cancel_begin(self, student_id, club_id, lease, member, klass=""):
         return int(self._run(
             "cancel_begin",
-            [K_MAINT, k_fence(club_id), k_op(student_id), k_inflight(club_id), K_LOCKED, K_CLOSE_AT],
-            [lease, SEAT_OP_TTL, member],
+            [K_MAINT, k_fence(club_id), k_op(student_id), k_inflight(club_id), K_LOCKED, K_CLOSE_AT,
+             K_BATCH, K_BATCHMAP],
+            [lease, SEAT_OP_TTL, member, klass or ""],
         ))
 
     def cancel_release(self, student_id, club_id, mirror, lease, member, event_id):
@@ -524,8 +545,11 @@ class RedisGate:
     def has_active_operations(self):
         return next(self._r.scan_iter(match=rk("op", "*"), count=1000), None) is not None
 
-    def publish_all(self, token, stocks, mirrors, open_at, locked, close_at=None):
-        """持有全局维护锁时整体发布库存、镜像、开放与截止时间、锁定状态。"""
+    def publish_all(self, token, stocks, mirrors, open_at, locked, close_at=None, batch=None):
+        """持有全局维护锁时整体发布库存、镜像、开放与截止时间、锁定状态和批次。
+
+        batch 为 None 表示同时报名；分批报名时为 {"current": 当前批次编号, "classes": {班级: 批次编号}}。
+        """
         stale = []
         for name in ("stock", "reg", "inflight", "fence"):
             stale.extend(self._r.scan_iter(match=rk(name, "*"), count=1000))
@@ -537,6 +561,12 @@ class RedisGate:
             pipe.multi()
             if stale:
                 pipe.delete(*stale)
+            pipe.delete(K_BATCH, K_BATCHMAP)
+            if batch is not None:
+                # 逐个写入班级，兼容 Redis 3.2 的 HSET。
+                for klass, batch_id in sorted(batch["classes"].items()):
+                    pipe.hset(K_BATCHMAP, klass, int(batch_id))
+                pipe.set(K_BATCH, int(batch["current"]))
             for club_id, remaining in stocks.items():
                 pipe.set(k_stock(club_id), int(remaining))
             for student_id, value in mirrors.items():
@@ -1237,6 +1267,37 @@ def operations_snapshot():
 # ==========================================================================
 # 调剂：锁定名单后，把未报名的学生随机安排到还有名额的社团
 # ==========================================================================
+# ---- 社团卡片插图 ----
+# 管理员在编辑页为每个社团选一幅插图（clubs.art），上传的照片优先显示。插图画在 web/js/club-art.js。
+# 新社团按名称先选一幅，管理员随时可改；之后改名不影响已选的插图。
+CLUB_ART = ("club", "laser", "design", "model3d", "print", "media", "wood", "code", "robot", "paint",
+            "music", "science", "sports", "book")
+_CLUB_ART_RULES = tuple((key, re.compile(pattern, re.I)) for key, pattern in (
+    ("model3d", r"3D\s*设计|3D\s*建模|三维设计|建模|C4D|Blender"),
+    ("print", r"3D|三维|打印"),
+    ("laser", r"激光|雕刻|雕切|切割"),
+    ("design", r"设计|Photoshop|平面|海报|美工|PS"),
+    ("media", r"传媒|媒体|影视|摄影|播音|广播|新闻|视频|电视|拍摄|剪辑"),
+    ("wood", r"木工|木艺|木作|木雕"),
+    ("code", r"编程|程序|信息|计算机|电脑|Python|Scratch|算法|人工智能"),
+    ("robot", r"机器人|机械|无人机|创客"),
+    ("paint", r"美术|绘画|画|书法|素描|水彩"),
+    ("music", r"音乐|合唱|乐团|乐队|吉他|钢琴|器乐|声乐"),
+    ("science", r"科学|实验|化学|物理|生物|天文"),
+    ("sports", r"篮球|足球|排球|乒乓|羽毛球|网球|体育|运动|田径|跳绳|武术"),
+    ("book", r"阅读|文学|读书|写作|诗|朗诵|辩论|演讲"),
+))
+
+
+def suggest_art(name):
+    """按社团名称给新社团选一幅插图；没有对应的插图时用通用插图。"""
+    text = str(name or "")
+    for key, pattern in _CLUB_ART_RULES:
+        if pattern.search(text):
+            return key
+    return "club"
+
+
 def registration_method(operation_id):
     text = operation_id or ""
     if text.startswith("adjust-"):
@@ -1267,16 +1328,200 @@ DATA_CHANGE_ACTIONS = (
     "registration.admin_removed", "registration.admin_transferred", "registration.lock_updated",
     "registrations.adjusted", "registrations.cleared", "students.imported", "student.updated",
     "student.deleted", "students.deleted_all", "clubs.imported", "club.updated", "club.deleted",
-    "clubs.deleted_all",
+    "clubs.deleted_all", "batches.updated",
 )
 
 
+def latest_actions(conn, actions):
+    """各操作最近一次的时间 {action: occurred_at}。每个操作单独取最大值，走 (action, occurred_at) 索引。"""
+    sql = " UNION ALL ".join(["SELECT ?, (SELECT MAX(occurred_at) FROM audit_events WHERE action = ?)"] * len(actions))
+    return {action: at for action, at in conn.execute(sql, [v for action in actions for v in (action, action)])
+            if at is not None}
+
+
 def registration_locked(conn):
-    """名单已锁定，或已到截止时间（后台随后写入锁定）。"""
+    """名单已锁定，或已到截止时间（后台随后写入锁定）。分批报名时以锁定标记为准，各批的截止时间只结束该批。"""
     row = conn.execute(
-        "SELECT COALESCE(registration_locked, 0), registration_end_time FROM settings ORDER BY id DESC LIMIT 1"
+        "SELECT COALESCE(registration_locked, 0), registration_end_time, COALESCE(batch_mode, 0) "
+        "FROM settings ORDER BY id DESC LIMIT 1"
     ).fetchone()
-    return bool(row and (row[0] or deadline_passed(parse_optional_time(row[1]))))
+    if not row:
+        return False
+    return bool(row[0] or (not row[2] and deadline_passed(parse_optional_time(row[1]))))
+
+
+# ---- 分批报名 ----
+# 分批报名时，每个班级属于一个批次；批次按开放时间先后编号（第 1 批最早），各批时段不重叠。
+# 当前批次是第一个尚未截止的批次：Redis 的开放时间、截止时间和库存都按当前批次发布，
+# settings 的开放与截止时间同步为当前批次的时段，两个服务读取它们的地方无需区分报名方式。
+MAX_BATCHES = 20
+
+
+def batch_name(batch_id):
+    return "第 {} 批".format(batch_id)
+
+
+def batch_state(conn):
+    """返回 (是否分批报名, settings 里记录的当前批次编号或 None)。"""
+    row = conn.execute(
+        "SELECT COALESCE(batch_mode, 0), current_batch FROM settings ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        return False, None
+    return bool(row[0]), (int(row[1]) if row[1] is not None else None)
+
+
+def load_batches(conn):
+    """按批次编号返回 [{id, start_time, end_time, classes}]，班级按自然顺序排列。"""
+    members = collections.defaultdict(list)
+    for klass, batch_id in conn.execute("SELECT class_name, batch_id FROM batch_classes"):
+        members[int(batch_id)].append(klass)
+    return [{"id": int(batch_id), "start_time": start, "end_time": end,
+             "classes": sorted(members.get(int(batch_id), []), key=tables.natural_key)}
+            for batch_id, start, end in conn.execute("SELECT id, start_time, end_time FROM batches ORDER BY id")]
+
+
+def desired_batch(batches, now_ms):
+    """当前批次：第一个尚未截止的批次；全部截止后为 BATCH_DONE；没有批次时为 0。"""
+    if not batches:
+        return 0
+    for batch in batches:
+        close_at = parse_optional_time(batch["end_time"])
+        if close_at is None or now_ms < close_at * 1000:
+            return batch["id"]
+    return BATCH_DONE
+
+
+def batch_window(batches, batch_id):
+    """该批次的 (开放时间, 截止时间) 文本；BATCH_DONE 与 0 没有时段。"""
+    for batch in batches:
+        if batch["id"] == batch_id:
+            return batch["start_time"], batch["end_time"]
+    return None, None
+
+
+def batch_payload(batch, now_ms=None):
+    """批次的对外格式：名称、时段（文本与毫秒）、班级和状态。"""
+    open_at = parse_optional_time(batch["start_time"])
+    close_at = parse_optional_time(batch["end_time"])
+    now_ms = RG.now_epoch_ms() if now_ms is None else now_ms
+    if close_at is not None and now_ms >= close_at * 1000:
+        state = "closed"
+    elif open_at is not None and now_ms >= open_at * 1000:
+        state = "open"
+    else:
+        state = "waiting"
+    return {"id": batch["id"], "name": batch_name(batch["id"]), "start_time": batch["start_time"],
+            "end_time": batch["end_time"], "open_at": open_at * 1000 if open_at is not None else None,
+            "close_at": close_at * 1000 if close_at is not None else None, "classes": batch["classes"],
+            "state": state}
+
+
+def pool_used(cur, club_id, student_id):
+    """这名学生所在名额池里，该社团已有的报名人数。同时报名时只走 club_id 索引。"""
+    return cur.execute(
+        "SELECT CASE WHEN COALESCE((SELECT batch_mode FROM settings ORDER BY id DESC LIMIT 1), 0) = 0 "
+        "THEN (SELECT COUNT(*) FROM registrations WHERE club_id = ?1) "
+        "ELSE (SELECT COUNT(*) FROM registrations r JOIN student_batch sb ON sb.student_id = r.student_id "
+        "WHERE r.club_id = ?1 AND sb.pool = COALESCE((SELECT pool FROM student_batch WHERE student_id = ?2), 0)) END",
+        (club_id, student_id)).fetchone()[0]
+
+
+def club_peak_used(cur, club_id):
+    """该社团在各名额池里报名人数的最大值；人数上限不能低于它。"""
+    return cur.execute(
+        "SELECT COALESCE(MAX(n), 0) FROM (SELECT COUNT(*) AS n FROM registrations r "
+        "JOIN student_batch sb ON sb.student_id = r.student_id WHERE r.club_id = ? GROUP BY sb.pool)",
+        (club_id,)).fetchone()[0]
+
+
+def parse_batches(items):
+    """校验管理员提交的批次，按开放时间排序后编号。返回 (批次列表, None) 或 (None, 提示)。"""
+    if not isinstance(items, list):
+        return None, "批次格式错误"
+    if len(items) > MAX_BATCHES:
+        return None, "批次最多 {} 个".format(MAX_BATCHES)
+    parsed = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None, "批次格式错误"
+        times = []
+        for field in ("start_time", "end_time"):
+            text = item.get(field)
+            if text is not None and not isinstance(text, str):
+                return None, "时间格式应为 YYYY-MM-DD HH:MM:SS"
+            try:
+                times.append(parse_local_time(text.strip()) if text and text.strip() else None)
+            except ValueError:
+                return None, "时间格式应为 YYYY-MM-DD HH:MM:SS"
+        classes = clean_text_list(item.get("classes"), max_items=500, item_maxlen=80)
+        if classes is None:
+            return None, "班级格式错误"
+        parsed.append({"start": times[0], "end": times[1], "classes": classes})
+    parsed.sort(key=lambda batch: (batch["start"] is None, batch["start"] or 0, batch["end"] or 0))
+    owner = {}
+    for index, batch in enumerate(parsed, 1):
+        name = batch_name(index)
+        if batch["start"] is None or batch["end"] is None:
+            return None, "请填写{}的开放和截止时间".format(name)
+        if batch["end"] <= batch["start"]:
+            return None, "{}的截止时间请晚于开放时间".format(name)
+        if index > 1 and batch["start"] < parsed[index - 2]["end"]:
+            return None, "{}请在{}截止后开放".format(name, batch_name(index - 1))
+        if not batch["classes"]:
+            return None, "请为{}选择班级".format(name)
+        for klass in batch["classes"]:
+            if klass in owner:
+                return None, "“{}”请只放在一个批次里".format(klass)
+            owner[klass] = index
+    return [{"id": index, "start_time": format_local_time(batch["start"]),
+             "end_time": format_local_time(batch["end"]), "classes": batch["classes"]}
+            for index, batch in enumerate(parsed, 1)], None
+
+
+def batch_overview(conn, now_ms):
+    """控制台用：报名方式、当前批次、各批的时段、班级、人数、报名数和各社团报名数，以及待分批的班级。
+
+    人数按 batch_classes 统计，同时报名时也能看到已保存的分批设置。
+    """
+    batched, current = batch_state(conn)
+    batches = load_batches(conn)
+    counts = {int(pool): (students, registered) for pool, students, registered in conn.execute(
+        "SELECT COALESCE(bc.batch_id, 0), COUNT(*), COUNT(r.id) FROM students s "
+        "LEFT JOIN batch_classes bc ON bc.class_name = s.class "
+        "LEFT JOIN registrations r ON r.student_id = s.id GROUP BY 1")}
+    by_club = collections.defaultdict(dict)
+    for pool, club_id, count in conn.execute(
+            "SELECT COALESCE(bc.batch_id, 0), r.club_id, COUNT(*) FROM registrations r "
+            "JOIN students s ON s.id = r.student_id LEFT JOIN batch_classes bc ON bc.class_name = s.class "
+            "GROUP BY 1, 2"):
+        by_club[int(pool)][str(club_id)] = count
+    assigned = {klass for batch in batches for klass in batch["classes"]}
+    unassigned = [{"class": klass, "students": count} for klass, count in sorted(
+        conn.execute("SELECT class, COUNT(*) FROM students GROUP BY class").fetchall(),
+        key=lambda row: tables.natural_key(row[0])) if klass not in assigned]
+    items = []
+    for batch in batches:
+        students, registered = counts.get(batch["id"], (0, 0))
+        items.append(dict(batch_payload(batch, now_ms), students=students, registered=registered,
+                          clubs=by_club.get(batch["id"], {})))
+    return {
+        "batch_mode": batched,
+        "current_batch": (current or 0) if batched else None,
+        "batches": items,
+        "unassigned": unassigned,
+        "unassigned_students": sum(item["students"] for item in unassigned),
+        "unassigned_clubs": by_club.get(0, {}) if batched else {},
+        "largest_batch": max((item["students"] for item in items), default=0),
+    }
+
+
+def pool_overflows(cur):
+    """名额池里报名人数超过人数上限的 (社团, 名额池, 人数, 上限)；更改报名方式或分批前检查。"""
+    return cur.execute(
+        "SELECT c.name, sb.pool, COUNT(*), c.max_students FROM registrations r "
+        "JOIN student_batch sb ON sb.student_id = r.student_id JOIN clubs c ON c.id = r.club_id "
+        "GROUP BY r.club_id, sb.pool HAVING COUNT(*) > c.max_students ORDER BY c.id, sb.pool"
+    ).fetchall()
 
 
 def _max_flow(groups, seats):
@@ -1320,34 +1565,50 @@ def _max_flow(groups, seats):
 
 
 def plan_adjustment(conn, rng=None):
-    """返回 (安排 [(学生, 社团)], 无法安排的学生, {社团: 空余名额})。
+    """返回 (安排 [(学生, 社团, 名额池)], 无法安排的学生, {(名额池, 社团): 空余名额})。
 
     只用开放中的社团，遵守年级和班级限制；能安排的人数最多，同组学生之间随机。
+    分批报名时每批只用本批的空余名额；班级待分批的学生（名额池 0）保持未报名。
     """
+    batched, _current = batch_state(conn)
     students = conn.execute(
-        "SELECT s.id, s.grade, s.class FROM students s "
+        "SELECT s.id, s.grade, s.class, sb.pool FROM students s JOIN student_batch sb ON sb.student_id = s.id "
         "LEFT JOIN registrations r ON r.student_id = s.id WHERE r.id IS NULL ORDER BY s.id"
     ).fetchall()
     clubs = conn.execute(
-        "SELECT c.id, c.max_students - (SELECT COUNT(*) FROM registrations r WHERE r.club_id = c.id), "
-        "c.enabled, c.allowed_grades, c.allowed_classes FROM clubs c ORDER BY c.id"
-    ).fetchall()
-    seats = {club: free for club, free, enabled, _grades, _classes in clubs if enabled and free > 0}
-    groups = collections.OrderedDict()
-    for student, grade, klass in students:
-        options = frozenset(club for club, _free, _enabled, grades, classes in clubs
-                            if club in seats and student_matches_restrictions(grade, klass, grades, classes)[0])
-        groups.setdefault(options, []).append(student)
-    allocation = _max_flow({options: len(members) for options, members in groups.items() if options}, seats)
+        "SELECT id, max_students, enabled, allowed_grades, allowed_classes FROM clubs ORDER BY id").fetchall()
+    used = {(club, pool): count for club, pool, count in conn.execute(
+        "SELECT r.club_id, sb.pool, COUNT(*) FROM registrations r "
+        "JOIN student_batch sb ON sb.student_id = r.student_id GROUP BY r.club_id, sb.pool")}
+    pools = [batch["id"] for batch in load_batches(conn)] if batched else [0]
+    seats = {}
+    for pool in pools:
+        for club, maximum, enabled, _grades, _classes in clubs:
+            free = maximum - used.get((club, pool), 0)
+            if enabled and free > 0:
+                seats[(pool, club)] = free
     rng = rng or random.SystemRandom()
     pairs, unplaced = [], []
-    for options, members in groups.items():
-        members = list(members)
-        rng.shuffle(members)
-        for club, count in sorted(allocation.get(options, {}).items()):
-            pairs.extend((student, club) for student in members[:count])
-            members = members[count:]
-        unplaced.extend(members)
+    for pool in pools:
+        pool_seats = {club: free for (seat_pool, club), free in seats.items() if seat_pool == pool}
+        groups = collections.OrderedDict()
+        for student, grade, klass, student_pool in students:
+            if student_pool != pool:
+                continue
+            options = frozenset(club for club, _maximum, _enabled, grades, classes in clubs
+                                if club in pool_seats
+                                and student_matches_restrictions(grade, klass, grades, classes)[0])
+            groups.setdefault(options, []).append(student)
+        allocation = _max_flow({options: len(members) for options, members in groups.items() if options},
+                               pool_seats)
+        for options, members in groups.items():
+            members = list(members)
+            rng.shuffle(members)
+            for club, count in sorted(allocation.get(options, {}).items()):
+                pairs.extend((student, club, pool) for student in members[:count])
+                members = members[count:]
+            unplaced.extend(members)
+    unplaced.extend(student for student, _grade, _klass, pool in students if pool not in pools)
     return pairs, unplaced, seats
 
 
@@ -1404,6 +1665,7 @@ BACKUP_NAME_RE = re.compile(r"(\d{8}-\d{6})-([a-z]+(?:-[a-z]+)*)(?:-\d+)?\.db")
 BACKUP_LABELS = {
     "locked": "名单锁定", "before-adjust": "调剂前", "before-clear": "清空报名前",
     "before-delete-students": "清空学生前", "before-delete-clubs": "清空社团前", "before-restore": "恢复前",
+    "before-delete-club": "删除社团前",
 }
 BACKUP_DB_NAME = "club_system.db"
 BACKUP_TABLES = {"settings", "students", "clubs", "registrations"}
@@ -1547,17 +1809,21 @@ def admission_result(row):
 
 
 def club_seat_truth(club_id):
-    """SQLite 中单个社团的容量、报名数与报名镜像；社团不存在返回 None。"""
+    """SQLite 中单个社团的容量、当前名额池的报名数与全部报名镜像；社团不存在返回 None。"""
     with DB_POOL.connection() as conn:
-        row = conn.execute("SELECT max_students FROM clubs WHERE id=?", (club_id,)).fetchone()
-        if not row:
-            return None
-        registrations = conn.execute(
-            "SELECT student_id, operation_id FROM registrations WHERE club_id=?", (club_id,)
-        ).fetchall()
+        conn.execute("BEGIN")
+        try:
+            row = conn.execute("SELECT max_students, used FROM club_pool WHERE club_id=?", (club_id,)).fetchone()
+            if not row:
+                return None
+            registrations = conn.execute(
+                "SELECT student_id, operation_id FROM registrations WHERE club_id=?", (club_id,)
+            ).fetchall()
+        finally:
+            conn.rollback()
     mirrors = {int(student_id): reservation_mirror(club_id, operation_id)
                for student_id, operation_id in registrations}
-    return int(row[0]), len(registrations), mirrors
+    return int(row[0]), int(row[1]), mirrors
 
 
 def publish_club_with_fence(club_id, token):
@@ -1670,7 +1936,7 @@ def build_catalog():
     with DB_POOL.connection() as conn:
         rows = conn.execute(
             "SELECT id, name, max_students, description, advisor_name, meeting_time, location, "
-            "image_path, allowed_grades, allowed_classes, enabled, revision, seat_sync_pending "
+            "image_path, allowed_grades, allowed_classes, enabled, revision, seat_sync_pending, art "
             "FROM clubs ORDER BY id"
         ).fetchall()
     return [{
@@ -1678,12 +1944,13 @@ def build_catalog():
         "advisor_name": advisor, "meeting_time": meeting, "location": location,
         "image_path": image_path, "allowed_grades": stored_text_list(grades),
         "allowed_classes": stored_text_list(classes), "enabled": bool(enabled),
-        "revision": revision, "seat_sync_pending": bool(pending),
+        "revision": revision, "seat_sync_pending": bool(pending), "art": art,
     } for (cid, name, maximum, description, advisor, meeting, location, image_path, grades,
-           classes, enabled, revision, pending) in rows]
+           classes, enabled, revision, pending, art) in rows]
 
 
 def build_seats():
+    """名额快照。分批报名时库存属于当前批次（batch），locked 只表示名单锁定，各批截止由学生页按本批时段判断。"""
     _catalog_body, catalog_etag = CATALOG_CACHE.get()
     with DB_POOL.connection() as conn:
         rows = conn.execute("SELECT id, max_students, current_students FROM clubs ORDER BY id").fetchall()
@@ -1691,6 +1958,7 @@ def build_seats():
             "SELECT registration_start_time, registration_locked, registration_end_time "
             "FROM settings ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        batched, current_batch = batch_state(conn)
     live = RG.stock_left([row[0] for row in rows]) or {}
     seats = []
     for club_id, maximum, current in rows:
@@ -1705,14 +1973,27 @@ def build_seats():
         except ValueError:
             open_at = None
     close_at = parse_optional_time(setting[2]) if setting else None
-    locked = bool(setting and setting[1]) or bool(RG.locked_get()) or deadline_passed(close_at, RG.now_epoch_ms())
+    locked = (bool(setting and setting[1]) or bool(RG.locked_get())
+              or (not batched and deadline_passed(close_at, RG.now_epoch_ms())))
     return {"catalog": catalog_etag, "open_at": open_at * 1000 if open_at is not None else None,
             "close_at": close_at * 1000 if close_at is not None else None,
-            "end_time": setting[2] if close_at is not None else None, "locked": locked, "seats": seats}
+            "end_time": setting[2] if close_at is not None else None, "locked": locked,
+            "batch": (current_batch or 0) if batched else None, "seats": seats}
+
+
+def build_batches():
+    """GET /api/batches 的内容：报名方式、当前批次、各批的时段、班级与状态。"""
+    now_ms = RG.now_epoch_ms()
+    with DB_POOL.connection() as conn:
+        batched, current = batch_state(conn)
+        batches = load_batches(conn)
+    return {"batch_mode": batched, "current": (current or 0) if batched else None,
+            "batches": [batch_payload(batch, now_ms) for batch in batches]}
 
 
 CATALOG_CACHE = ConditionalCache(CATALOG_CACHE_SECONDS, build_catalog)
 SEATS_CACHE = ConditionalCache(SEATS_CACHE_SECONDS, build_seats)
+BATCHES_CACHE = ConditionalCache(CATALOG_CACHE_SECONDS, build_batches)
 
 
 def _csv_safe(v):
@@ -1885,6 +2166,8 @@ def ensure_schema(conn):
             ON audit_events(occurred_at DESC);
         CREATE INDEX IF NOT EXISTS idx_audit_events_target
             ON audit_events(target_type, target_id, occurred_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_events_action
+            ON audit_events(action, occurred_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_request
             ON audit_events(actor_role, actor_id, action, request_id)
             WHERE request_id IS NOT NULL;
@@ -1899,6 +2182,8 @@ def ensure_schema(conn):
     ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")
     ensure_column("settings", "registration_locked", "registration_locked INTEGER NOT NULL DEFAULT 0")
     ensure_column("settings", "registration_end_time", "registration_end_time TEXT")
+    ensure_column("settings", "batch_mode", "batch_mode INTEGER NOT NULL DEFAULT 0")
+    ensure_column("settings", "current_batch", "current_batch INTEGER")
     for name, definition in (
         ("description", "description TEXT NOT NULL DEFAULT ''"),
         ("advisor_name", "advisor_name TEXT NOT NULL DEFAULT ''"),
@@ -1911,8 +2196,12 @@ def ensure_schema(conn):
         ("revision", "revision INTEGER NOT NULL DEFAULT 0"),
         ("seat_revision", "seat_revision INTEGER NOT NULL DEFAULT 0"),
         ("seat_sync_pending", "seat_sync_pending INTEGER NOT NULL DEFAULT 0"),
+        ("art", "art TEXT NOT NULL DEFAULT ''"),
     ):
         ensure_column("clubs", name, definition)
+    # 还没有选过插图的社团（旧库升级、恢复旧备份）按名称选一幅，之后由管理员决定。
+    for club_id, club_name in cur.execute("SELECT id, name FROM clubs WHERE art = ''").fetchall():
+        cur.execute("UPDATE clubs SET art=? WHERE id=?", (suggest_art(club_name), club_id))
     # 旧库在线迁移:operation_id 用来让 Redis confirm/cancel 精确匹配同一代操作。
     cur.execute("PRAGMA table_info(registrations)")
     if "operation_id" not in {r[1] for r in cur.fetchall()}:
@@ -1926,33 +2215,9 @@ def ensure_schema(conn):
         "ON registrations(operation_id) WHERE operation_id IS NOT NULL"
     )
     # Redis 是快速准入层；SQLite trigger 是跨 Python/Rust 的最终容量保险。
-    # 即使库存因运维或故障漂移，第 max+1 条 registration 也无法落库。
-    cur.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS registrations_capacity_guard
-        BEFORE INSERT ON registrations
-        FOR EACH ROW
-        BEGIN
-          SELECT CASE WHEN
-            (SELECT COUNT(*) FROM registrations WHERE club_id = NEW.club_id) >=
-            (SELECT max_students FROM clubs WHERE id = NEW.club_id)
-          THEN RAISE(ABORT, 'club full') END;
-        END
-        """
-    )
-    cur.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS registrations_capacity_guard_update
-        BEFORE UPDATE OF club_id ON registrations
-        FOR EACH ROW WHEN NEW.club_id != OLD.club_id
-        BEGIN
-          SELECT CASE WHEN
-            (SELECT COUNT(*) FROM registrations WHERE club_id = NEW.club_id) >=
-            (SELECT max_students FROM clubs WHERE id = NEW.club_id)
-          THEN RAISE(ABORT, 'club full') END;
-        END
-        """
-    )
+    # 即使库存因运维或故障漂移，名额池里第 max+1 条 registration 也无法落库。
+    # 名额池的表、视图与触发器写在 shared/sql/pools.sql，Rust 热服务执行同一份定义。
+    run_sql_script(cur, POOLS_SQL)
     # `clubs.max_students` is business data, but it still needs a durable
     # bound: Python integers are unbounded while SQLite INTEGER is signed
     # 64-bit.  Without this guard one malformed import rolls back a whole
@@ -1974,17 +2239,6 @@ def ensure_schema(conn):
         FOR EACH ROW WHEN NEW.max_students < 1 OR NEW.max_students > {MAX_CLUB_CAPACITY}
         BEGIN
           SELECT RAISE(ABORT, 'invalid club capacity');
-        END
-        """
-    )
-    cur.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS clubs_capacity_registration_guard
-        BEFORE UPDATE OF max_students ON clubs
-        FOR EACH ROW WHEN NEW.max_students <
-            (SELECT COUNT(*) FROM registrations WHERE club_id = OLD.id)
-        BEGIN
-          SELECT RAISE(ABORT, 'club capacity below registrations');
         END
         """
     )
@@ -2054,7 +2308,7 @@ def init_db():
         )
         cur.execute(
             "UPDATE clubs SET current_students = "
-            "(SELECT COUNT(*) FROM registrations r WHERE r.club_id = clubs.id)"
+            "(SELECT used FROM club_pool WHERE club_pool.club_id = clubs.id)"
         )
         conn.commit()
     finally:
@@ -2070,8 +2324,35 @@ def init_db():
         seed_settings_mirror()
 
 
+def sync_current_batch(cur):
+    """分批报名时按当前时间确定当前批次，写入 settings 的 current_batch 与开放、截止时间。
+
+    返回 Redis 的批次状态 {"current", "classes"}；同时报名时返回 None。调用方持有写事务。
+    """
+    row = cur.execute(
+        "SELECT id, COALESCE(batch_mode, 0), current_batch, registration_start_time, registration_end_time "
+        "FROM settings ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        return None
+    settings_id, batched, stored, start_text, end_text = row
+    if not batched:
+        if stored is not None:
+            cur.execute("UPDATE settings SET current_batch=NULL WHERE id=?", (settings_id,))
+        return None
+    batches = load_batches(cur)
+    current = desired_batch(batches, RG.now_epoch_ms())
+    start, end = batch_window(batches, current)
+    if (stored, start_text, end_text) != (current, start, end):
+        cur.execute("UPDATE settings SET current_batch=?, registration_start_time=?, registration_end_time=? "
+                    "WHERE id=?", (current, start, end, settings_id))
+        if stored != current:
+            log.info("当前批次: %s", batch_name(current) if 0 < current < BATCH_DONE else current)
+    classes = {klass: batch["id"] for batch in batches for klass in batch["classes"]}
+    return {"current": current, "classes": classes}
+
+
 def rebuild_all(token=None):
-    """以 SQLite 为准整体发布 Redis 名额状态：首次启动、Redis 重启或清空类操作后使用。"""
+    """以 SQLite 为准整体发布 Redis 名额状态：首次启动、Redis 重启、清空类操作和批次切换后使用。"""
     if not RG.alive():
         return False
     owns = token is None
@@ -2081,15 +2362,14 @@ def rebuild_all(token=None):
             return False
     try:
         with DB_POOL.connection() as conn:
-            conn.execute("BEGIN")
-            rows = conn.execute(
-                "SELECT c.id, c.max_students, "
-                "(SELECT COUNT(*) FROM registrations r WHERE r.club_id=c.id) FROM clubs c"
-            ).fetchall()
-            registrations = conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            batch = sync_current_batch(cur)
+            rows = cur.execute("SELECT club_id, max_students, used FROM club_pool").fetchall()
+            registrations = cur.execute(
                 "SELECT student_id, club_id, operation_id FROM registrations"
             ).fetchall()
-            setting = conn.execute(
+            setting = cur.execute(
                 "SELECT registration_start_time, registration_locked, registration_end_time "
                 "FROM settings ORDER BY id DESC LIMIT 1"
             ).fetchone()
@@ -2103,14 +2383,15 @@ def rebuild_all(token=None):
         stocks = {int(cid): max(0, int(maximum) - int(used)) for cid, maximum, used in rows}
         mirrors = {int(sid): reservation_mirror(cid, op) for sid, cid, op in registrations}
         RG.publish_all(token, stocks, mirrors, open_at, bool(setting and setting[1]),
-                       parse_optional_time(setting[2]) if setting else None)
+                       parse_optional_time(setting[2]) if setting else None, batch=batch)
         with DB_POOL.connection() as conn:
             conn.execute(
                 "UPDATE clubs SET current_students="
-                "(SELECT COUNT(*) FROM registrations r WHERE r.club_id=clubs.id), seat_sync_pending=0"
+                "(SELECT used FROM club_pool WHERE club_pool.club_id=clubs.id), seat_sync_pending=0"
             )
         CATALOG_CACHE.invalidate()
         SEATS_CACHE.invalidate()
+        BATCHES_CACHE.invalidate()
         log.info("Redis 名额已整体发布: %d 个社团", len(rows))
         return True
     except Exception as e:  # noqa: BLE001
@@ -2139,11 +2420,17 @@ def seed_settings_mirror():
 
 
 def lock_at_deadline():
-    """到截止时间后写入锁定：清除截止时间，记入操作记录，并保存快照。抢位脚本此前已按截止时间拒绝。"""
+    """到截止时间后写入锁定：清除截止时间，记入操作记录，并保存快照。抢位脚本此前已按截止时间拒绝。
+
+    分批报名时由 sync_batches 处理：各批截止后切换到下一批，最后一批截止后锁定。
+    """
     with DB_POOL.connection() as conn:
         row = conn.execute(
-            "SELECT id, registration_end_time, COALESCE(registration_locked, 0) FROM settings ORDER BY id DESC LIMIT 1"
+            "SELECT id, registration_end_time, COALESCE(registration_locked, 0), COALESCE(batch_mode, 0) "
+            "FROM settings ORDER BY id DESC LIMIT 1"
         ).fetchone()
+    if row and row[3]:
+        return False
     close_at = parse_optional_time(row[1]) if row else None
     if close_at is None or not deadline_passed(close_at, RG.now_epoch_ms()):
         return False
@@ -2181,13 +2468,81 @@ def lock_at_deadline():
     return True
 
 
+BATCHES_DONE_REASON = "最后一批截止"
+
+
+def batches_lock_due(conn):
+    """全部批次截止后是否还需要自动锁定：本次分批设置之后还没有自动锁定过。管理员解除锁定后不再重复锁定。"""
+    locked_at, configured_at = conn.execute(
+        "SELECT (SELECT MAX(occurred_at) FROM audit_events WHERE action='registration.lock_updated' AND reason=?), "
+        "(SELECT MAX(occurred_at) FROM audit_events WHERE action='batches.updated')",
+        (BATCHES_DONE_REASON,)).fetchone()
+    return locked_at is None or (configured_at is not None and configured_at > locked_at)
+
+
+def lock_after_batches(last_end):
+    """最后一批截止后锁定名单：记入操作记录并保存快照。"""
+    with DB_POOL.connection() as conn:
+        cur = conn.cursor()
+        conn.execute("BEGIN IMMEDIATE")
+        row = cur.execute("SELECT id, COALESCE(registration_locked, 0) FROM settings ORDER BY id DESC LIMIT 1"
+                          ).fetchone()
+        if not row or row[1] or not batches_lock_due(cur):
+            conn.rollback()
+            return False
+        cur.execute("UPDATE settings SET registration_locked=1 WHERE id=?", (row[0],))
+        append_audit_event(
+            cur, event_id="registration-batches-done-" + secrets.token_urlsafe(18), actor_role="admin",
+            actor_id="系统", action="registration.lock_updated", target_type="settings", target_id=row[0],
+            reason=BATCHES_DONE_REASON, before={"locked": False, "end_time": last_end}, after={"locked": True},
+        )
+        conn.commit()
+    RG.locked_set(True)
+    SEATS_CACHE.invalidate()
+    log.info("最后一批 %s 截止，名单已锁定", last_end)
+    try:
+        snapshot_database("locked")
+    except (OSError, sqlite3.Error) as exc:
+        log.error("锁定后自动备份失败: %s", exc)
+    return True
+
+
+def sync_batches():
+    """分批报名：当前批次截止后切换到下一批并重新发布名额；最后一批截止后锁定名单。
+
+    返回距离当前批次截止的秒数（后台线程据此准时醒来），没有待截止的批次时返回 None。
+    """
+    with DB_POOL.connection() as conn:
+        batched, stored = batch_state(conn)
+        if not batched:
+            return None
+        batches = load_batches(conn)
+        now_ms = RG.now_epoch_ms()
+        desired = desired_batch(batches, now_ms)
+        # 只有全部批次截止后才需要读操作记录，平时每秒只读设置和批次两张小表。
+        lock_due = desired == BATCH_DONE and not registration_locked(conn) and batches_lock_due(conn)
+    if desired != (stored or 0) and not rebuild_all():
+        return 0.2
+    if lock_due:
+        lock_after_batches(batches[-1]["end_time"])
+    _start, end = batch_window(batches, desired)
+    close_at = parse_optional_time(end)
+    return max(0.0, close_at - now_ms / 1000) if close_at is not None else None
+
+
 def seat_worker():
     """后台维护名额：Redis 重启后整体发布，按需修复单个社团，定期清理失效的在途成员，到截止时间写入锁定。"""
     last_scan = 0.0
-    while not RECONCILE_STOP.wait(REPAIR_INTERVAL):
+    delay = REPAIR_INTERVAL
+    while not RECONCILE_STOP.wait(delay):
+        delay = REPAIR_INTERVAL
         try:
             if not RG.alive():
                 continue
+            until_close = sync_batches()
+            if until_close is not None:
+                # 当前批次截止后立即切换到下一批，前后两批的时段可以首尾相接。
+                delay = min(REPAIR_INTERVAL, until_close + 0.02)
             lock_at_deadline()
             if RECONCILE_REQUESTED.is_set() or not RG.r.exists(K_INIT):
                 RECONCILE_REQUESTED.set()
@@ -2224,6 +2579,7 @@ GET_ROUTES = {
     "/api/get_clubs": ("_h_get_clubs", ROLE_PUBLIC),
     "/api/catalog": ("_h_catalog", ROLE_PUBLIC),
     "/api/seats": ("_h_seats", ROLE_PUBLIC),
+    "/api/batches": ("_h_batches", ROLE_PUBLIC),
     "/api/get_student_info": ("_h_get_student_info", ROLE_STUDENT),
     "/api/get_registrations": ("_h_get_registrations", ROLE_ADMIN),
     "/api/get_all_students": ("_h_get_all_students", ROLE_ADMIN),
@@ -2251,6 +2607,8 @@ POST_ROUTES = {
     "/api/import_clubs": ("_h_import_clubs", ROLE_ADMIN),
     "/api/update_registration_time": ("_h_update_time", ROLE_ADMIN),
     "/api/update_registration_lock": ("_h_update_registration_lock", ROLE_ADMIN),
+    "/api/admin/batches": ("_h_update_batches", ROLE_ADMIN),
+    "/api/admin/batch_now": ("_h_batch_now", ROLE_ADMIN),
     "/api/delete_student": ("_h_delete_student", ROLE_ADMIN),
     "/api/delete_all_students": ("_h_delete_all_students", ROLE_ADMIN),
     "/api/delete_club": ("_h_delete_club", ROLE_ADMIN),
@@ -2507,7 +2865,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             raw = self._read_raw_body(raw_route[2] if raw_route is not None else None)
         except RequestBodyError as e:
             return self._json(e.status, {"success": False, "code": "bad_request",
-                                         "message": "请求格式错误：{}".format(e)})
+                                         "message": "请检查请求内容：{}".format(e)})
         if raw_route is not None:
             name, role, _limit = raw_route
             sess = self._require(role)
@@ -2615,9 +2973,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 return self._json(503, {"status": "not-ready", "reason": "maintenance"})
             with DB_POOL.connection() as conn:
                 rows = conn.execute(
-                    "SELECT c.id, c.max_students, "
-                    "(SELECT COUNT(*) FROM registrations r WHERE r.club_id=c.id) "
-                    "FROM clubs c ORDER BY c.id").fetchall()
+                    "SELECT club_id, max_students, used FROM club_pool ORDER BY club_id").fetchall()
             live = RG.stock_left([row[0] for row in rows])
             if live is None:
                 return self._json(503, {"status": "not-ready", "reason": "redis"})
@@ -2637,16 +2993,19 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             self._json(503, {"status": "not-ready"})
 
     def _h_check_time(self, sess):
+        """开放与截止时间、锁定状态和服务器时间。分批报名时时间为当前批次的时段，batch 为当前批次编号。"""
         open_at = RG.open_at_get()
         start_str = None
         end_str = None
         db_locked = False
+        batched, current_batch = False, None
         try:
             with DB_POOL.connection() as conn:
                 row = conn.execute(
                     "SELECT registration_start_time, registration_locked, registration_end_time "
                     "FROM settings ORDER BY id DESC LIMIT 1"
                 ).fetchone()
+                batched, current_batch = batch_state(conn)
             if row:
                 db_locked = bool(row[1])
                 end_str = row[2]
@@ -2662,8 +3021,9 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             start_str = format_local_time(open_at)
         close_at = parse_optional_time(end_str)
         server_now = RG.now_epoch_ms()
-        locked = db_locked or bool(RG.locked_get()) or deadline_passed(close_at, server_now)
-        can = open_at is not None and server_now >= open_at * 1000 and not locked
+        passed = deadline_passed(close_at, server_now)
+        locked = db_locked or bool(RG.locked_get()) or (passed and not batched)
+        can = open_at is not None and server_now >= open_at * 1000 and not locked and not passed
         self._json(200, {
             "can_register": can,
             "start_time": start_str,
@@ -2672,6 +3032,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             "registration_locked": locked,
             "end_time": end_str if close_at is not None else None,
             "close_at": close_at * 1000 if close_at is not None else None,
+            "batch_mode": batched,
+            "batch": (current_batch or 0) if batched else None,
         }, extra=[("Cache-Control", "no-store")])
 
     def _h_get_clubs(self, sess):
@@ -2680,7 +3042,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 rows = conn.execute(
                     "SELECT id, name, max_students, current_students, description, advisor_name, "
                     "meeting_time, location, image_path, allowed_grades, allowed_classes, enabled, "
-                    "revision, seat_sync_pending FROM clubs ORDER BY id"
+                    "revision, seat_sync_pending, art FROM clubs ORDER BY id"
                 ).fetchall()
         except Exception as e:  # noqa: BLE001
             log.error("get_clubs 失败: %s", e)
@@ -2689,7 +3051,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         data = []
         for (cid, name, maxs, cur_s, description, advisor_name, meeting_time,
              location, image_path, allowed_grades, allowed_classes, enabled, revision,
-             seat_sync_pending) in rows:
+             seat_sync_pending, art) in rows:
             used = maxs - live[cid] if live.get(cid) is not None else cur_s
             data.append({
                 "id": cid, "name": name, "max_students": maxs,
@@ -2702,6 +3064,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 "enabled": bool(enabled),
                 "revision": revision,
                 "seat_sync_pending": bool(seat_sync_pending),
+                "art": art,
             })
         self._json(200, data)
 
@@ -2876,12 +3239,12 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         operation_id = "{}-{}".format(sid, request_id or secrets.token_urlsafe(12))
         mirror = reservation_mirror(club_id, operation_id)
         lease = "{}|{}".format(mirror, secrets.token_urlsafe(6))
-        self._register_with_lease(sid, club_id, operation_id, mirror, lease, repair_mirror=True)
+        self._register_with_lease(sid, club_id, operation_id, mirror, lease, repair_mirror=True, klass=row[5])
 
-    def _register_with_lease(self, sid, club_id, operation_id, mirror, lease, repair_mirror):
+    def _register_with_lease(self, sid, club_id, operation_id, mirror, lease, repair_mirror, klass=""):
         member = "{}|{}".format(sid, lease)
         try:
-            code = RG.acquire(sid, club_id, lease, member, mirror + "|")
+            code = RG.acquire(sid, club_id, lease, member, mirror + "|", klass)
         except RuntimeError:
             RG.request_repair(club_id)
             return self._reply(503, "unavailable")
@@ -2906,10 +3269,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 RECONCILE_REQUESTED.set()
             return self._reply(503, "syncing")
         if code == -1:
-            return self._resolve_existing(sid, club_id, operation_id, mirror, lease, repair_mirror)
+            return self._resolve_existing(sid, club_id, operation_id, mirror, lease, repair_mirror, klass)
         return self._reply(503, "unavailable")
 
-    def _resolve_existing(self, sid, club_id, operation_id, mirror, lease, repair_mirror):
+    def _resolve_existing(self, sid, club_id, operation_id, mirror, lease, repair_mirror, klass=""):
         """抢位返回"已报名或有其他操作"时，以数据库为准给出结果。"""
         with DB_POOL.connection() as conn:
             row = conn.execute(
@@ -2929,7 +3292,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         if stale and repair_mirror:
             # 数据库没有报名记录而镜像还在：清掉这条旧镜像后重试一次。
             RG.mirror_set(sid, "clear", stale)
-            return self._register_with_lease(sid, club_id, operation_id, mirror, lease, repair_mirror=False)
+            return self._register_with_lease(sid, club_id, operation_id, mirror, lease, repair_mirror=False,
+                                             klass=klass)
         return self._reply(202, "pending")
 
     def _finalize_registration(self, sid, club_id, operation_id, mirror, lease, member):
@@ -3066,21 +3430,24 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._reply(503, "unavailable")
         with DB_POOL.connection() as conn:
             reg = conn.execute(
-                "SELECT r.id, r.club_id, r.operation_id, c.seat_sync_pending FROM registrations r "
-                "JOIN clubs c ON c.id=r.club_id WHERE r.student_id=?", (sid,)).fetchone()
+                "SELECT r.id, r.club_id, r.operation_id, c.seat_sync_pending, s.class FROM registrations r "
+                "JOIN clubs c ON c.id=r.club_id JOIN students s ON s.id=r.student_id WHERE r.student_id=?",
+                (sid,)).fetchone()
         if not reg:
             return self._reply(200, "not_registered")
-        registration_id, club_id, operation_id, sync_pending = reg
+        registration_id, club_id, operation_id, sync_pending, klass = reg
         if sync_pending:
             return self._reply(503, "syncing")
         lease = "{}|x-{}".format(club_id, secrets.token_urlsafe(9))
         member = "{}|{}".format(sid, lease)
         try:
-            code = RG.cancel_begin(sid, club_id, lease, member)
+            code = RG.cancel_begin(sid, club_id, lease, member, klass)
         except RuntimeError:
             return self._reply(503, "unavailable")
         if code == -6:
             return self._reply(200, "locked")
+        if code == -4:
+            return self._reply(200, "not_open")
         if code == -3:
             return self._reply(503, "syncing")
         if code != 1:
@@ -3152,7 +3519,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         cur_pw = data.get("current") or ""
         new_pw = data.get("new") or ""
         if not isinstance(cur_pw, str) or not isinstance(new_pw, str):
-            return self._json(400, {"success": False, "message": "密码格式错误"})
+            return self._json(400, {"success": False, "message": "请输入新密码"})
         if len(new_pw) < 8 or len(new_pw) > MAX_PASSWORD or len(cur_pw) > MAX_PASSWORD:
             return self._json(400, {"success": False, "message": "新密码须为 8–256 位"})
         uname = sess.get("username", "admin")
@@ -3165,11 +3532,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._auth_busy(verified)
         ok, new_hash = verified
         if not ok:
-            return self._json(400, {"success": False, "message": "当前密码不正确"})
+            return self._json(400, {"success": False, "message": "请核对当前密码"})
         try:
             mutation_lock = RG.session_begin_mutation("admin", uname)
         except RuntimeError:
-            return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+            return self._json(503, {"success": False, "message": "请稍后重试"})
         if not mutation_lock:
             return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
         try:
@@ -3189,7 +3556,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"success": True, "message": "管理员密码已修改，请重新登录"},
                        extra=[self._clear_cookie()])
         except RuntimeError:
-            self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+            self._json(503, {"success": False, "message": "请稍后重试"})
         finally:
             RG.session_end_mutation(mutation_lock)
 
@@ -3198,13 +3565,13 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         try:
             student_id = int(student_id)
         except (TypeError, ValueError):
-            return self._json(400, {"success": False, "message": "缺少或非法的学生ID"})
+            return self._json(400, {"success": False, "message": "请提供有效的学生编号"})
         request_id = admin_request_id(data)
         if request_id is None:
-            return self._json(400, {"success": False, "message": "request_id 格式错误"})
+            return self._json(400, {"success": False, "message": "请提供有效的 request_id"})
         reason = clean_text(data.get("reason"), maxlen=400)
         if not reason:
-            return self._json(400, {"success": False, "message": "重置原因格式错误"})
+            return self._json(400, {"success": False, "message": "请填写原因，400 字以内"})
         actor = sess.get("username", "admin")
         with DB_POOL.connection() as conn:
             replay = conn.execute(
@@ -3221,7 +3588,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                                     "request_id": request_id,
                                     "message": "该重置请求已执行，临时密码仅在首次返回时显示"})
         if not student:
-            return self._json(404, {"success": False, "message": "学生不存在"})
+            return self._json(404, {"success": False, "message": "请刷新名单后重试"})
         temporary_password = gen_password(length=12)
         password_hash = AUTH.run(hash_password, temporary_password)
         if isinstance(password_hash, AuthBusy):
@@ -3229,7 +3596,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         try:
             mutation_lock = RG.session_begin_mutation("student", str(student_id))
         except RuntimeError:
-            return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+            return self._json(503, {"success": False, "message": "请稍后重试"})
         if not mutation_lock:
             return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
         event_id = "password-reset-" + secrets.token_urlsafe(18)
@@ -3241,7 +3608,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 row = cur.execute("SELECT username, name FROM students WHERE id=?", (student_id,)).fetchone()
                 if not row:
                     conn.rollback()
-                    return self._json(404, {"success": False, "message": "学生不存在"})
+                    return self._json(404, {"success": False, "message": "请刷新名单后重试"})
                 cur.execute("UPDATE students SET password=? WHERE id=?", (password_hash, student_id))
                 append_audit_event(
                     cur, event_id=event_id, actor_role="admin", actor_id=actor,
@@ -3259,7 +3626,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         except sqlite3.IntegrityError:
             return self._json(409, {"success": False, "message": "重复的重置请求"})
         except RuntimeError:
-            return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+            return self._json(503, {"success": False, "message": "请稍后重试"})
         finally:
             RG.session_end_mutation(mutation_lock)
 
@@ -3268,7 +3635,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         try:
             student_id = int(data.get("student_id"))
         except (TypeError, ValueError):
-            return self._json(400, {"success": False, "message": "缺少或非法的学生ID"})
+            return self._json(400, {"success": False, "message": "请提供有效的学生编号"})
         request_id = admin_request_id(data)
         name = clean_text(data.get("name"))
         klass = clean_text(data.get("class"))
@@ -3289,13 +3656,26 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                                   (student_id,)).fetchone()
                 if not row:
                     conn.rollback()
-                    return self._json(404, {"success": False, "message": "学生不存在"})
+                    return self._json(404, {"success": False, "message": "请刷新名单后重试"})
                 number = number or row[2]
                 if (name, klass, number) == tuple(row):
                     conn.rollback()
                     return self._json(200, {"success": True, "changed": False})
                 cur.execute("UPDATE students SET name=?, class=?, grade=?, student_id=? WHERE id=?",
                             (name, klass, derive_grade(klass), number, student_id))
+                batched, _current = batch_state(cur)
+                if batched and klass != row[1]:
+                    # 换班可能换到另一批：该生的社团在新批次里也要有名额，名额随后按当前批次重新发布。
+                    registered = cur.execute(
+                        "SELECT r.club_id, c.max_students, c.name FROM registrations r "
+                        "JOIN clubs c ON c.id = r.club_id WHERE r.student_id=?", (student_id,)).fetchone()
+                    if registered and pool_used(cur, registered[0], student_id) > registered[1]:
+                        conn.rollback()
+                        return self._json(409, {"success": False,
+                                                "message": "新班级所在批次的“{}”已满，请先为该生调整社团".format(
+                                                    registered[2])})
+                    if registered:
+                        cur.execute("UPDATE clubs SET seat_sync_pending=1 WHERE id=?", (registered[0],))
                 append_audit_event(
                     cur, event_id="student-update-" + secrets.token_urlsafe(18), actor_role="admin",
                     actor_id=actor, action="student.updated", target_type="student", target_id=student_id,
@@ -3308,7 +3688,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(409, {"success": False, "message": "学号 {} 已被其他学生使用".format(number)})
         except sqlite3.Error as e:
             log.error("修改学生失败: %s", e)
-            return self._json(500, {"success": False, "message": "保存失败"})
+            return self._json(500, {"success": False, "message": "请重试"})
         if klass != row[1]:
             with contextlib.suppress(RuntimeError):
                 RG.session_revoke_identity("student", str(student_id))
@@ -3333,7 +3713,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 "SELECT id, name, class, username FROM students WHERE class=? ORDER BY student_id, id", (klass,)
             ).fetchall()
         if not students:
-            return self._json(404, {"success": False, "message": "该班级没有学生"})
+            return self._json(404, {"success": False, "message": "请选择有学生的班级"})
         passwords = [gen_password() for _ in students]
         hashes = [future.result() for future in
                   [AUTH.submit(hash_password, password, force=True)[0] for password in passwords]]
@@ -3359,10 +3739,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 )
                 conn.commit()
         except RuntimeError:
-            return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+            return self._json(503, {"success": False, "message": "请稍后重试"})
         except sqlite3.Error as e:
             log.error("按班重置密码失败: %s", e)
-            return self._json(500, {"success": False, "message": "重置失败"})
+            return self._json(500, {"success": False, "message": "请重试"})
         finally:
             for lock in locks:
                 RG.session_end_mutation(lock)
@@ -3376,11 +3756,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         try:
             club_id = int(club_id)
         except (TypeError, ValueError):
-            return self._json(400, {"success": False, "message": "缺少或非法的社团ID"})
+            return self._json(400, {"success": False, "message": "请提供有效的社团编号"})
         request_id = admin_request_id(data)
         reason = clean_text(data.get("reason"), maxlen=400)
         if request_id is None or not reason:
-            return self._json(400, {"success": False, "message": "更新参数格式错误"})
+            return self._json(400, {"success": False, "message": "请检查社团信息"})
         actor = sess.get("username", "admin")
         with DB_POOL.connection() as conn:
             existing = conn.execute(
@@ -3411,7 +3791,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return self._json(200, {"success": True, "replayed": True, "request_id": request_id,
                                     "club": after, "seat_sync": "not_needed"})
         if not existing:
-            return self._json(404, {"success": False, "message": "社团不存在"})
+            return self._json(404, {"success": False, "message": "请刷新社团列表后重试"})
         (_id, old_name, old_max, old_description, old_advisor, old_meeting,
          old_location, _old_image_path, old_grades, old_classes, old_enabled,
          _old_revision, _old_sync_pending) = existing
@@ -3431,22 +3811,25 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         location = choose_text("location", old_location, 120)
         if (not name or not all(value is not None
                             for value in (description, advisor_name, meeting_time, location))):
-            return self._json(400, {"success": False, "message": "社团信息格式错误"})
+            return self._json(400, {"success": False, "message": "请检查社团信息"})
         allowed_grades = (clean_text_list(data["allowed_grades"], item_maxlen=20)
                           if "allowed_grades" in data else strict_text_list(old_grades))
         allowed_classes = (clean_text_list(data["allowed_classes"], item_maxlen=80)
                            if "allowed_classes" in data else strict_text_list(old_classes))
         if allowed_grades is None or allowed_classes is None:
-            return self._json(400, {"success": False, "message": "年级或班级限制格式错误"})
+            return self._json(400, {"success": False, "message": "年级、班级范围请用列表"})
         if "enabled" in data and type(data["enabled"]) is not bool:
             return self._json(400, {"success": False, "message": "enabled 必须为布尔值"})
         enabled = data.get("enabled", bool(old_enabled))
         max_students = data.get("max_students", old_max)
         if type(max_students) is not int or not 1 <= max_students <= MAX_CLUB_CAPACITY:
-            return self._json(400, {"success": False, "message": "社团容量格式错误"})
+            return self._json(400, {"success": False, "message": "人数上限请填 1–10000 的整数"})
         expected_revision = data.get("expected_revision")
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
-            return self._json(400, {"success": False, "message": "expected_revision 格式错误"})
+            return self._json(400, {"success": False, "message": "请提供有效的 expected_revision"})
+        art = data.get("art")
+        if "art" in data and art not in CLUB_ART:
+            return self._json(400, {"success": False, "message": "请从列出的插图中选择"})
 
         capacity_changed = max_students != int(old_max)
         held = None
@@ -3464,30 +3847,34 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 conn.execute("BEGIN IMMEDIATE")
                 current = cur.execute(
                     "SELECT name, max_students, description, advisor_name, meeting_time, location, "
-                    "image_path, allowed_grades, allowed_classes, enabled, revision, seat_sync_pending "
+                    "image_path, allowed_grades, allowed_classes, enabled, revision, seat_sync_pending, art "
                     "FROM clubs WHERE id=?", (club_id,)
                 ).fetchone()
                 if not current:
                     conn.rollback()
-                    return self._json(404, {"success": False, "message": "社团不存在"})
+                    return self._json(404, {"success": False, "message": "请刷新社团列表后重试"})
+                art = art if "art" in data else current[12]
                 if expected_revision is not None and current[10] != expected_revision:
                     conn.rollback()
                     return self._json(409, {"success": False, "message": "社团已被其他管理员修改",
                                             "revision": current[10]})
                 used = cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id=?", (club_id,)).fetchone()[0]
-                if max_students < used:
+                peak = club_peak_used(cur, club_id)
+                if max_students < peak:
                     conn.rollback()
-                    return self._json(400, {"success": False, "message": "人数上限至少为已报名人数"})
+                    batched, _current = batch_state(cur)
+                    label = "每批名额" if batched else "人数上限"
+                    return self._json(400, {"success": False, "message": "{}至少为 {}".format(label, peak)})
                 previous_max = int(current[1])
                 capacity_changed = max_students != previous_max
                 new_revision = int(current[10]) + 1
                 cur.execute(
                     "UPDATE clubs SET name=?, max_students=?, description=?, advisor_name=?, meeting_time=?, "
                     "location=?, allowed_grades=?, allowed_classes=?, enabled=?, revision=?, "
-                    "seat_revision=seat_revision + ?, seat_sync_pending=? WHERE id=?",
+                    "seat_revision=seat_revision + ?, seat_sync_pending=?, art=? WHERE id=?",
                     (name, max_students, description, advisor_name, meeting_time, location,
                      _audit_json(allowed_grades), _audit_json(allowed_classes), int(enabled),
-                     new_revision, int(capacity_changed), int(capacity_changed or current[11]), club_id),
+                     new_revision, int(capacity_changed), int(capacity_changed or current[11]), art, club_id),
                 )
                 after = {
                     "id": club_id, "name": name, "max_students": max_students,
@@ -3496,7 +3883,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     "location": location, "image_path": current[6],
                     "allowed_grades": allowed_grades, "allowed_classes": allowed_classes,
                     "enabled": enabled, "revision": new_revision,
-                    "seat_sync_pending": bool(capacity_changed or current[11]),
+                    "seat_sync_pending": bool(capacity_changed or current[11]), "art": art,
                 }
                 before = {
                     "id": club_id, "name": current[0], "max_students": current[1],
@@ -3504,7 +3891,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     "location": current[5], "image_path": current[6],
                     "allowed_grades": stored_text_list(current[7]),
                     "allowed_classes": stored_text_list(current[8]), "enabled": bool(current[9]),
-                    "revision": current[10], "seat_sync_pending": bool(current[11]),
+                    "revision": current[10], "seat_sync_pending": bool(current[11]), "art": current[12],
                 }
                 event_id = "club-update-" + secrets.token_urlsafe(18)
                 append_audit_event(
@@ -3528,7 +3915,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"success": True, "event_id": event_id, "request_id": request_id,
                              "club": after, "seat_sync": seat_sync})
         except sqlite3.IntegrityError:
-            return self._json(409, {"success": False, "message": "重复的更新请求或社团名称冲突"})
+            return self._json(409, {"success": False, "message": "名称已被其他社团使用"})
         finally:
             release_seat_locks(held)
 
@@ -3538,12 +3925,12 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             club_id = int((qs.get("club_id") or [None])[0])
             expected_revision = int((qs.get("expected_revision") or [None])[0])
         except (TypeError, ValueError):
-            return self._json(400, {"success": False, "message": "club_id 或 expected_revision 格式错误"})
+            return self._json(400, {"success": False, "message": "请提供有效的 club_id 和 expected_revision"})
         request_id = (qs.get("request_id") or [None])[0]
         reason = clean_text((qs.get("reason") or [None])[0], maxlen=400)
         if (not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", request_id)
                 or not reason or club_id <= 0 or expected_revision < 0):
-            return self._json(400, {"success": False, "message": "上传参数格式错误"})
+            return self._json(400, {"success": False, "message": "请检查上传参数"})
         actor = sess.get("username", "admin")
         # A network retry must not spend another Pillow decode/write slot or
         # create a second immutable object.  Bind the idempotency key to this
@@ -3584,7 +3971,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         os.makedirs(CLUB_IMAGE_DIR, mode=0o700, exist_ok=True)
         target = _club_image_disk_path(image_path)
         if target is None:
-            return self._json(500, {"success": False, "message": "图片存储路径异常"})
+            return self._json(500, {"success": False, "message": "请检查社团图片目录"})
         created_file = False
         if not os.path.exists(target):
             temp_path = target + "." + secrets.token_urlsafe(8) + ".tmp"
@@ -3600,7 +3987,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     os.unlink(temp_path)
                 except OSError:
                     pass
-                return self._json(503, {"success": False, "message": "图片保存失败，请稍后重试"})
+                return self._json(503, {"success": False, "message": "请稍后再上传"})
 
         event_id = "club-image-" + secrets.token_urlsafe(18)
         old_image_path = None
@@ -3616,7 +4003,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 ).fetchone()
                 if not club:
                     conn.rollback()
-                    return self._json(404, {"success": False, "message": "社团不存在"})
+                    return self._json(404, {"success": False, "message": "请刷新社团列表后重试"})
                 old_image_path, revision = club[9], club[10]
                 if revision != expected_revision:
                     conn.rollback()
@@ -3674,11 +4061,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             club_id = int(data.get("club_id"))
             expected_revision = int(data.get("expected_revision"))
         except (TypeError, ValueError):
-            return self._json(400, {"success": False, "message": "club_id 或 expected_revision 格式错误"})
+            return self._json(400, {"success": False, "message": "请提供有效的 club_id 和 expected_revision"})
         request_id = admin_request_id(data)
         reason = clean_text(data.get("reason"), maxlen=400)
         if request_id is None or not reason:
-            return self._json(400, {"success": False, "message": "移除参数格式错误"})
+            return self._json(400, {"success": False, "message": "请检查参数"})
         actor = sess.get("username", "admin")
         with DB_POOL.connection() as conn:
             cur = conn.cursor()
@@ -3701,7 +4088,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             ).fetchone()
             if not club:
                 conn.rollback()
-                return self._json(404, {"success": False, "message": "社团不存在"})
+                return self._json(404, {"success": False, "message": "请刷新社团列表后重试"})
             old_image_path, revision = club[9], club[10]
             if revision != expected_revision:
                 conn.rollback()
@@ -3757,7 +4144,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             return snapshot_database(label)
         except (OSError, sqlite3.Error) as exc:
             log.error("自动备份失败: %s", exc)
-            self._json(500, {"success": False, "message": "自动备份失败，操作未执行"})
+            self._json(500, {"success": False, "message": "操作前需要保存快照，请检查磁盘空间后重试"})
             return None
 
     def _admin_replay(self, actor, action, request_id):
@@ -3798,7 +4185,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_admin_assign_registration(self, sess, data):
         parsed = self._admin_registration_input(data)
         if not parsed:
-            return self._json(400, {"success": False, "message": "调整参数格式错误"})
+            return self._json(400, {"success": False, "message": "请检查调整参数"})
         student_id, club_id, request_id, reason, override_eligibility = parsed
         actor = sess.get("username", "admin")
         replay = self._admin_replay(actor, "registration.admin_assigned", request_id)
@@ -3808,7 +4195,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 if str(replay[1]) != str(student_id) or int(recorded.get("club_id")) != club_id:
                     return self._json(409, {"success": False, "message": "request_id 已用于其他调整操作"})
             except (TypeError, ValueError):
-                return self._json(409, {"success": False, "message": "request_id 对应的审计记录异常"})
+                return self._json(409, {"success": False, "message": "请换一个 request_id 重试"})
             return self._admin_replay_reply(replay, request_id, (club_id,))
         held = acquire_seat_locks([club_id], student_id)
         if not held:
@@ -3824,10 +4211,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 ).fetchone()
                 if not student:
                     conn.rollback()
-                    return self._json(404, {"success": False, "message": "学生不存在"})
+                    return self._json(404, {"success": False, "message": "请刷新名单后重试"})
                 if not club:
                     conn.rollback()
-                    return self._json(404, {"success": False, "message": "社团不存在"})
+                    return self._json(404, {"success": False, "message": "请刷新社团列表后重试"})
                 if cur.execute("SELECT 1 FROM registrations WHERE student_id=?", (student_id,)).fetchone():
                     conn.rollback()
                     return self._json(409, {"success": False, "message": "该学生已报名其他社团"})
@@ -3835,9 +4222,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 if (not club[2] or not eligible) and not override_eligibility:
                     conn.rollback()
                     return self._json(400, {"success": False,
-                                            "message": ineligible_reason or "该社团当前未开放报名"})
-                used = cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id=?", (club_id,)).fetchone()[0]
-                if used >= club[1]:
+                                            "message": ineligible_reason or "该社团暂停报名"})
+                if pool_used(cur, club_id, student_id) >= club[1]:
                     conn.rollback()
                     return self._json(400, {"success": False, "message": "该社团已满员"})
                 operation_id = "admin-" + secrets.token_urlsafe(18)
@@ -3863,14 +4249,14 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 "registration_id": registration_id, "club_id": club_id,
             }, student_mirror=reservation_mirror(club_id, operation_id))
         except sqlite3.IntegrityError:
-            return self._json(409, {"success": False, "message": "调整请求冲突"})
+            return self._json(409, {"success": False, "message": "请刷新后重试"})
         finally:
             release_seat_locks(held)
 
     def _h_admin_remove_registration(self, sess, data):
         parsed = self._admin_registration_input(data, needs_club=False)
         if not parsed:
-            return self._json(400, {"success": False, "message": "调整参数格式错误"})
+            return self._json(400, {"success": False, "message": "请检查调整参数"})
         student_id, _club_id, request_id, reason, _override = parsed
         actor = sess.get("username", "admin")
         replay = self._admin_replay(actor, "registration.admin_removed", request_id)
@@ -3880,11 +4266,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             try:
                 source_club_id = int((json.loads(replay[2]) if replay[2] else {}).get("club_id"))
             except (TypeError, ValueError):
-                return self._json(409, {"success": False, "message": "request_id 对应的审计记录异常"})
+                return self._json(409, {"success": False, "message": "请换一个 request_id 重试"})
             return self._admin_replay_reply(replay, request_id, (source_club_id,))
         registration = self._student_registration(student_id)
         if not registration:
-            return self._json(404, {"success": False, "message": "该学生未报名任何社团"})
+            return self._json(404, {"success": False, "message": "请先为该学生报名社团"})
         registration_id, club_id, operation_id = registration
         held = acquire_seat_locks([club_id], student_id)
         if not held:
@@ -3921,7 +4307,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
     def _h_admin_transfer_registration(self, sess, data):
         parsed = self._admin_registration_input(data)
         if not parsed:
-            return self._json(400, {"success": False, "message": "调整参数格式错误"})
+            return self._json(400, {"success": False, "message": "请检查调整参数"})
         student_id, target_club_id, request_id, reason, override_eligibility = parsed
         actor = sess.get("username", "admin")
         replay = self._admin_replay(actor, "registration.admin_transferred", request_id)
@@ -3933,11 +4319,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     return self._json(409, {"success": False, "message": "request_id 已用于其他调整操作"})
                 clubs = (int(before.get("club_id")), int(after.get("club_id")))
             except (TypeError, ValueError):
-                return self._json(409, {"success": False, "message": "request_id 对应的审计记录异常"})
+                return self._json(409, {"success": False, "message": "请换一个 request_id 重试"})
             return self._admin_replay_reply(replay, request_id, clubs)
         registration = self._student_registration(student_id)
         if not registration:
-            return self._json(404, {"success": False, "message": "该学生未报名任何社团"})
+            return self._json(404, {"success": False, "message": "请先为该学生报名社团"})
         registration_id, source_club_id, old_operation_id = registration
         if source_club_id == target_club_id:
             return self._json(400, {"success": False, "message": "学生已在目标社团"})
@@ -3958,21 +4344,19 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 ).fetchone()
                 if not student:
                     conn.rollback()
-                    return self._json(404, {"success": False, "message": "学生不存在"})
+                    return self._json(404, {"success": False, "message": "请刷新名单后重试"})
                 if not current or tuple(current) != (registration_id, source_club_id):
                     conn.rollback()
                     return self._json(409, {"success": False, "message": "学生报名已变化，请刷新后重试"})
                 if not target:
                     conn.rollback()
-                    return self._json(404, {"success": False, "message": "目标社团不存在"})
+                    return self._json(404, {"success": False, "message": "请刷新社团列表后重试"})
                 eligible, ineligible_reason = student_matches_restrictions(student[1], student[0], target[2], target[3])
                 if (not target[1] or not eligible) and not override_eligibility:
                     conn.rollback()
                     return self._json(400, {"success": False,
-                                            "message": ineligible_reason or "目标社团当前未开放报名"})
-                target_used = cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id=?",
-                                          (target_club_id,)).fetchone()[0]
-                if target_used >= target[0]:
+                                            "message": ineligible_reason or "目标社团暂停报名"})
+                if pool_used(cur, target_club_id, student_id) >= target[0]:
                     conn.rollback()
                     return self._json(400, {"success": False, "message": "目标社团已满员"})
                 new_operation_id = "admin-" + secrets.token_urlsafe(18)
@@ -4003,7 +4387,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 "to_club_id": target_club_id,
             }, student_mirror=reservation_mirror(target_club_id, new_operation_id))
         except sqlite3.IntegrityError:
-            return self._json(409, {"success": False, "message": "调整请求冲突"})
+            return self._json(409, {"success": False, "message": "请刷新后重试"})
         finally:
             release_seat_locks(held)
 
@@ -4013,10 +4397,10 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             cursor = int((qs.get("cursor") or ["0"])[0])
             limit = int((qs.get("limit") or ["50"])[0])
         except ValueError:
-            return self._json(400, {"success": False, "message": "cursor 或 limit 格式错误"})
+            return self._json(400, {"success": False, "message": "请提供有效的 cursor 和 limit"})
         role = (qs.get("role") or [""])[0]
         if cursor < 0 or not 1 <= limit <= 100 or role not in {"", "admin", "student"}:
-            return self._json(400, {"success": False, "message": "cursor、limit 或 role 超出范围"})
+            return self._json(400, {"success": False, "message": "limit 请在 1–100 之间，role 为 admin、student 或留空"})
         with DB_POOL.connection() as conn:
             rows = conn.execute(
                 "SELECT id,event_id,occurred_at,actor_role,actor_id,action,target_type,target_id,"
@@ -4050,21 +4434,163 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         }, extra=[("Cache-Control", "no-store")])
 
     def _h_admin_summary(self, sess):
-        """工作台每 6 秒刷新一次：人数、开放社团的名额合计，以及最近一次导出、备份和数据变化的时间。"""
+        """工作台每 6 秒刷新一次：人数、开放社团的名额合计、分批情况，以及最近一次导出、备份和数据变化的时间。
+
+        分批报名时 capacity 是每批的名额合计，与人数最多的一批（largest_batch）比较。
+        """
         actions = DATA_CHANGE_ACTIONS + ("registrations.exported", "backup.downloaded")
+        now_ms = RG.now_epoch_ms()
         with DB_POOL.connection() as conn:
             students, registered, clubs, capacity = conn.execute(
                 "SELECT (SELECT COUNT(*) FROM students), (SELECT COUNT(*) FROM registrations), "
                 "(SELECT COUNT(*) FROM clubs), (SELECT COALESCE(SUM(max_students), 0) FROM clubs WHERE enabled=1)"
             ).fetchone()
-            latest = dict(conn.execute(
-                "SELECT action, MAX(occurred_at) FROM audit_events WHERE action IN ({}) GROUP BY action".format(
-                    ",".join("?" * len(actions))), actions).fetchall())
+            latest = latest_actions(conn, actions)
+            batches = batch_overview(conn, now_ms)
         changed = max((latest.get(action) or 0 for action in DATA_CHANGE_ACTIONS), default=0)
-        self._json(200, {"students": students, "registered": registered, "clubs": clubs, "capacity": capacity,
-                         "last_export": latest.get("registrations.exported"),
-                         "last_backup": latest.get("backup.downloaded"), "last_change": changed or None},
+        self._json(200, dict(batches, students=students, registered=registered, clubs=clubs, capacity=capacity,
+                             last_export=latest.get("registrations.exported"),
+                             last_backup=latest.get("backup.downloaded"), last_change=changed or None,
+                             server_now=now_ms),
                    extra=[("Cache-Control", "no-store")])
+
+    def _h_batches(self, sess):
+        """报名方式与各批次的时段、班级。学生页据此找到本班所在的批次，显示本批的倒计时与截止时间。
+
+        缓存 1 秒并带 ETag：批次切换时全体学生同时读取，一秒内只读一次数据库。
+        """
+        try:
+            body, etag = BATCHES_CACHE.get()
+        except Exception as e:  # noqa: BLE001
+            log.error("batches 失败: %s", e)
+            return self._reply(503, "unavailable")
+        self._conditional(body, etag)
+
+    def _h_update_batches(self, sess, data):
+        """设置报名方式（batch_mode）与批次（batches，可省略表示不改）。
+
+        批次按开放时间排序编号，时段不重叠，每个班级只属于一个批次。改为同时报名时清除开放与截止时间，
+        请管理员重新设置。保存前检查每个名额池的报名人数都在人数上限以内，保存后整体发布名额。
+        """
+        batched = data.get("batch_mode")
+        request_id = admin_request_id(data)
+        if type(batched) is not bool or request_id is None:
+            return self._json(400, {"success": False, "message": "请提供 batch_mode 和 request_id"})
+        if self._admin_replay(sess.get("username", "admin"), "batches.updated", request_id):
+            return self._json(200, {"success": True, "replayed": True, "request_id": request_id})
+        parsed = None
+        if data.get("batches") is not None:
+            parsed, error = parse_batches(data["batches"])
+            if error:
+                return self._json(400, {"success": False, "message": error})
+        self._store_batches(sess, batched, parsed, request_id)
+
+    def _h_batch_now(self, sess, data):
+        """当前批次现在开放（action=open）或现在截止（action=close），按服务器时间改这一批的时段。"""
+        action = data.get("action")
+        request_id = admin_request_id(data)
+        try:
+            batch_id = int(data.get("batch_id"))
+        except (TypeError, ValueError):
+            batch_id = 0
+        if action not in ("open", "close") or batch_id <= 0 or request_id is None:
+            return self._json(400, {"success": False, "message": "请提供 batch_id、action 和 request_id"})
+        if self._admin_replay(sess.get("username", "admin"), "batches.updated", request_id):
+            return self._json(200, {"success": True, "replayed": True, "request_id": request_id})
+        with DB_POOL.connection() as conn:
+            batched, _current = batch_state(conn)
+            batches = load_batches(conn)
+        index = next((i for i, batch in enumerate(batches) if batch["id"] == batch_id), None)
+        if not batched or index is None:
+            return self._json(409, {"success": False, "message": "请刷新页面后重试"})
+        now = RG.now_epoch_ms() // 1000
+        batch = batches[index]
+        name = batch_name(batch_id)
+        start, end = parse_local_time(batch["start_time"]), parse_local_time(batch["end_time"])
+        if action == "open" and start <= now < end:
+            return self._json(200, {"success": True, "unchanged": True, "request_id": request_id})
+        if action == "open":
+            earlier = batches[index - 1] if index else None
+            if earlier and parse_local_time(earlier["end_time"]) > now:
+                return self._json(409, {"success": False,
+                                        "message": "请先截止{}".format(batch_name(earlier["id"]))})
+            if end <= now:
+                return self._json(409, {"success": False, "message": "请先把{}的截止时间改到现在之后".format(name)})
+            start = now
+        else:
+            if not start <= now < end:
+                return self._json(409, {"success": False, "message": "{}报名中时可以现在截止".format(name)})
+            end, start = now, min(start, now - 1)
+        items = [dict(item) for item in batches]
+        items[index] = dict(batch, start_time=format_local_time(start), end_time=format_local_time(end))
+        parsed, error = parse_batches(items)
+        if error:
+            return self._json(409, {"success": False, "message": error})
+        self._store_batches(sess, True, parsed, request_id)
+
+    def _store_batches(self, sess, batched, parsed, request_id):
+        """在全局维护标记下保存报名方式与批次，核对名额池、记入操作记录、整体发布，回复分批情况。"""
+        actor = sess.get("username", "admin")
+        maintenance = RG.maintenance_begin()
+        if not maintenance:
+            return self._json(503, {"success": False, "message": "报名请求处理中，请稍后重试"},
+                              extra=[("Retry-After", "2")])
+        try:
+            with DB_POOL.connection() as conn:
+                cur = conn.cursor()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = cur.execute("SELECT id, COALESCE(batch_mode, 0) FROM settings ORDER BY id DESC LIMIT 1"
+                                      ).fetchone()
+                    if not row:
+                        conn.rollback()
+                        return self._json(500, {"success": False, "message": "请重启服务后重试"})
+                    previous = load_batches(cur)
+                    if parsed is not None:
+                        cur.execute("DELETE FROM batch_classes")
+                        cur.execute("DELETE FROM batches")
+                        for batch in parsed:
+                            cur.execute("INSERT INTO batches (id, start_time, end_time) VALUES (?,?,?)",
+                                        (batch["id"], batch["start_time"], batch["end_time"]))
+                            cur.executemany("INSERT INTO batch_classes (class_name, batch_id) VALUES (?,?)",
+                                            [(klass, batch["id"]) for klass in batch["classes"]])
+                    cur.execute("UPDATE settings SET batch_mode=? WHERE id=?", (int(batched), row[0]))
+                    if bool(row[1]) != batched:
+                        # 换报名方式后时段按新方式重新确定：分批报名取当前批次，同时报名请管理员重新设置。
+                        cur.execute("UPDATE settings SET current_batch=NULL, registration_start_time=NULL, "
+                                    "registration_end_time=NULL WHERE id=?", (row[0],))
+                    overflow = pool_overflows(cur)
+                    if overflow:
+                        conn.rollback()
+                        club, pool, count, _maximum = overflow[0]
+                        where = (batch_name(pool) if pool else "待分批的班级") if batched else ""
+                        label = "每批名额" if batched else "人数上限"
+                        return self._json(409, {"success": False, "message": "请把“{}”的{}设为至少 {}：{}已有 {} 人报名".format(
+                            club, label, count, where, count)})
+                    current = load_batches(cur)
+                    append_audit_event(
+                        cur, event_id="batches-" + secrets.token_urlsafe(18), actor_role="admin", actor_id=actor,
+                        action="batches.updated", target_type="settings", target_id=row[0], request_id=request_id,
+                        before={"batch_mode": bool(row[1]), "batches": previous},
+                        after={"batch_mode": batched, "batches": current},
+                    )
+                    conn.commit()
+                except sqlite3.Error as e:
+                    conn.rollback()
+                    log.error("保存分批设置失败: %s", e)
+                    return self._json(500, {"success": False, "message": "请重试"})
+            CATALOG_CACHE.invalidate()
+            BATCHES_CACHE.invalidate()
+            if not rebuild_all(maintenance):
+                RECONCILE_REQUESTED.set()
+                return self._json(503, {"success": False, "message": "设置已保存，名额稍后发布"},
+                                  extra=[("Retry-After", "2")])
+            now_ms = RG.now_epoch_ms()
+            with DB_POOL.connection() as conn:
+                overview = batch_overview(conn, now_ms)
+            self._json(200, dict(overview, success=True, request_id=request_id))
+        finally:
+            RG.maintenance_end(maintenance)
 
     def _record_download(self, sess, action, metadata):
         """导出与备份下载记入操作记录，工作台据此判断导出的文件是否为最新数据。"""
@@ -4112,73 +4638,90 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
 
     @staticmethod
     def _registration_rows(conn):
-        """每名学生一行：姓名、班级、社团编号、社团、方式、报名时间。"""
+        """返回 (是否分批报名, 行)。每名学生一行：姓名、班级、社团编号、社团、方式、报名时间、批次。
+
+        分批报名时批次为“第 N 批”或“待分批”，按批次、班级、姓名排序；同时报名时批次为空，按班级、姓名排序。
+        """
+        batched, _current = batch_state(conn)
         rows = conn.execute(
-            "SELECT s.name, s.class, c.id, c.name, r.operation_id, r.registration_time "
+            "SELECT s.name, s.class, c.id, c.name, r.operation_id, r.registration_time, COALESCE(bc.batch_id, 0) "
             "FROM students s LEFT JOIN registrations r ON s.id = r.student_id "
-            "LEFT JOIN clubs c ON r.club_id = c.id ORDER BY s.class, s.name, s.id"
+            "LEFT JOIN clubs c ON r.club_id = c.id LEFT JOIN batch_classes bc ON bc.class_name = s.class "
+            "ORDER BY s.class, s.name, s.id"
         ).fetchall()
-        return [(name, klass, club_id, club, registration_method(operation) if club_id else "", when or "")
-                for name, klass, club_id, club, operation, when in rows]
+        if batched:
+            rows.sort(key=lambda row: row[6] or BATCH_DONE)
+        return batched, [(name, klass, club_id, club, registration_method(operation) if club_id else "", when or "",
+                          (batch_name(pool) if pool else "待分批") if batched else "")
+                         for name, klass, club_id, club, operation, when, pool in rows]
+
+    @staticmethod
+    def _with_batch(batched, header, rows, widths=None):
+        """分批报名时在第一列加上“批次”；rows 的每一行以批次开头。"""
+        if batched:
+            return ["批次"] + header, rows, ([10] + widths if widths else None)
+        return header, [row[1:] for row in rows], widths
 
     def _h_export_all_data(self, sess):
         with DB_POOL.connection() as conn:
-            rows = self._registration_rows(conn)
+            batched, rows = self._registration_rows(conn)
         stamp = export_stamp()
         self._record_download(sess, "registrations.exported", {"kind": "all_csv"})
-        self._csv([(name, klass, club or "未报名", method, when)
-                   for name, klass, _club_id, club, method, when in rows],
-                  ["姓名", "班级", "社团", "方式", "报名时间"],
-                  "报名总表_{}.csv".format(stamp), "registrations_{}.csv".format(stamp))
+        header, body, _widths = self._with_batch(
+            batched, ["姓名", "班级", "社团", "方式", "报名时间"],
+            [(batch, name, klass, club or "未报名", method, when)
+             for name, klass, _club_id, club, method, when, batch in rows])
+        self._csv(body, header, "报名总表_{}.csv".format(stamp), "registrations_{}.csv".format(stamp))
 
     def _h_export_unregistered(self, sess):
         with DB_POOL.connection() as conn:
-            rows = conn.execute(
-                "SELECT s.name, s.class FROM students s "
-                "LEFT JOIN registrations r ON s.id = r.student_id WHERE r.id IS NULL "
-                "ORDER BY s.class, s.name, s.id").fetchall()
+            batched, rows = self._registration_rows(conn)
         stamp = export_stamp()
         self._record_download(sess, "registrations.exported", {"kind": "unregistered_csv"})
-        self._csv(rows, ["姓名", "班级"], "未报名名单_{}.csv".format(stamp),
-                  "unregistered_{}.csv".format(stamp))
+        header, body, _widths = self._with_batch(
+            batched, ["姓名", "班级"],
+            [(batch, name, klass) for name, klass, club_id, _club, _method, _when, batch in rows if not club_id])
+        self._csv(body, header, "未报名名单_{}.csv".format(stamp), "unregistered_{}.csv".format(stamp))
 
     def _h_export_club_data(self, sess):
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         club_id = (qs.get("club_id") or [None])[0]
         if not club_id or not str(club_id).isdigit():
-            return self._json(400, {"success": False, "message": "无效的 club_id"})
+            return self._json(400, {"success": False, "message": "请提供有效的 club_id"})
         club_id = int(club_id)
         with DB_POOL.connection() as conn:
             club = conn.execute("SELECT name FROM clubs WHERE id = ?", (club_id,)).fetchone()
             if not club:
-                return self._json(404, {"success": False, "message": "社团不存在"})
-            rows = conn.execute(
-                "SELECT s.name, s.class, r.operation_id, r.registration_time FROM students s "
-                "JOIN registrations r ON s.id = r.student_id WHERE r.club_id = ? "
-                "ORDER BY s.class, s.name, s.id", (club_id,)).fetchall()
+                return self._json(404, {"success": False, "message": "请刷新社团列表后重试"})
+            batched, rows = self._registration_rows(conn)
         stamp = export_stamp()
         self._record_download(sess, "registrations.exported", {"kind": "club_csv", "club": club[0]})
-        self._csv([(name, klass, registration_method(operation), when)
-                   for name, klass, operation, when in rows],
-                  ["姓名", "班级", "方式", "报名时间"],
+        header, body, _widths = self._with_batch(
+            batched, ["姓名", "班级", "方式", "报名时间"],
+            [(batch, name, klass, method, when)
+             for name, klass, member_club, _club, method, when, batch in rows if member_club == club_id])
+        self._csv(body, header,
                   "{}_名单_{}.csv".format(_FILE_NAME_BAD.sub(" ", club[0]).strip() or club_id, stamp),
                   "club_{}_{}.csv".format(club_id, stamp))
 
     def _h_export_workbook(self, sess):
-        """报名表：总表、每个社团一张表、未报名名单（有未报名学生时）。"""
+        """报名表：总表、每个社团一张表、未报名名单（有未报名学生时）。分批报名时每张表第一列为批次。"""
         with DB_POOL.connection() as conn:
-            rows = self._registration_rows(conn)
+            batched, rows = self._registration_rows(conn)
             clubs = conn.execute("SELECT id, name FROM clubs ORDER BY id").fetchall()
-        summary = [(name, klass, club or "未报名", method, when)
-                   for name, klass, _club_id, club, method, when in rows]
-        book = [("总表", ["姓名", "班级", "社团", "方式", "报名时间"], summary, [10, 12, 16, 10, 20])]
+        book = [("总表",) + self._with_batch(
+            batched, ["姓名", "班级", "社团", "方式", "报名时间"],
+            [(batch, name, klass, club or "未报名", method, when)
+             for name, klass, _club_id, club, method, when, batch in rows], [10, 12, 16, 10, 20])]
         for club_id, club_name in clubs:
-            members = [(name, klass, method, when)
-                       for name, klass, member_club, _club, method, when in rows if member_club == club_id]
-            book.append((club_name, ["姓名", "班级", "方式", "报名时间"], members, [10, 12, 10, 20]))
-        missing = [(name, klass) for name, klass, club_id, *_rest in rows if not club_id]
+            book.append((club_name,) + self._with_batch(
+                batched, ["姓名", "班级", "方式", "报名时间"],
+                [(batch, name, klass, method, when)
+                 for name, klass, member_club, _club, method, when, batch in rows if member_club == club_id],
+                [10, 12, 10, 20]))
+        missing = [(batch, name, klass) for name, klass, club_id, _club, _method, _when, batch in rows if not club_id]
         if missing:
-            book.append(("未报名", ["姓名", "班级"], missing, [10, 12]))
+            book.append(("未报名",) + self._with_batch(batched, ["姓名", "班级"], missing, [10, 12]))
         stamp = export_stamp()
         self._record_download(sess, "registrations.exported", {"kind": "workbook"})
         self._send(200, xlsx_bytes(book), ctype=XLSX_TYPE,
@@ -4187,26 +4730,34 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
 
     # ---- 调剂 ----
     def _h_adjustment_plan(self, sess):
+        """调剂预览。分批报名时按批列出各社团的空余与将安排人数；unbatched 为班级待分批的未报名人数。"""
         with DB_POOL.connection() as conn:
             conn.execute("BEGIN")
             try:
                 pairs, unplaced, seats = plan_adjustment(conn, rng=random.Random(0))
                 names = dict(conn.execute("SELECT id, name FROM clubs").fetchall())
                 locked = registration_locked(conn)
+                batched, _current = batch_state(conn)
+                unbatched = conn.execute(
+                    "SELECT COUNT(*) FROM students s JOIN student_batch sb ON sb.student_id = s.id "
+                    "LEFT JOIN registrations r ON r.student_id = s.id WHERE r.id IS NULL AND sb.pool = 0"
+                ).fetchone()[0] if batched else 0
             finally:
                 conn.rollback()
-        planned = collections.Counter(club for _student, club in pairs)
+        planned = collections.Counter((pool, club) for _student, club, pool in pairs)
         self._json(200, {
             "locked": locked, "unregistered": len(pairs) + len(unplaced),
-            "assignable": len(pairs), "seats": sum(seats.values()),
-            "clubs": [{"id": club, "name": names.get(club), "remaining": seats[club], "assign": planned.get(club, 0)}
-                      for club in sorted(seats)],
+            "assignable": len(pairs), "seats": sum(seats.values()), "batch_mode": batched,
+            "unbatched": unbatched,
+            "clubs": [{"id": club, "name": names.get(club), "batch": pool or None, "remaining": seats[(pool, club)],
+                       "assign": planned.get((pool, club), 0)}
+                      for pool, club in sorted(seats)],
         }, extra=[("Cache-Control", "no-store")])
 
     def _h_adjust_registrations(self, sess, data):
         request_id = admin_request_id(data)
         if request_id is None:
-            return self._json(400, {"success": False, "message": "请求编号无效"})
+            return self._json(400, {"success": False, "message": "请提供有效的请求编号"})
         actor = sess.get("username", "admin")
         replay = self._admin_replay(actor, "registrations.adjusted", request_id)
         if replay:
@@ -4238,8 +4789,9 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     cur.executemany(
                         "INSERT INTO registrations (student_id, club_id, registration_time, operation_id) "
                         "VALUES (?,?,?,?)",
-                        [(student, club, stamp, "adjust-{}-{}".format(batch, student)) for student, club in pairs])
-                    planned = collections.Counter(club for _student, club in pairs)
+                        [(student, club, stamp, "adjust-{}-{}".format(batch, student))
+                         for student, club, _pool in pairs])
+                    planned = collections.Counter(club for _student, club, _pool in pairs)
                     cur.executemany("UPDATE clubs SET current_students = current_students + ? WHERE id = ?",
                                     [(count, club) for club, count in planned.items()])
                     summary = {"assigned": len(pairs), "unassigned": len(unplaced),
@@ -4248,14 +4800,14 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         cur, event_id="adjust-" + batch, actor_role="admin", actor_id=actor,
                         action="registrations.adjusted", target_type="registrations", request_id=request_id,
                         before={"unregistered": len(pairs) + len(unplaced)},
-                        after=dict(summary, students=[[student, club] for student, club in pairs]),
+                        after=dict(summary, students=[[student, club] for student, club, _pool in pairs]),
                         metadata={"batch": batch, "backup": backup},
                     )
                     conn.commit()
                 except sqlite3.Error as e:
                     conn.rollback()
                     log.error("调剂失败: %s", e)
-                    return self._json(500, {"success": False, "message": "调剂失败"})
+                    return self._json(500, {"success": False, "message": "请重试"})
             if not rebuild_all(maintenance):
                 RECONCILE_REQUESTED.set()
                 return self._json(503, dict(summary, success=False, message="调剂已保存，名额稍后发布"),
@@ -4268,7 +4820,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         """名单锁定后删除全部报名，学生与社团保留；清空前自动备份。"""
         request_id = admin_request_id(data)
         if request_id is None:
-            return self._json(400, {"success": False, "message": "请求编号无效"})
+            return self._json(400, {"success": False, "message": "请提供有效的请求编号"})
         actor = sess.get("username", "admin")
         replay = self._admin_replay(actor, "registrations.cleared", request_id)
         if replay:
@@ -4305,7 +4857,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 except sqlite3.Error as e:
                     conn.rollback()
                     log.error("清空报名失败: %s", e)
-                    return self._json(500, {"success": False, "message": "清空失败"})
+                    return self._json(500, {"success": False, "message": "请重试"})
             if not rebuild_all(maintenance):
                 RECONCILE_REQUESTED.set()
                 return self._json(503, dict(summary, success=False, message="报名已清空，名额稍后发布"),
@@ -4480,7 +5032,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         name = (qs.get("name") or [""])[0]
         if name:
             if not BACKUP_NAME_RE.fullmatch(name):
-                return self._json(400, {"success": False, "message": "备份名称无效"})
+                return self._json(400, {"success": False, "message": "请从快照列表中选择"})
             try:
                 with open(os.path.join(BACKUP_DIR, name), "rb") as source:
                     body = source.read()
@@ -4493,7 +5045,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             body = backup_archive()
         except (OSError, sqlite3.Error) as exc:
             log.error("生成完整备份失败: %s", exc)
-            return self._json(500, {"success": False, "message": "生成备份失败"})
+            return self._json(500, {"success": False, "message": "请检查磁盘空间后重试"})
         stamp = export_stamp()
         self._record_download(sess, "backup.downloaded", {"kind": "full"})
         self._send(200, body, ctype="application/zip",
@@ -4572,7 +5124,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 conn.commit()
         except Exception as e:  # noqa: BLE001
             log.error("导入学生失败: %s", e)
-            return self._json(500, {"success": False, "message": "导入失败"})
+            return self._json(500, {"success": False, "message": "请重试"})
         self._json(200, {"success": results["success"], "failed": results["failed"],
                          "credentials": credentials}, extra=[("Cache-Control", "no-store")])
 
@@ -4599,8 +5151,8 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         results["failed"] += 1
                         continue
                     try:
-                        cur.execute("INSERT INTO clubs (name, max_students, current_students) VALUES (?,?,0)",
-                                    (name, maxs))
+                        cur.execute("INSERT INTO clubs (name, max_students, current_students, art) VALUES (?,?,0,?)",
+                                    (name, maxs, suggest_art(name)))
                         new_ids.append((cur.lastrowid, maxs))
                         existing.add(name)
                         results["success"] += 1
@@ -4615,7 +5167,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 conn.commit()
         except Exception as e:  # noqa: BLE001
             log.error("导入社团失败: %s", e)
-            return self._json(500, {"success": False, "message": "导入失败"})
+            return self._json(500, {"success": False, "message": "请重试"})
         CATALOG_CACHE.invalidate()
         SEATS_CACHE.invalidate()
         published = True
@@ -4638,7 +5190,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 continue
             text = data.get(field) or ""
             if not isinstance(text, str):
-                return self._json(400, {"success": False, "message": "时间格式错误"})
+                return self._json(400, {"success": False, "message": "时间格式应为 YYYY-MM-DD HH:MM:SS"})
             text = text.strip() or None
             if text:
                 try:
@@ -4656,11 +5208,15 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 cur = conn.cursor()
                 conn.execute("BEGIN IMMEDIATE")
                 row = cur.execute(
-                    "SELECT id, registration_start_time, registration_end_time FROM settings ORDER BY id DESC LIMIT 1"
+                    "SELECT id, registration_start_time, registration_end_time, COALESCE(batch_mode, 0) "
+                    "FROM settings ORDER BY id DESC LIMIT 1"
                 ).fetchone()
                 if not row:
                     conn.rollback()
-                    return self._json(500, {"success": False, "message": "系统设置不存在"})
+                    return self._json(500, {"success": False, "message": "请重启服务后重试"})
+                if row[3]:
+                    conn.rollback()
+                    return self._json(409, {"success": False, "message": "分批报名时，请在各批次里设置时间"})
                 current = {"start_time": row[1], "end_time": row[2]}
                 merged = dict(current, **values)
                 open_at = parse_optional_time(merged["start_time"])
@@ -4684,7 +5240,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 conn.commit()
         except sqlite3.Error as e:
             log.error("更新报名时间失败: %s", e)
-            return self._json(500, {"success": False, "message": "更新失败"})
+            return self._json(500, {"success": False, "message": "请重试"})
         SEATS_CACHE.invalidate()
         try:
             RG.open_at_set(open_at)
@@ -4703,7 +5259,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         request_id = admin_request_id(data)
         reason = clean_text(data.get("reason"), maxlen=400)
         if request_id is None or not reason:
-            return self._json(400, {"success": False, "message": "锁定参数格式错误"})
+            return self._json(400, {"success": False, "message": "请检查锁定参数"})
         actor = sess.get("username", "admin")
         event_id = None
         changed = True
@@ -4730,7 +5286,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     ).fetchone()
                     if not row:
                         conn.rollback()
-                        return self._json(500, {"success": False, "message": "系统设置不存在"})
+                        return self._json(500, {"success": False, "message": "请重启服务后重试"})
                     settings_id, previous_locked = row[0], bool(row[1])
                     if previous_locked == locked:
                         conn.rollback()
@@ -4739,9 +5295,11 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         cur.execute("UPDATE settings SET registration_locked=? WHERE id=?",
                                     (int(locked), settings_id))
                         if not locked:
-                            end_row = cur.execute("SELECT registration_end_time FROM settings WHERE id=?",
-                                                  (settings_id,)).fetchone()
-                            if end_row and deadline_passed(parse_optional_time(end_row[0])):
+                            # 同时报名：解除锁定时清除已过的截止时间。分批报名时各批时段保持不变。
+                            end_row = cur.execute(
+                                "SELECT registration_end_time, COALESCE(batch_mode, 0) FROM settings WHERE id=?",
+                                (settings_id,)).fetchone()
+                            if end_row and not end_row[1] and deadline_passed(parse_optional_time(end_row[0])):
                                 cur.execute("UPDATE settings SET registration_end_time=NULL WHERE id=?",
                                             (settings_id,))
                                 clear_close = True
@@ -4755,7 +5313,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                         conn.commit()
         except sqlite3.Error as exc:
             log.error("更新报名锁失败: %s", exc)
-            return self._json(500, {"success": False, "message": "更新报名锁失败"})
+            return self._json(500, {"success": False, "message": "请重试"})
         SEATS_CACHE.invalidate()
         try:
             RG.locked_set(locked)
@@ -4782,7 +5340,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
         try:
             sid = int(data.get("student_id"))
         except (TypeError, ValueError):
-            return self._json(400, {"success": False, "message": "缺少或非法的学生ID"})
+            return self._json(400, {"success": False, "message": "请提供有效的学生编号"})
         registration = self._student_registration(sid)
         held = acquire_seat_locks([registration[1]] if registration else [], sid)
         if not held:
@@ -4797,7 +5355,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
                 RG.session_revoke_identity("student", str(sid))
             except RuntimeError:
-                return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+                return self._json(503, {"success": False, "message": "请稍后重试"})
             with DB_POOL.connection() as conn:
                 cur = conn.cursor()
                 try:
@@ -4808,7 +5366,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                                       (sid,)).fetchone()
                     if not student:
                         conn.rollback()
-                        return self._json(404, {"success": False, "message": "学生不存在"})
+                        return self._json(404, {"success": False, "message": "请刷新名单后重试"})
                     if reg and (not registration or int(reg[1]) != int(registration[1])):
                         conn.rollback()
                         return self._json(409, {"success": False, "message": "学生报名已变化，请刷新后重试"})
@@ -4829,7 +5387,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 except sqlite3.Error as e:
                     conn.rollback()
                     log.error("删除学生失败: %s", e)
-                    return self._json(500, {"success": False, "message": "删除失败"})
+                    return self._json(500, {"success": False, "message": "请重试"})
             if not publish_seat_locks(held, student_mirror=""):
                 return self._json(503, {"success": False, "message": "学生已删除，名额稍后自动同步"})
             self._json(200, {"success": True, "message": "学生删除成功"})
@@ -4852,7 +5410,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                     return self._json(503, {"success": False, "message": "账号状态更新中，请稍后重试"})
                 RG.session_revoke_role("student")
             except RuntimeError:
-                return self._json(503, {"success": False, "message": "会话服务不可用，请稍后重试"})
+                return self._json(503, {"success": False, "message": "请稍后重试"})
             with DB_POOL.connection() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
@@ -4873,7 +5431,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 except sqlite3.Error as e:
                     conn.rollback()
                     log.error("清空学生失败: %s", e)
-                    return self._json(500, {"success": False, "message": "删除失败"})
+                    return self._json(500, {"success": False, "message": "请重试"})
             if not rebuild_all(maintenance):
                 RECONCILE_REQUESTED.set()
                 return self._json(503, {"success": False, "message": "学生已删除，名额稍后自动发布"})
@@ -4883,43 +5441,53 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
             RG.maintenance_end(maintenance)
 
     def _h_delete_club(self, sess, data):
+        """删除社团及其报名记录。有报名时先保存快照，删除后这些学生可以改报其他社团。"""
         try:
             club_id = int(data.get("club_id"))
         except (TypeError, ValueError):
-            return self._json(400, {"success": False, "message": "缺少或非法的社团ID"})
+            return self._json(400, {"success": False, "message": "请提供有效的社团编号"})
         held = acquire_seat_locks([club_id])
         if not held:
             return self._json(503, {"success": False, "message": "该社团正在处理报名，请稍后重试"},
                               extra=[("Retry-After", "2")])
         try:
             with DB_POOL.connection() as conn:
+                registered = conn.execute("SELECT COUNT(*) FROM registrations WHERE club_id=?",
+                                          (club_id,)).fetchone()[0]
+            if registered and self._snapshot_before("before-delete-club") is None:
+                return
+            removed = []
+            with DB_POOL.connection() as conn:
                 cur = conn.cursor()
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     name_row = cur.execute("SELECT name, image_path FROM clubs WHERE id=?", (club_id,)).fetchone()
-                    if cur.execute("SELECT COUNT(*) FROM registrations WHERE club_id = ?",
-                                   (club_id,)).fetchone()[0] > 0:
-                        conn.rollback()
-                        return self._json(400, {"success": False, "message": "该社团已有学生报名，无法删除"})
+                    removed = cur.execute("SELECT student_id, operation_id FROM registrations WHERE club_id=?",
+                                          (club_id,)).fetchall()
+                    cur.execute("DELETE FROM registrations WHERE club_id = ?", (club_id,))
                     cur.execute("DELETE FROM clubs WHERE id = ?", (club_id,))
                     if cur.rowcount == 0:
                         conn.rollback()
-                        return self._json(404, {"success": False, "message": "社团不存在"})
+                        return self._json(404, {"success": False, "message": "请刷新社团列表后重试"})
                     append_audit_event(
                         cur, event_id="club-delete-" + secrets.token_urlsafe(18),
                         actor_role="admin", actor_id=sess.get("username", "admin"),
                         action="club.deleted", target_type="club", target_id=club_id,
                         before={"name": name_row[0] if name_row else None,
-                                "image_path": name_row[1] if name_row else None},
+                                "image_path": name_row[1] if name_row else None, "registrations": len(removed)},
                         after={"deleted": True},
                     )
                     conn.commit()
                 except sqlite3.Error as e:
                     conn.rollback()
                     log.error("删除社团失败: %s", e)
-                    return self._json(500, {"success": False, "message": "删除失败"})
+                    return self._json(500, {"success": False, "message": "请重试"})
             if name_row and name_row[1]:
                 _remove_managed_club_image(name_row[1])
+            # 这些学生的报名镜像随社团一起清除，随后可以直接改报其他社团。
+            for student_id, operation_id in removed:
+                with contextlib.suppress(RuntimeError):
+                    RG.mirror_set(student_id, "clear", reservation_mirror(club_id, operation_id))
             CATALOG_CACHE.invalidate()
             SEATS_CACHE.invalidate()
             if not publish_seat_locks(held):
@@ -4957,7 +5525,7 @@ class ClubSystemHandler(http.server.BaseHTTPRequestHandler):
                 except sqlite3.Error as e:
                     conn.rollback()
                     log.error("清空社团失败: %s", e)
-                    return self._json(500, {"success": False, "message": "删除失败"})
+                    return self._json(500, {"success": False, "message": "请重试"})
             for image_path in image_paths:
                 _remove_managed_club_image(image_path)
             if not rebuild_all(maintenance):

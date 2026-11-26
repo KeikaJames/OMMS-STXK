@@ -125,6 +125,12 @@ impl Seats {
     fn k_maint(&self) -> String {
         self.key(&[&"maint"])
     }
+    fn k_batch(&self) -> String {
+        self.key(&[&"batch"])
+    }
+    fn k_batchmap(&self) -> String {
+        self.key(&[&"batchmap"])
+    }
     fn k_repair(&self) -> String {
         self.key(&[&"repair"])
     }
@@ -211,6 +217,7 @@ impl Seats {
     }
 
     // ---- 抢位、确认、撤销 ----
+    /// `class_name` 供分批报名的批次检查：只有当前批次的班级可以抢位。
     pub async fn acquire(
         &self,
         student: i64,
@@ -218,6 +225,7 @@ impl Seats {
         lease: &str,
         member: &str,
         idem_prefix: &str,
+        class_name: &str,
     ) -> AppResult<Acquire> {
         let keys = [
             self.k_stock(club),
@@ -229,12 +237,15 @@ impl Seats {
             self.k_fence(club),
             self.k_inflight(club),
             self.k_close_at(),
+            self.k_batch(),
+            self.k_batchmap(),
         ];
         let args = [
             lease.to_string(),
             self.op_ttl.to_string(),
             member.to_string(),
             idem_prefix.to_string(),
+            class_name.to_string(),
         ];
         Ok(Acquire::from_code(self.run(&ACQUIRE, &keys, &args).await?))
     }
@@ -289,6 +300,7 @@ impl Seats {
         club: i64,
         lease: &str,
         member: &str,
+        class_name: &str,
     ) -> AppResult<i64> {
         let keys = [
             self.k_maint(),
@@ -297,11 +309,14 @@ impl Seats {
             self.k_inflight(club),
             self.k_locked(),
             self.k_close_at(),
+            self.k_batch(),
+            self.k_batchmap(),
         ];
         let args = [
             lease.to_string(),
             self.op_ttl.to_string(),
             member.to_string(),
+            class_name.to_string(),
         ];
         self.run(&CANCEL_BEGIN, &keys, &args).await
     }
@@ -608,6 +623,14 @@ impl Seats {
         if !stale.is_empty() {
             pipe.del(stale).ignore();
         }
+        // 分批报名：当前批次与班级到批次的对照，抢位与退选脚本据此只放行当前批次的学生。
+        pipe.del(&[self.k_batch(), self.k_batchmap()]).ignore();
+        if let Some(batch) = &snapshot.batch {
+            for (class_name, batch_id) in &batch.classes {
+                pipe.hset(self.k_batchmap(), class_name, *batch_id).ignore();
+            }
+            pipe.set(self.k_batch(), batch.current).ignore();
+        }
         for club in &snapshot.clubs {
             pipe.set(
                 self.k_stock(club.club_id),
@@ -911,12 +934,11 @@ pub async fn publish_club_with_fence(
     club: i64,
     token: &str,
 ) -> AppResult<bool> {
-    let Some((maximum, registrations)) = db.club_seat_truth(club).await? else {
+    let Some((maximum, used, registrations)) = db.club_seat_truth(club).await? else {
         seats.drop_club(club, token).await?;
         seats.repair_done(club).await;
         return Ok(true);
     };
-    let used = registrations.len() as i64;
     let mirrors: BTreeMap<i64, String> = registrations
         .iter()
         .map(|(student, op)| (*student, mirror_value(club, op.as_deref())))

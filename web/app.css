@@ -376,6 +376,28 @@ body.has-dialog { overflow: hidden; }
 .admin-clubs .club-body .actions { margin-top: 12px; }
 .image-row { display: flex; flex-wrap: wrap; align-items: center; }
 .image-row .club-art { flex: 0 0 160px; width: 160px; height: 100px; padding-top: 0; margin-right: 16px; border-radius: 10px; }
+.art-grid { display: flex; flex-wrap: wrap; margin: 0 -4px; }
+.art-option { display: flex; flex-direction: column; align-items: center; width: 92px; margin: 0 4px 8px; padding: 4px 4px 2px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); color: var(--ink-2); font-size: 12px; line-height: 1.6; }
+.art-option:hover { border-color: var(--line-strong); }
+.art-option .club-art { width: 100%; height: 52px; padding-top: 0; border-radius: 7px; }
+.art-option > span:last-child { margin-top: 2px; white-space: nowrap; }
+.art-option[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); color: var(--accent); font-weight: 600; }
+.club-batches { margin-top: 12px; color: var(--muted); font-size: 13px; }
+.club-batches b { color: var(--ink); font-weight: 600; }
+.mode-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; }
+.mode-head h2 { margin: 0 12px 8px 0; }
+.mode-head .segmented { margin-bottom: 8px; }
+.mode-hint { margin-bottom: 16px; }
+.batch-list li > span small + small { margin-top: 0; }
+.batch-list .tag { margin-left: 6px; }
+.class-grid { display: flex; flex-wrap: wrap; margin: 0 -4px 6px; }
+.class-grid .check { flex: 0 0 auto; margin: 0 4px 8px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.class-grid .check small { margin-left: 6px; color: var(--muted); font-size: 12px; }
+.class-grid .check .tag { margin: 0 0 0 6px; }
+.class-grid .check.is-on { border-color: var(--accent); background: var(--accent-tint); }
+.batch-tally { margin-bottom: 14px; }
+.batch-table td.wrap { min-width: 200px; }
+.tbl td.nowrap { white-space: nowrap; }
 .backup-row td:first-child { white-space: nowrap; }
 .audit-wrap { max-height: 560px; overflow: auto; }
 .content-head h1:focus { outline: none; }
@@ -413,6 +435,7 @@ body.has-dialog { overflow: hidden; }
 .present-label { color: var(--muted); font-size: 28px; }
 .present-url { margin-top: 12px; font-size: 64px; font-size: 6vw; font-weight: 700; line-height: 1.15; word-break: break-all; }
 .present-more { margin-top: 24px; color: var(--ink-2); font-size: 24px; }
+.present-batch { margin-top: 28px; color: var(--accent); font-size: 32px; font-size: 3vw; font-weight: 600; }
 .present-hint { position: absolute; right: 0; bottom: 24px; left: 0; color: var(--muted); font-size: 14px; }
 .gap { margin: 12px 0; }
 #audit-scope { margin-bottom: 12px; }
@@ -448,6 +471,7 @@ body.has-dialog { overflow: hidden; }
   .access-url .mono { font-size: 18px; font-size: 4.8vw; }
   .present-label { font-size: 20px; }
   .present-more { font-size: 18px; }
+  .present-batch { font-size: 20px; }
   .list li { flex-wrap: wrap; }
   .list li > span { flex-basis: 100%; margin: 0 0 8px; }
 }

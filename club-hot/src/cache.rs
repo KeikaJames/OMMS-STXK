@@ -86,6 +86,7 @@ pub async fn catalog(state: &AppState) -> AppResult<Arc<Catalog>> {
                 "enabled": r.enabled,
                 "revision": r.revision,
                 "seat_sync_pending": r.seat_sync_pending,
+                "art": r.art,
             })
         })
         .collect();
@@ -133,15 +134,18 @@ pub async fn seats(state: &AppState) -> AppResult<CachedJson> {
         .as_deref()
         .and_then(crate::auth::parse_local_datetime);
     let now = redis.now_epoch_ms().await;
+    // 分批报名时库存属于当前批次（batch）；locked 只表示名单锁定，各批截止由学生页按本批时段判断。
+    let (batch_mode, current_batch) = state.db.batch_state().await?;
     let locked = state.db.registration_locked().await?
         || redis.locked_get().await.unwrap_or(false)
-        || close_at.is_some_and(|c| now >= c.saturating_mul(1000));
+        || (!batch_mode && close_at.is_some_and(|c| now >= c.saturating_mul(1000)));
     let fresh = CachedJson::new(&json!({
         "catalog": catalog.json.etag,
         "open_at": open_at.map(|value| value.saturating_mul(1000)),
         "close_at": close_at.map(|value| value.saturating_mul(1000)),
         "end_time": if close_at.is_some() { json!(end_time) } else { Value::Null },
         "locked": locked,
+        "batch": if batch_mode { json!(current_batch.unwrap_or(0)) } else { Value::Null },
         "seats": seats,
     }));
     *slot = Some(fresh.clone());

@@ -507,14 +507,55 @@ def text_list(value) -> list:
     return [str(item).strip() for item in items if str(item).strip()]
 
 
+BATCH_DONE = 1_000_000  # 全部批次截止后的当前批次编号，与 main.py 一致
+# 社团卡片插图：键名与 main.py 的 CLUB_ART、web/js/club-art.js 一致；上传的照片优先显示。
+CLUB_ART = {"club": "通用", "laser": "激光雕刻", "design": "平面设计", "model3d": "3D 建模", "print": "3D 打印",
+            "media": "影视传媒", "wood": "木工", "code": "编程", "robot": "机器人", "paint": "美术", "music": "音乐",
+            "science": "科学实验", "sports": "体育", "book": "阅读写作"}
+
+
+def art_key(value) -> str:
+    """插图键名；也接受中文名称，例如“激光雕刻”。"""
+    text = str(value or "").strip()
+    for key, label in CLUB_ART.items():
+        if text in (key, label, label.replace(" ", "")):
+            return key
+    raise ToolError("art 可选：" + "、".join("{}（{}）".format(key, label) for key, label in CLUB_ART.items()))
+
+
 def phase_text(info: dict) -> str:
+    """报名状态；分批报名时带上当前批次，例如“第 2 批报名中”。"""
     if info.get("registration_locked"):
         return "名单已锁定"
+    if info.get("batch_mode"):
+        current = info.get("batch") or 0
+        if current >= BATCH_DONE:
+            return "全部批次已截止"
+        if not current:
+            return "开放时间待定"
+        return "第 {} 批{}".format(current, "报名中" if info.get("can_register") else "待开放")
     if info.get("can_register"):
         return "报名中"
     if info.get("start_time"):
         return "待开放"
     return "开放时间待定"
+
+
+def batch_view(summary: dict) -> dict:
+    """报名方式与各批次，供 get_overview、set_batches 返回。"""
+    if not summary.get("batch_mode"):
+        return {"报名方式": "同时报名"}
+    states = {"open": "报名中", "closed": "已截止", "waiting": "待开放"}
+    view = {
+        "报名方式": "分批报名",
+        "批次": [{"批次": batch["name"], "开放": batch["start_time"], "截止": batch["end_time"],
+                "班级": batch["classes"], "学生": batch.get("students", 0), "已报名": batch.get("registered", 0),
+                "状态": states.get(batch.get("state"), "")} for batch in summary.get("batches") or []],
+    }
+    if summary.get("unassigned"):
+        view["待分批的班级"] = [item["class"] for item in summary["unassigned"]]
+        view["待分批的学生"] = summary.get("unassigned_students", 0)
+    return view
 
 
 def all_clubs() -> list:
@@ -527,16 +568,24 @@ def all_students() -> list:
     return data if isinstance(data, list) else []
 
 
-def club_row(club: dict) -> dict:
+def club_row(club: dict, batched: bool = False) -> dict:
+    """社团的一行。分批报名时名额按批计算，已报名与剩余是当前批次的人数。"""
     custom = isinstance(club.get("image_path"), str) and club["image_path"].startswith("/club-images/")
+    prefix = "当前批次" if batched else ""
     return {
-        "编号": club["id"], "名称": club["name"], "人数上限": club["max_students"], "已报名": club["current_students"],
-        "剩余": club["max_students"] - club["current_students"], "开放报名": club["enabled"],
+        "编号": club["id"], "名称": club["name"], ("每批名额" if batched else "人数上限"): club["max_students"],
+        prefix + "已报名": club["current_students"], prefix + "剩余": club["max_students"] - club["current_students"],
+        "开放报名": club["enabled"],
         "年级范围": club.get("allowed_grades") or "全部年级", "班级范围": club.get("allowed_classes") or "全部班级",
         "简介": club.get("description") or "", "指导老师": club.get("advisor_name") or "",
         "活动时间": club.get("meeting_time") or "", "地点": club.get("location") or "",
-        "图片": "上传的图片" if custom else "默认插图",
+        "图片": "上传的照片" if custom else "插图：" + CLUB_ART.get(club.get("art"), "通用"),
     }
+
+
+def batched_now() -> bool:
+    info = get("/api/check_registration_time")
+    return bool(isinstance(info, dict) and info.get("batch_mode"))
 
 
 def find_club(ref, clubs: list | None = None) -> dict:
@@ -557,7 +606,7 @@ def find_club(ref, clubs: list | None = None) -> dict:
     candidates = exact or partial
     if candidates:
         raise ToolError("“{}”对应多个社团：{}".format(text, "、".join(club["name"] for club in candidates)))
-    raise ToolError("未找到社团“{}”。现有社团：{}".format(text, "、".join(club["name"] for club in clubs) or "无"))
+    raise ToolError("请从这些社团中选择：{}（收到：{}）".format("、".join(club["name"] for club in clubs) or "先用 add_club 添加社团", text))
 
 
 def student_row(student: dict, clubs: dict) -> dict:
@@ -580,7 +629,7 @@ def find_student(ref, students: list | None = None) -> dict:
     if len(found) == 1:
         return found[0]
     if not found:
-        raise ToolError("未找到学生“{}”。可用 list_students 按姓名或班级查找。".format(text))
+        raise ToolError("请用 list_students 按姓名或班级查找学生（收到：{}）".format(text))
     raise ToolError("找到多名学生，请改用账号指定：" + "；".join(
         "{}（{}）账号 {}".format(item["name"], item["class"], item["username"]) for item in found[:20]))
 
@@ -638,13 +687,27 @@ def flow_steps(summary: dict, info: dict) -> list:
 
     exported = (school_time(summary.get("last_export")) if fresh(summary.get("last_export")) else None)
     backed = (school_time(summary.get("last_backup")) if fresh(summary.get("last_backup")) else None)
+    if summary.get("batch_mode"):
+        # 分批报名：每批名额合计与人数最多的一批比较；时间按批次设置。
+        batches = summary.get("batches") or []
+        largest = summary.get("largest_batch", 0)
+        clubs_step = {"步骤": "添加社团", "状态": status(summary.get("clubs", 0) > 0, largest > capacity),
+                      "说明": "{} 个社团，每批名额合计 {}，人数最多的一批 {} 名".format(
+                          summary.get("clubs", 0), capacity, largest)}
+        time_step = {"步骤": "分批与时间", "状态": status(bool(batches), summary.get("unassigned_students", 0) > 0),
+                     "说明": "{} 批{}".format(len(batches), "，{} 个班级待分批".format(len(summary["unassigned"]))
+                                             if summary.get("unassigned_students") else "，全部班级已分批")
+                     if batches else "按班级分批并设置各批时段（set_batches）"}
+    else:
+        clubs_step = {"步骤": "添加社团", "状态": status(summary.get("clubs", 0) > 0, students > capacity),
+                      "说明": "{} 个社团，开放报名的名额合计 {}{}".format(
+                          summary.get("clubs", 0), capacity, "，学生 {} 名".format(students) if students > capacity else "")}
+        time_step = {"步骤": "开放时间", "状态": status(bool(info.get("start_time"))),
+                     "说明": "开放 {}；截止 {}".format(info.get("start_time") or "待定", info.get("end_time") or "手动锁定")}
     return [
         {"步骤": "导入学生", "状态": status(students > 0), "说明": "{} 名学生".format(students)},
-        {"步骤": "添加社团", "状态": status(summary.get("clubs", 0) > 0, students > capacity),
-         "说明": "{} 个社团，开放报名的名额合计 {}{}".format(summary.get("clubs", 0), capacity,
-                                                  "，学生 {} 名".format(students) if students > capacity else "")},
-        {"步骤": "开放时间", "状态": status(bool(info.get("start_time"))),
-         "说明": "开放 {}；截止 {}".format(info.get("start_time") or "待定", info.get("end_time") or "手动锁定")},
+        clubs_step,
+        time_step,
         {"步骤": "报名", "状态": status(locked), "说明": "{}，已报名 {} / {}".format(phase_text(info), registered, students)},
         {"步骤": "调剂", "状态": status(locked and registered >= students),
          "说明": "未报名 {} 名".format(students - registered) if locked else "名单锁定后安排未报名的学生"},
@@ -867,7 +930,7 @@ def validate_setting(key: str, value) -> str:
         if text.upper() not in rule[1:]:
             raise ToolError("{} 可选：{}".format(key, "、".join(rule[1:])))
         return text.upper()
-    raise ToolError("未知参数类型：{}".format(key))
+    raise ToolError("参数类型请对照 get_settings（收到：{}）".format(key))
 
 
 def tool_get_settings(args: dict) -> dict:
@@ -904,7 +967,7 @@ def tool_update_settings(args: dict) -> dict:
     if merged.get("TLS_CERT"):
         ports.append(merged.get("TLS_PORT") or "8443")
     if len(set(ports)) != len(ports):
-        raise ToolError("HTTP_PORT 与 TLS_PORT 需要不同")
+        raise ToolError("HTTP_PORT 与 TLS_PORT 请用两个端口")
     output, seen = [], set()
     for line in lines:
         key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
@@ -971,18 +1034,70 @@ def tool_get_overview(args: dict) -> dict:
     summary = get("/api/admin/summary")
     info = get("/api/check_registration_time")
     students, registered = summary.get("students", 0), summary.get("registered", 0)
-    return {
+    batched = bool(summary.get("batch_mode"))
+    view = {
         "报名状态": phase_text(info),
-        "开放时间": info.get("start_time") or "待定",
-        "截止时间": info.get("end_time") or "手动锁定",
+        **batch_view(summary),
+        ("当前批次开放时间" if batched else "开放时间"): info.get("start_time") or "待定",
+        ("当前批次截止时间" if batched else "截止时间"): info.get("end_time") or ("—" if batched else "手动锁定"),
         "服务器当前时间（学校时间）": school_time(info.get("server_now")),
         "学生": students, "已报名": registered, "未报名": students - registered,
-        "社团": len(clubs), "开放报名的名额合计": summary.get("capacity", 0),
-        "各社团": [{"社团": club["name"], "已报名": club["current_students"], "人数上限": club["max_students"],
-                  "开放报名": club["enabled"]} for club in clubs],
+        "社团": len(clubs), ("每批名额合计" if batched else "开放报名的名额合计"): summary.get("capacity", 0),
+        "各社团": [{"社团": club["name"], ("当前批次已报名" if batched else "已报名"): club["current_students"],
+                  ("每批名额" if batched else "人数上限"): club["max_students"], "开放报名": club["enabled"]}
+                 for club in clubs],
         "流程": flow_steps(summary, info),
         "访问地址": addresses(),
     }
+    return view
+
+
+def tool_batch_now(args: dict) -> dict:
+    """分批报名时让当前批次现在开放或现在截止，用于学生提前到齐或提前下课。"""
+    batch, action = args.get("batch"), args.get("action")
+    if not isinstance(batch, int) or isinstance(batch, bool) or batch < 1:
+        raise ToolError("batch 为批次编号，例如 2")
+    if action not in ("open", "close"):
+        raise ToolError("action 为 open（现在开放）或 close（现在截止）")
+    if not args.get("confirm"):
+        raise NeedsConfirm("第 {} 批{}".format(batch, "现在开放，这一批的学生即可报名" if action == "open"
+                                              else "现在截止，本批报名与退选在此刻结束"))
+    result = post("/api/admin/batch_now", {"batch_id": batch, "action": action, "request_id": rid()})
+    after = get("/api/check_registration_time")
+    return {"报名状态": phase_text(after), **(batch_view(result) if result.get("batches") else {})}
+
+
+def tool_set_batches(args: dict) -> dict:
+    """报名方式与批次：同时报名，或按班级分批、各批在自己的时段报名、社团名额按批计算。"""
+    batched = args.get("batch_mode")
+    if not isinstance(batched, bool):
+        raise ToolError("batch_mode 应为 true（分批报名）或 false（同时报名）")
+    payload = {"batch_mode": batched, "request_id": rid()}
+    if args.get("batches") is not None:
+        if not isinstance(args["batches"], list):
+            raise ToolError("batches 应为列表：[{\"open_at\": \"2026-11-27 10:00\", \"close_at\": \"2026-11-27 10:40\", "
+                            "\"classes\": [\"高一1班\"]}]")
+        batches = []
+        for index, item in enumerate(args["batches"], 1):
+            if not isinstance(item, dict):
+                raise ToolError("batches 的第 {} 项应为对象".format(index))
+            batches.append({"start_time": parse_time(item.get("open_at"), "第 {} 项的 open_at".format(index)),
+                            "end_time": parse_time(item.get("close_at"), "第 {} 项的 close_at".format(index)),
+                            "classes": text_list(item.get("classes"))})
+        payload["batches"] = batches
+    info = get("/api/check_registration_time")
+    if opening_soon(info) and not args.get("confirm"):
+        change = "改为{}".format("分批报名" if batched else "同时报名") if bool(info.get("batch_mode")) != batched \
+            else "更新批次"
+        raise NeedsConfirm("{}；报名正在进行或一小时内开放，保存后各班按新的批次和时段报名".format(change))
+    result = post("/api/admin/batches", payload)
+    after = get("/api/check_registration_time")
+    out = {"报名状态": phase_text(after), **batch_view(result)}
+    if not batched:
+        out["说明"] = ["开放时间待定，用 set_schedule 设置开放与截止时间"]
+    elif result.get("unassigned"):
+        out["说明"] = ["把待分批的班级加入某一批，这些学生即可报名"]
+    return out
 
 
 def tool_set_schedule(args: dict) -> dict:
@@ -1255,8 +1370,9 @@ def tool_delete_student(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 def tool_list_clubs(args: dict) -> dict:
     clubs = all_clubs()
-    return {"社团": [club_row(club) for club in clubs],
-            "名额合计": sum(club["max_students"] for club in clubs if club["enabled"])}
+    batched = batched_now()
+    return {"社团": [club_row(club, batched) for club in clubs],
+            ("每批名额合计" if batched else "名额合计"): sum(club["max_students"] for club in clubs if club["enabled"])}
 
 
 def club_payload(club: dict, args: dict) -> dict:
@@ -1290,6 +1406,8 @@ def club_payload(club: dict, args: dict) -> dict:
         payload["allowed_classes"] = text_list(args["classes"])
     if args.get("enabled") is not None:
         payload["enabled"] = bool(args["enabled"])
+    if args.get("art") is not None:
+        payload["art"] = art_key(args["art"])
     return payload
 
 
@@ -1297,11 +1415,12 @@ def apply_club_image(club: dict, image) -> str:
     if image in (None, ""):
         return ""
     if str(image).strip() in ("default", "默认", "恢复默认"):
+        label = CLUB_ART.get(club.get("art"), "通用")
         if not (isinstance(club.get("image_path"), str) and club["image_path"].startswith("/club-images/")):
-            return "图片已是默认插图"
+            return "卡片显示插图：" + label
         post("/api/remove_club_image", {"club_id": club["id"], "expected_revision": club["revision"],
-                                        "request_id": rid(), "reason": "恢复默认图片"})
-        return "已恢复默认插图"
+                                        "request_id": rid(), "reason": "改用插图"})
+        return "已改用插图：" + label
     path, data = read_input(image, MAX_IMAGE_BYTES)
     content_type = IMAGE_TYPES.get(path.suffix.lower())
     if not content_type:
@@ -1322,13 +1441,14 @@ def tool_add_club(args: dict) -> dict:
     if not int(result.get("success") or 0):
         raise ToolError("社团“{}”已存在".format(name))
     club = find_club(name)
-    extra = {key: args[key] for key in ("description", "advisor", "meeting_time", "location", "grades", "classes", "enabled")
+    extra = {key: args[key] for key in ("description", "advisor", "meeting_time", "location", "grades", "classes", "enabled",
+                                        "art")
              if args.get(key) is not None}
     if extra:
         updated = post("/api/update_club", club_payload(club, extra))
         club = updated.get("club") or find_club(club["id"])
     note = apply_club_image(club, args.get("image"))
-    out = {"社团": club_row(find_club(club["id"]))}
+    out = {"社团": club_row(find_club(club["id"]), batched_now())}
     if note:
         out["图片"] = note
     return out
@@ -1336,12 +1456,13 @@ def tool_add_club(args: dict) -> dict:
 
 def tool_update_club(args: dict) -> dict:
     club = find_club(args.get("club"))
-    fields = ("name", "capacity", "description", "advisor", "meeting_time", "location", "grades", "classes", "enabled")
+    fields = ("name", "capacity", "description", "advisor", "meeting_time", "location", "grades", "classes", "enabled",
+              "art")
     if any(args.get(key) is not None for key in fields):
         updated = post("/api/update_club", club_payload(club, args))
         club = updated.get("club") or find_club(club["id"])
     note = apply_club_image(club, args.get("image"))
-    out = {"社团": club_row(find_club(club["id"]))}
+    out = {"社团": club_row(find_club(club["id"]), batched_now())}
     if note:
         out["图片"] = note
     return out
@@ -1350,7 +1471,8 @@ def tool_update_club(args: dict) -> dict:
 def tool_delete_club(args: dict) -> dict:
     club = find_club(args.get("club"))
     if not args.get("confirm"):
-        raise NeedsConfirm("删除社团“{}”及其 {} 条报名记录".format(club["name"], club["current_students"]))
+        registered = sum(1 for student in all_students() if student.get("club_id") == club["id"])
+        raise NeedsConfirm("删除社团“{}”及其 {} 条报名记录；删除前自动保存快照".format(club["name"], registered))
     post("/api/delete_club", {"club_id": club["id"]})
     return {"已删除": club["name"]}
 
@@ -1359,13 +1481,21 @@ def tool_delete_club(args: dict) -> dict:
 # 工具：调剂、导出、记录
 # ---------------------------------------------------------------------------
 def tool_adjustment(args: dict) -> dict:
+    """调剂预览与执行。分批报名时每批只用本批的空余名额，班级待分批的学生先加入批次。"""
     plan = get("/api/admin/adjustment")
+    batched = bool(plan.get("batch_mode"))
+
+    def row(club: dict) -> dict:
+        item = {"社团": club.get("name"), "空余": club.get("remaining"), "将安排": club.get("assign")}
+        return {"批次": "第 {} 批".format(club.get("batch")), **item} if batched else item
+
     view = {"名单已锁定": plan.get("locked"), "未报名": plan.get("unregistered"), "空余名额": plan.get("seats"),
-            "可安排": plan.get("assignable"),
-            "各社团": [{"社团": club.get("name"), "空余": club.get("remaining"), "将安排": club.get("assign")}
-                     for club in plan.get("clubs") or []]}
-    if plan.get("assignable", 0) < plan.get("unregistered", 0):
-        view["还需名额"] = plan["unregistered"] - plan["assignable"]
+            "可安排": plan.get("assignable"), ("各批各社团" if batched else "各社团"): [row(club) for club in plan.get("clubs") or []]}
+    if plan.get("unbatched"):
+        view["班级待分批的未报名学生"] = plan["unbatched"]
+    short = plan.get("unregistered", 0) - plan.get("assignable", 0) - plan.get("unbatched", 0)
+    if short > 0:
+        view["还需名额"] = short
     if not args.get("run"):
         return view
     if not plan.get("locked"):
@@ -1518,7 +1648,17 @@ CLUB_FIELDS = {
     "grades": {"type": "array", "items": {"type": "string"}, "description": "限报年级，例如 [\"高一\", \"高二\"]；空列表为全部年级"},
     "classes": {"type": "array", "items": {"type": "string"}, "description": "限报班级；空列表为全部班级"},
     "enabled": {"type": "boolean", "description": "是否开放报名"},
-    "image": {"type": "string", "description": "图片文件的完整路径（JPG、PNG、WebP、GIF，10 MB 以内）；default 恢复默认插图"},
+    "art": {"type": "string", "enum": list(CLUB_ART),
+            "description": "卡片插图：" + "、".join("{} {}".format(key, label) for key, label in CLUB_ART.items())
+            + "。新社团已按名称选好一幅，按管理员的意思更换"},
+    "image": {"type": "string", "description": "照片文件的完整路径（JPG、PNG、WebP、GIF，10 MB 以内），照片优先于插图显示；default 改用插图"},
+}
+BATCH_ITEM = {
+    "type": "object",
+    "properties": {"open_at": {"type": "string", "description": "这一批的开放时间，例如 2026-11-27 10:00"},
+                   "close_at": {"type": "string", "description": "这一批的截止时间，例如 2026-11-27 10:40"},
+                   "classes": {"type": "array", "items": {"type": "string"}, "description": "这一批的班级"}},
+    "required": ["open_at", "close_at", "classes"],
 }
 
 READ = {"readOnlyHint": True, "openWorldHint": False}
@@ -1550,8 +1690,19 @@ TOOLS = [
      schema(), tool_admin_credentials, WRITE),
     ("change_admin_password", "修改管理员密码", "修改管理员密码并写入密码文件；不给 new_password 时随机生成 12 位。",
      schema({"new_password": {"type": "string", "description": "8–64 位，由字母、数字和符号连续组成"}}), tool_change_admin_password, WRITE),
-    ("get_overview", "报名概览", "报名状态、开放与截止时间、学生和报名人数、各社团名额、使用流程各步骤的状态。",
+    ("get_overview", "报名概览", "报名状态、报名方式与各批次、开放与截止时间、学生和报名人数、各社团名额、使用流程各步骤的状态。",
      schema(), tool_get_overview, READ),
+    ("set_batches", "报名方式与批次", "batch_mode=false 为同时报名：全体学生一个时段、共用名额。batch_mode=true 为分批报名："
+     "按班级分批，各批在自己的时段报名，社团人数上限即每批名额；学生分几节课到机房报名时使用。batches 给出全部批次"
+     "（按开放时间自动编号，时段先后排开，每个班级只放一批），缺省时只改报名方式。报名进行中或一小时内开放时需要 confirm。",
+     schema({"batch_mode": {"type": "boolean"},
+             "batches": {"type": "array", "items": BATCH_ITEM, "description": "全部批次；缺省时保持已有批次"},
+             "confirm": CONFIRM}, ["batch_mode"]), tool_set_batches, WRITE),
+    ("batch_now", "现在开放或截止", "分批报名时，让当前批次现在开放（action=open，例如学生已到齐）或现在截止（action=close，例如提前下课）。"
+     "截止后切换到下一批，最后一批截止后名单自动锁定。需要 confirm。",
+     schema({"batch": {"type": "integer", "description": "批次编号，例如 2"},
+             "action": {"type": "string", "enum": ["open", "close"]}, "confirm": CONFIRM}, ["batch", "action"]),
+     tool_batch_now, WRITE),
     ("set_schedule", "设置开放与截止时间", "按学校时间设置开放时间和截止时间；到开放时间自动开放，到截止时间自动锁定名单。",
      schema({"open_at": {"type": "string", "description": "开放时间，例如 2026-11-20 08:00"},
              "close_at": {"type": "string", "description": "截止时间；空字符串取消截止时间，缺省时保持原样"},
@@ -1589,9 +1740,10 @@ TOOLS = [
      schema({"student": STUDENT, "confirm": CONFIRM}, ["student"]), tool_delete_student, DANGER),
     ("list_clubs", "社团列表", "列出社团的名额、报名人数、范围、简介、时间地点和图片。", schema(), tool_list_clubs, READ),
     ("add_club", "添加社团", "添加社团并可同时填写简介、老师、时间地点、范围和图片。",
-     schema(dict({"name": {"type": "string"}, "capacity": {"type": "integer", "description": "人数上限 1–10000"}}, **CLUB_FIELDS),
+     schema(dict({"name": {"type": "string"},
+                  "capacity": {"type": "integer", "description": "人数上限 1–10000；分批报名时为每批名额"}}, **CLUB_FIELDS),
             ["name", "capacity"]), tool_add_club, WRITE),
-    ("update_club", "编辑社团", "修改社团名称、人数上限、简介、老师、时间地点、范围、开放状态；image 更换图片或恢复默认插图。",
+    ("update_club", "编辑社团", "修改社团名称、人数上限（分批报名时为每批名额）、简介、老师、时间地点、范围、开放状态；art 选卡片插图，image 上传照片或改用插图。",
      schema(dict({"club": CLUB, "name": {"type": "string"}, "capacity": {"type": "integer"},
                   "reason": {"type": "string"}}, **CLUB_FIELDS), ["club"]), tool_update_club, WRITE),
     ("delete_club", "删除社团", "删除社团及其报名记录。", schema({"club": CLUB, "confirm": CONFIRM}, ["club"]),

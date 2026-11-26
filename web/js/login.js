@@ -13,10 +13,13 @@
     var data = result.data;
     if (!result.ok || !data) return;
     var until = data.end_time ? '，截止 ' + App.schoolTime(data.end_time) : '';
+    // 分批报名时显示当前批次；各班的批次在登录后显示。
+    var batch = data.batch_mode && data.batch > 0 && data.batch < 1000000 ? '第 ' + data.batch + ' 批' : '';
     var text = '报名开放时间待定';
-    if (data.registration_locked) text = '报名已截止';
-    else if (data.can_register) text = '报名中' + until;
-    else if (data.start_time) text = '报名开放 ' + App.schoolTime(data.start_time) + until;
+    if (data.registration_locked || (data.batch_mode && data.batch >= 1000000)) text = '报名已截止';
+    else if (data.batch_mode && !batch) text = '报名开放时间待定';
+    else if (data.can_register) text = batch + '报名中' + until;
+    else if (data.start_time) text = batch + '报名开放 ' + App.schoolTime(data.start_time) + until;
     var line = $('#login-schedule');
     line.textContent = text;
     line.hidden = false;

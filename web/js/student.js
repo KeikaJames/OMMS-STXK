@@ -1,7 +1,9 @@
 // 学生页：开放状态、名额轮询、报名与退选。只用 ES5。
+// 分批报名时按本班所在批次的时段显示倒计时与截止；名额快照属于当前批次，本批是当前批次时才显示实时余量。
 (function () {
   'use strict';
   var RETRY_WINDOW_MS = 25000;
+  var OPEN_RETRY_MS = 5000;
   var state = {
     me: null,
     catalog: [],
@@ -12,6 +14,9 @@
     closeAt: null,
     closeText: null,
     locked: false,
+    batchMode: false,
+    batches: [],
+    activeBatch: null,
     offset: 0,
     expanded: {},
     pending: null,
@@ -29,14 +34,41 @@
   function registeredId() {
     return state.me && state.me.registered_club_id ? Number(state.me.registered_club_id) : null;
   }
+  // 本班所在的批次；同时报名或本班待分批时为 null。
+  function myBatch() {
+    if (!state.batchMode || !state.me) return null;
+    for (var i = 0; i < state.batches.length; i += 1) {
+      if (state.batches[i].classes.indexOf(state.me['class']) >= 0) return state.batches[i];
+    }
+    return null;
+  }
+  // 本人适用的开放与截止时间（毫秒）：分批报名取本批时段。
+  function windowOpenAt() {
+    if (!state.batchMode) return state.openAt;
+    var batch = myBatch();
+    return batch ? batch.open_at : null;
+  }
+  function windowCloseAt() {
+    if (!state.batchMode) return state.closeAt;
+    var batch = myBatch();
+    return batch ? batch.close_at : null;
+  }
   function phase() {
-    if (state.locked || (state.closeAt !== null && now() >= state.closeAt)) return 'locked';
+    var closeAt = windowCloseAt();
+    var openAt = windowOpenAt();
+    if (state.locked || (closeAt !== null && now() >= closeAt)) return 'locked';
     if (registeredId()) return 'chosen';
-    if (state.openAt === null) return 'unset';
-    return now() >= state.openAt ? 'open' : 'countdown';
+    if (openAt === null) return 'unset';
+    return now() >= openAt ? 'open' : 'countdown';
+  }
+  // 实时余量只属于当前批次；其他批次的学生看到每批名额。
+  function liveSeats() {
+    if (!state.batchMode) return true;
+    var batch = myBatch();
+    return Boolean(batch) && state.activeBatch === batch.id;
   }
   function remaining(club) {
-    return has(state.seats, club.id) ? state.seats[club.id] : club.max_students;
+    return liveSeats() && has(state.seats, club.id) ? state.seats[club.id] : club.max_students;
   }
   function eligibility(club) {
     if (!state.me) return null;
@@ -92,6 +124,15 @@
     });
   }
 
+  function loadBatches() {
+    return App.request('/api/batches').then(function (result) {
+      if (!result.ok || !result.data) return;
+      state.batchMode = Boolean(result.data.batch_mode);
+      state.batches = Array.isArray(result.data.batches) ? result.data.batches : [];
+      if (state.batchMode && typeof result.data.current === 'number') state.activeBatch = result.data.current;
+    });
+  }
+
   function loadSeats() {
     return App.request('/api/seats').then(function (result) {
       if (!result.ok || !result.data) return null;
@@ -105,11 +146,18 @@
       state.locked = Boolean(data.locked);
       var stamp = new Date();
       $('#updated-at').textContent = '更新于 ' + [stamp.getHours(), stamp.getMinutes(), stamp.getSeconds()].map(App.pad).join(':');
+      var pending = [];
+      // 报名方式或当前批次变化时重新读取批次。
+      var batch = typeof data.batch === 'number' ? data.batch : null;
+      if ((batch !== null) !== state.batchMode || batch !== state.activeBatch) {
+        state.activeBatch = batch;
+        pending.push(loadBatches());
+      }
       if (data.catalog !== state.catalogTag || !state.catalog.length) {
         state.catalogTag = data.catalog;
-        return loadCatalog();
+        pending.push(loadCatalog());
       }
-      return null;
+      return pending.length ? Promise.all(pending) : null;
     });
   }
 
@@ -117,7 +165,7 @@
   function pollDelay() {
     var current = phase();
     if (current === 'open') return 2000 + Math.random() * 800;
-    if (current === 'countdown') return state.openAt - now() < 90000 ? 4000 : 15000;
+    if (current === 'countdown') return windowOpenAt() - now() < 90000 ? 4000 : 15000;
     return current === 'chosen' ? 10000 : 15000;
   }
   function schedulePoll() {
@@ -130,15 +178,21 @@
       });
     }, pollDelay());
   }
+  // 到开放时间（分批报名时还有本批截止时间）立即刷新一次。
   function scheduleOpen() {
     clearTimeout(openTimer);
-    if (state.openAt === null || state.locked) return;
-    var left = state.openAt - now();
-    if (left <= 0 || left > 86400000) return;
+    if (state.locked) return;
+    var next = [windowOpenAt(), state.batchMode ? windowCloseAt() : null].filter(function (at) {
+      return at !== null && at - now() > 0 && at - now() <= 86400000;
+    }).sort(function (a, b) { return a - b; })[0];
+    if (next === undefined) return;
     openTimer = setTimeout(function () {
       render();
-      loadSeats().then(render);
-    }, left + 30);
+      loadSeats().then(function () {
+        render();
+        scheduleOpen();
+      });
+    }, next - now() + 30);
   }
 
   // ---- 状态条 ----
@@ -153,17 +207,27 @@
     return [date.getHours(), date.getMinutes(), date.getSeconds()].map(App.pad).join(':');
   }
 
+  // 截止与开放在同一天时只写钟点，例如“11 月 27 日 10:00 开放 · 10:40 截止”。
+  function closeLabel(startText, endText) {
+    var end = App.schoolTime(endText);
+    if (!end) return '';
+    return (startText && String(startText).slice(0, 10) === String(endText).slice(0, 10) ? end.split(' ').pop() : end) + ' 截止';
+  }
+
   function renderStatus() {
     var current = phase();
-    var openText = App.schoolTime(state.openText);
-    var closeText = App.schoolTime(state.closeText);
-    var until = closeText ? closeText + ' 截止' : '';
+    var batch = myBatch();
+    var name = batch ? batch.name : '';
+    var startText = batch ? batch.start_time : state.openText;
+    var endText = batch ? batch.end_time : state.closeText;
+    var openText = App.schoolTime(startText);
+    var until = batch ? closeLabel(startText, endText) : (App.schoolTime(endText) ? App.schoolTime(endText) + ' 截止' : '');
     var texts = {
       unset: ['开放时间待定', ''],
-      countdown: ['距开放', [openText ? openText + ' 开放' : '', until].filter(Boolean).join(' · ')],
-      open: ['报名中', until],
-      chosen: ['已报名', until],
-      locked: ['报名已截止', '']
+      countdown: ['距开放', [name, openText ? openText + ' 开放' : '', until].filter(Boolean).join(' · ')],
+      open: ['报名中', [name, until].filter(Boolean).join(' · ')],
+      chosen: ['已报名', [name, until].filter(Boolean).join(' · ')],
+      locked: ['报名已截止', [name, registeredId() ? '' : '社团由老师统一安排'].filter(Boolean).join(' · ')]
     };
     var text = texts[current];
     var detail = $('#status-detail');
@@ -183,7 +247,7 @@
     var label = current === 'countdown' ? '倒计时' : '当前时间';
     var labelNode = $('#clock-label');
     if (labelNode.textContent !== label) labelNode.textContent = label;
-    $('#clock').textContent = current === 'countdown' ? formatDuration(state.openAt - now()) : formatClock(now());
+    $('#clock').textContent = current === 'countdown' ? formatDuration(windowOpenAt() - now()) : formatClock(now());
   }
 
   // ---- 已报名 ----
@@ -275,7 +339,7 @@
     var next = actionFor(club, left, restriction, mine);
     var expanded = Boolean(state.expanded[club.id]);
     var signature = [club.name, club.location, club.meeting_time, club.advisor_name, club.description,
-      club.image_path, club.max_students, (club.allowed_grades || []).join(','), (club.allowed_classes || []).length,
+      club.image_path, club.art, club.max_students, (club.allowed_grades || []).join(','), (club.allowed_classes || []).length,
       left, mine, restriction, next.key, expanded].join('|');
     if (card.getAttribute('data-signature') === signature) return;
     card.setAttribute('data-signature', signature);
@@ -367,6 +431,11 @@
         body: { club_id: club.id, request_id: pending.requestId }
       }).then(function (result) {
         if (state.pending !== pending) return null;
+        // 本机时钟刚到开放时间、服务器还差几十毫秒：同一请求稍后再试。
+        if (result.status === 200 && result.data && result.data.code === 'not_open' && phase() === 'open' &&
+            Date.now() - pending.started < OPEN_RETRY_MS) {
+          return wait(500 + Math.random() * 400).then(attempt);
+        }
         if (result.status === 200 && result.data) {
           state.pending = null;
           return settle(result.data, club);
@@ -455,6 +524,12 @@
     scheduleOpen();
     schedulePoll();
     setInterval(function () { if (!App.hidden()) tick(); }, 1000);
-    setInterval(function () { if (!App.hidden()) syncTime().then(scheduleOpen); }, 60000);
+    setInterval(function () {
+      if (App.hidden()) return;
+      Promise.all([syncTime(), state.batchMode ? loadBatches() : null]).then(function () {
+        render();
+        scheduleOpen();
+      });
+    }, 60000);
   });
 })();

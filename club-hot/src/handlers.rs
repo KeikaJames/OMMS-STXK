@@ -259,6 +259,8 @@ impl Outcome {
 struct Attempt {
     student: i64,
     club: i64,
+    /// 学生所在班级，分批报名时抢位脚本据此核对批次。
+    class: String,
     operation_id: String,
     mirror: String,
     lease: String,
@@ -329,6 +331,7 @@ pub async fn register_club(
     let attempt = Attempt {
         student: sess.student_id,
         club,
+        class,
         member: format!("{}|{}", sess.student_id, lease),
         operation_id,
         mirror,
@@ -355,6 +358,7 @@ async fn finalize_registration(state: AppState, attempt: Attempt) -> Outcome {
                 &attempt.lease,
                 &attempt.member,
                 &format!("{}|", attempt.mirror),
+                &attempt.class,
             )
             .await;
         let acquired = match result {
@@ -601,13 +605,23 @@ pub async fn cancel_registration(State(state): State<AppState>, headers: HeaderM
     if registration.seat_sync_pending {
         return fail(StatusCode::SERVICE_UNAVAILABLE, "syncing");
     }
+    // 分批报名时只有当前批次的学生可以退选，退选脚本按班级核对批次。
+    let class = match sess.class.clone() {
+        Some(class) => class,
+        None => match state.db.student_grade_class(StudentId(student)).await {
+            Ok(Some((_grade, class))) => class,
+            Ok(None) => return fail(StatusCode::UNAUTHORIZED, "unauthorized"),
+            Err(e) => return e.into_response(),
+        },
+    };
     let redis = seats(&state);
     let club = registration.club_id;
     let lease = format!("{club}|x-{}", random_token(9));
     let member = format!("{student}|{lease}");
-    match redis.cancel_begin(student, club, &lease, &member).await {
+    match redis.cancel_begin(student, club, &lease, &member, &class).await {
         Ok(1) => {}
         Ok(-6) => return fail(StatusCode::OK, "locked"),
+        Ok(-4) => return fail(StatusCode::OK, "not_open"),
         Ok(-3) => return fail(StatusCode::SERVICE_UNAVAILABLE, "syncing"),
         Ok(_) => return fail(StatusCode::ACCEPTED, "pending"),
         Err(e) => return e.into_response(),
@@ -717,6 +731,7 @@ pub async fn get_clubs(State(state): State<AppState>) -> Response {
                 "enabled": r.enabled,
                 "revision": r.revision,
                 "seat_sync_pending": r.seat_sync_pending,
+                "art": r.art,
             })
         })
         .collect();
@@ -736,10 +751,13 @@ pub async fn check_registration_time(State(state): State<AppState>) -> Response 
     let server_now = redis.now_epoch_ms().await;
     let end_str = state.db.registration_end_time().await.ok().flatten();
     let close_at = end_str.as_deref().and_then(auth::parse_local_datetime);
+    // 分批报名时时段属于当前批次；某一批截止只结束这一批，名单锁定以锁定标记为准。
+    let (batch_mode, current_batch) = state.db.batch_state().await.unwrap_or((false, None));
+    let passed = close_at.is_some_and(|c| server_now >= c.saturating_mul(1000));
     let locked = state.db.registration_locked().await.unwrap_or(false)
         || redis.locked_get().await.unwrap_or(false)
-        || close_at.is_some_and(|c| server_now >= c.saturating_mul(1000));
-    let can = open_at.is_some_and(|o| server_now >= o.saturating_mul(1000)) && !locked;
+        || (passed && !batch_mode);
+    let can = open_at.is_some_and(|o| server_now >= o.saturating_mul(1000)) && !locked && !passed;
     (
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
@@ -750,6 +768,8 @@ pub async fn check_registration_time(State(state): State<AppState>) -> Response 
             "registration_locked": locked,
             "end_time": if close_at.is_some() { json!(end_str) } else { Value::Null },
             "close_at": close_at.map(|value| value.saturating_mul(1000)),
+            "batch_mode": batch_mode,
+            "batch": if batch_mode { json!(current_batch.unwrap_or(0)) } else { Value::Null },
         })),
     )
         .into_response()

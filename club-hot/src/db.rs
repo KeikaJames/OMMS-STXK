@@ -24,6 +24,8 @@ pub struct ClubRow {
     pub enabled: bool,
     pub revision: i64,
     pub seat_sync_pending: bool,
+    /// 管理员选定的卡片插图（见 web/js/club-art.js），上传的照片优先显示。
+    pub art: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,12 +64,27 @@ pub struct StudentRegistration {
 }
 
 pub struct Snapshot {
+    /// 当前名额池的容量与占用（视图 club_pool）。
     pub clubs: Vec<ClubStock>,
     pub registrations: Vec<(i64, i64, Option<String>)>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
     pub locked: bool,
+    /// 分批报名时的当前批次与班级对照；同时报名时为 None。
+    pub batch: Option<BatchState>,
 }
+
+/// 分批报名的批次状态：当前批次编号（Python 按时间维护）与班级到批次编号的对照。
+pub struct BatchState {
+    pub current: i64,
+    pub classes: Vec<(String, i64)>,
+}
+
+/// 名额池的表、视图与容量触发器，与 Python 共用。
+const POOLS_SQL: &str = include_str!("../../shared/sql/pools.sql");
+
+/// settings 中整体发布用到的列：开放、截止、锁定、是否分批、当前批次。
+type SettingsRow = (Option<String>, Option<String>, bool, bool, Option<i64>);
 
 #[derive(Clone)]
 pub struct Db {
@@ -115,15 +132,13 @@ struct AuditEvent<'a> {
 }
 
 fn append_audit_event(tx: &Transaction<'_>, event: AuditEvent<'_>) -> rusqlite::Result<()> {
-    tx.execute(
-        concat!(
-            "INSERT INTO audit_events ",
-            "(event_id,occurred_at,actor_role,actor_id,action,target_type,target_id,before_json,after_json,metadata_json) ",
-            "VALUES (?1,?2,'student',?3,?4,'registration',?5,?6,?7,?8)"
-        ),
-        rusqlite::params![event.event_id, now_epoch_ms(), event.actor_id, event.action,
-            event.target_id, event.before_json, event.after_json, event.metadata_json],
-    )?;
+    tx.prepare_cached(concat!(
+        "INSERT INTO audit_events ",
+        "(event_id,occurred_at,actor_role,actor_id,action,target_type,target_id,before_json,after_json,metadata_json) ",
+        "VALUES (?1,?2,'student',?3,?4,'registration',?5,?6,?7,?8)"
+    ))?
+    .execute(rusqlite::params![event.event_id, now_epoch_ms(), event.actor_id, event.action,
+        event.target_id, event.before_json, event.after_json, event.metadata_json])?;
     Ok(())
 }
 
@@ -182,6 +197,9 @@ impl Db {
             ensure_column("registrations", "operation_id", "operation_id TEXT")?;
             ensure_column("students", "grade", "grade TEXT NOT NULL DEFAULT ''")?;
             ensure_column("settings", "registration_locked", "registration_locked INTEGER NOT NULL DEFAULT 0")?;
+            ensure_column("settings", "registration_end_time", "registration_end_time TEXT")?;
+            ensure_column("settings", "batch_mode", "batch_mode INTEGER NOT NULL DEFAULT 0")?;
+            ensure_column("settings", "current_batch", "current_batch INTEGER")?;
             for (column, definition) in [
                 ("description", "description TEXT NOT NULL DEFAULT ''"),
                 ("advisor_name", "advisor_name TEXT NOT NULL DEFAULT ''"),
@@ -194,6 +212,7 @@ impl Db {
                 ("revision", "revision INTEGER NOT NULL DEFAULT 0"),
                 ("seat_revision", "seat_revision INTEGER NOT NULL DEFAULT 0"),
                 ("seat_sync_pending", "seat_sync_pending INTEGER NOT NULL DEFAULT 0"),
+                ("art", "art TEXT NOT NULL DEFAULT ''"),
             ] {
                 ensure_column("clubs", column, definition)?;
             }
@@ -210,24 +229,11 @@ impl Db {
                  WHERE operation_id IS NULL OR operation_id = ''",
                 [],
             )?;
+            // 名额池按 shared/sql/pools.sql 重建：同时报名每社团一个池，分批报名每社团每批一个池。
+            tx.execute_batch(POOLS_SQL)?;
             tx.execute_batch(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_registrations_operation_id \
                    ON registrations(operation_id) WHERE operation_id IS NOT NULL; \
-                 CREATE TRIGGER IF NOT EXISTS registrations_capacity_guard \
-                 BEFORE INSERT ON registrations FOR EACH ROW BEGIN \
-                   SELECT CASE WHEN \
-                     (SELECT COUNT(*) FROM registrations WHERE club_id = NEW.club_id) >= \
-                     (SELECT max_students FROM clubs WHERE id = NEW.club_id) \
-                   THEN RAISE(ABORT, 'club full') END; \
-                 END; \
-                 CREATE TRIGGER IF NOT EXISTS registrations_capacity_guard_update \
-                 BEFORE UPDATE OF club_id ON registrations \
-                 FOR EACH ROW WHEN NEW.club_id != OLD.club_id BEGIN \
-                   SELECT CASE WHEN \
-                     (SELECT COUNT(*) FROM registrations WHERE club_id = NEW.club_id) >= \
-                     (SELECT max_students FROM clubs WHERE id = NEW.club_id) \
-                   THEN RAISE(ABORT, 'club full') END; \
-                 END; \
                  CREATE TRIGGER IF NOT EXISTS clubs_capacity_limit_insert \
                  BEFORE INSERT ON clubs FOR EACH ROW \
                  WHEN NEW.max_students < 1 OR NEW.max_students > 10000 BEGIN \
@@ -237,11 +243,6 @@ impl Db {
                  BEFORE UPDATE OF max_students ON clubs FOR EACH ROW \
                  WHEN NEW.max_students < 1 OR NEW.max_students > 10000 BEGIN \
                    SELECT RAISE(ABORT, 'invalid club capacity'); \
-                 END; \
-                 CREATE TRIGGER IF NOT EXISTS clubs_capacity_registration_guard \
-                 BEFORE UPDATE OF max_students ON clubs FOR EACH ROW \
-                 WHEN NEW.max_students < (SELECT COUNT(*) FROM registrations WHERE club_id = OLD.id) BEGIN \
-                   SELECT RAISE(ABORT, 'club capacity below registrations'); \
                  END; \
                  CREATE TABLE IF NOT EXISTS audit_events ( \
                    id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, \
@@ -272,7 +273,7 @@ impl Db {
             .interact(|conn| {
                 let mut stmt = conn.prepare(concat!(
                     "SELECT id,name,max_students,current_students,description,advisor_name,meeting_time,location,",
-                    "image_path,allowed_grades,allowed_classes,enabled,revision,seat_sync_pending \
+                    "image_path,allowed_grades,allowed_classes,enabled,revision,seat_sync_pending,art \
                      FROM clubs ORDER BY id"
                 ))?;
                 stmt.query_map([], |r| {
@@ -291,6 +292,7 @@ impl Db {
                         enabled: r.get(11)?,
                         revision: r.get(12)?,
                         seat_sync_pending: r.get(13)?,
+                        art: r.get(14)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()
@@ -326,10 +328,7 @@ impl Db {
             .interact(|conn| {
                 let tx = conn.transaction()?;
                 let clubs = tx
-                    .prepare(
-                        "SELECT c.id, c.max_students, \
-                         (SELECT COUNT(*) FROM registrations r WHERE r.club_id = c.id) FROM clubs c",
-                    )?
+                    .prepare("SELECT club_id, max_students, used FROM club_pool")?
                     .query_map([], |r| {
                         Ok(ClubStock { club_id: r.get(0)?, max_students: r.get(1)?, used: r.get(2)? })
                     })?
@@ -338,22 +337,34 @@ impl Db {
                     .prepare("SELECT student_id, club_id, operation_id FROM registrations")?
                     .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
-                let settings: Option<(Option<String>, Option<String>, bool)> = tx
+                let settings: Option<SettingsRow> = tx
                     .query_row(
                         "SELECT registration_start_time, registration_end_time, \
-                         COALESCE(registration_locked,0) FROM settings ORDER BY id DESC LIMIT 1",
+                         COALESCE(registration_locked,0), COALESCE(batch_mode,0), current_batch \
+                         FROM settings ORDER BY id DESC LIMIT 1",
                         [],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                     )
                     .optional()?;
+                let (start_time, end_time, locked, batch_mode, current_batch) =
+                    settings.unwrap_or((None, None, false, false, None));
+                let batch = if batch_mode {
+                    let classes = tx
+                        .prepare("SELECT class_name, batch_id FROM batch_classes")?
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Some(BatchState { current: current_batch.unwrap_or(0), classes })
+                } else {
+                    None
+                };
                 tx.commit()?;
-                let (start_time, end_time, locked) = settings.unwrap_or((None, None, false));
                 Ok::<_, rusqlite::Error>(Snapshot {
                     clubs,
                     registrations,
                     start_time,
                     end_time,
                     locked,
+                    batch,
                 })
             })
             .await
@@ -361,23 +372,23 @@ impl Db {
         Ok(snapshot)
     }
 
-    /// 单个社团的容量与报名（student_id, operation_id）；社团不存在返回 None。
+    /// 单个社团的容量、当前名额池的报名人数与全部报名（student_id, operation_id）；社团不存在返回 None。
     pub async fn club_seat_truth(
         &self,
         club_id: i64,
-    ) -> AppResult<Option<(i64, Vec<(i64, Option<String>)>)>> {
+    ) -> AppResult<Option<(i64, i64, Vec<(i64, Option<String>)>)>> {
         let conn = self.read.get().await?;
         let truth = conn
             .interact(move |conn| {
                 let tx = conn.transaction()?;
-                let maximum: Option<i64> = tx
+                let pool: Option<(i64, i64)> = tx
                     .query_row(
-                        "SELECT max_students FROM clubs WHERE id=?1",
+                        "SELECT max_students, used FROM club_pool WHERE club_id=?1",
                         [club_id],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()?;
-                let Some(maximum) = maximum else {
+                let Some((maximum, used)) = pool else {
                     return Ok::<_, rusqlite::Error>(None);
                 };
                 let registrations = tx
@@ -385,7 +396,7 @@ impl Db {
                     .query_map([club_id], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
                 tx.commit()?;
-                Ok(Some((maximum, registrations)))
+                Ok(Some((maximum, used, registrations)))
             })
             .await
             .map_err(interact_error)??;
@@ -410,7 +421,7 @@ impl Db {
         conn.interact(|conn| {
             conn.execute(
                 "UPDATE clubs SET current_students=\
-                 (SELECT COUNT(*) FROM registrations r WHERE r.club_id=clubs.id), seat_sync_pending=0",
+                 (SELECT used FROM club_pool WHERE club_pool.club_id=clubs.id), seat_sync_pending=0",
                 [],
             )
         })
@@ -487,6 +498,23 @@ impl Db {
             .await
             .map_err(interact_error)??;
         Ok(value.unwrap_or(false))
+    }
+
+    /// 报名方式与当前批次：(是否分批报名, 当前批次编号)。当前批次由 Python 按时间维护。
+    pub async fn batch_state(&self) -> AppResult<(bool, Option<i64>)> {
+        let conn = self.read.get().await?;
+        let row = conn
+            .interact(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(batch_mode,0), current_batch FROM settings ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get::<_, bool>(0)?, r.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()
+            })
+            .await
+            .map_err(interact_error)??;
+        Ok(row.unwrap_or((false, None)))
     }
 
     pub async fn find_student_by_username(
@@ -628,27 +656,25 @@ impl Db {
         let outcome = conn
             .interact(move |conn| {
                 use RegistrationInsertOutcome as O;
+                // 语句都走连接的预编译缓存：插入语句连同容量触发器只编译一次。
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let locked: bool = tx
-                    .query_row(
+                    .prepare_cached(
                         "SELECT COALESCE(registration_locked,0) FROM settings ORDER BY id DESC LIMIT 1",
-                        [],
-                        |r| r.get(0),
-                    )
+                    )?
+                    .query_row([], |r| r.get(0))
                     .optional()?
                     .unwrap_or(false);
                 if locked {
                     return Ok::<_, rusqlite::Error>(O::RegistrationLocked);
                 }
-                let club: Option<(i64, bool, bool, String, String)> = tx
-                    .query_row(
-                        "SELECT max_students,enabled,seat_sync_pending,allowed_grades,allowed_classes \
-                         FROM clubs WHERE id=?1",
-                        [cid],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                    )
+                let club: Option<(bool, bool, String, String)> = tx
+                    .prepare_cached(
+                        "SELECT enabled,seat_sync_pending,allowed_grades,allowed_classes FROM clubs WHERE id=?1",
+                    )?
+                    .query_row([cid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                     .optional()?;
-                let Some((max_students, enabled, sync_pending, grades, classes)) = club else {
+                let Some((enabled, sync_pending, grades, classes)) = club else {
                     return Ok(O::ClubMissing);
                 };
                 if !enabled {
@@ -658,9 +684,8 @@ impl Db {
                     return Ok(O::SeatSyncPending);
                 }
                 let student: Option<(String, String)> = tx
-                    .query_row("SELECT grade,class FROM students WHERE id=?1", [sid], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })
+                    .prepare_cached("SELECT grade,class FROM students WHERE id=?1")?
+                    .query_row([sid], |r| Ok((r.get(0)?, r.get(1)?)))
                     .optional()?;
                 let Some((grade, class_name)) = student else {
                     return Ok(O::Ineligible("ineligible_config"));
@@ -668,32 +693,30 @@ impl Db {
                 if let Some(code) = restriction_code(&grade, &class_name, &grades, &classes) {
                     return Ok(O::Ineligible(code));
                 }
-                let already: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM registrations WHERE student_id = ?1)",
-                    [sid],
-                    |r| r.get(0),
-                )?;
+                let already: bool = tx
+                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM registrations WHERE student_id = ?1)")?
+                    .query_row([sid], |r| r.get(0))?;
                 if already {
                     return Ok(O::AlreadyRegistered);
                 }
-                let used: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM registrations WHERE club_id = ?1",
-                    [cid],
-                    |r| r.get(0),
-                )?;
-                if used >= max_students {
-                    return Ok(O::ClubFull);
+                // 名额池的上限由触发器 registrations_capacity_guard 在插入时核对（与 Python 相同），
+                // 满员时触发器中止这条插入，按满员返回；事务随后回滚。
+                let inserted = tx
+                    .prepare_cached(
+                        "INSERT INTO registrations (student_id, club_id, registration_time, operation_id) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )?
+                    .execute(rusqlite::params![sid, cid, when, operation_id.clone()]);
+                match inserted {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(_, Some(ref message))) if message.contains("club full") => {
+                        return Ok(O::ClubFull);
+                    }
+                    Err(e) => return Err(e),
                 }
-                tx.execute(
-                    "INSERT INTO registrations (student_id, club_id, registration_time, operation_id) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![sid, cid, when, operation_id.clone()],
-                )?;
                 let registration_id = tx.last_insert_rowid();
-                tx.execute(
-                    "UPDATE clubs SET current_students = current_students + 1 WHERE id = ?1",
-                    [cid],
-                )?;
+                tx.prepare_cached("UPDATE clubs SET current_students = current_students + 1 WHERE id = ?1")?
+                    .execute([cid])?;
                 append_audit_event(
                     &tx,
                     AuditEvent {

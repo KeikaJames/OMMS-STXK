@@ -98,6 +98,14 @@ a:focus, button:focus, input:focus, select:focus, textarea:focus, [tabindex]:foc
 .dropzone.is-over { border-color: #355F78; background: #E2EAEE; }
 .dropzone svg { stroke: #776F62; }
 .pager span { color: #776F62; }
+.art-option { border: 1px solid #E1D8C8; background: #FFFFFF; color: #4A453D; }
+.art-option:hover { border-color: #CABDA6; }
+.art-option[aria-pressed="true"] { border-color: #355F78; box-shadow: 0 0 0 1px #355F78; color: #355F78; }
+.club-batches { color: #776F62; }
+.club-batches b { color: #1F1D1A; }
+.class-grid .check { border: 1px solid #E1D8C8; background: #FFFFFF; }
+.class-grid .check small { color: #776F62; }
+.class-grid .check.is-on { border-color: #355F78; background: #E2EAEE; }
 .list li { border-top: 1px solid #E1D8C8; }
 .list small { color: #776F62; }
 .secret-box { background: #E2EAEE; }
@@ -105,6 +113,7 @@ a:focus, button:focus, input:focus, select:focus, textarea:focus, [tabindex]:foc
 .present { background: #F4EFE6; color: #1F1D1A; }
 .present-label { color: #776F62; }
 .present-more { color: #4A453D; }
+.present-batch { color: #355F78; }
 .present-hint { color: #776F62; }
 @media (max-width: 900px) {
   .sidebar { border-bottom: 1px solid #E1D8C8; }
