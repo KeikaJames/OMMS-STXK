@@ -166,14 +166,7 @@ python3 tests/stress_site.py hot --backend python --users 1000
 
 ## 由 AI 代理运行
 
-`agent/` 提供以 Python 标准库实现的 MCP 服务 `omms_mcp.py`，Claude、Codex、Cursor 等客户端可用它管理服务、参数、管理员账户、名单、社团、报名批次、调剂、导出和备份恢复。删除、清空、恢复、重置密码和调剂等操作需管理员确认；完整工具清单见 [代理运行指南](agent/AGENTS.md)。
-
-- Claude Code、Cursor、VS Code：在 `agent` 文件夹中打开，配置已写好。
-- Claude 桌面版：`python3 agent/omms_mcp.py register claude-desktop`，重新打开 Claude。
-- Codex：`python3 agent/omms_mcp.py register codex`。
-- 命令行：`python3 agent/omms_mcp.py call 工具名 '{"参数": "值"}'`。
-
-运行参数保存在 `deploy/omms.env`；代理可通过 `update_settings` 修改。
+`agent/` 提供 MCP 服务 `omms_mcp.py`，Claude、Codex、Cursor 等客户端可用于服务管理、运行参数、学生与社团、报名批次、调剂、导出和备份恢复。接入步骤、完整工具清单与操作规则见 [agent/AGENTS.md](agent/AGENTS.md)。
 
 ## 使用流程
 
